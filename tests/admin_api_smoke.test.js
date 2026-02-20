@@ -146,10 +146,10 @@ function createMockDb() {
   };
 }
 
-function createTestApp() {
+function createTestApp(overrides = {}) {
   const db = createMockDb();
   const config = buildConfig();
-  const runImporter = async (options) => {
+  const runImporter = overrides.runImporter || (async (options) => {
     if (options.dryRun) {
       return {
         mode: "dry-run",
@@ -193,7 +193,32 @@ function createTestApp() {
       },
       ruleSummary: null,
     };
-  };
+  });
+  const runExcelPriceImporter =
+    overrides.runExcelPriceImporter ||
+    (async (_options) => ({
+      mode: "dry-run",
+      parser_summary: {
+        rows_read: 10,
+        products_parsed: 2,
+        row_type_counts: { header_rows: 2, detail_rows: 4, meta_rows: 2, ignored_rows: 2 },
+      },
+      summary: {
+        products_processed: 2,
+        sku_found: 2,
+        missing_sku: 0,
+        units_processed: 3,
+        price_rows_planned_updates: 3,
+        barcodes_new: 2,
+        barcodes_existing: 1,
+        skipped_no_price: 0,
+        skipped_ambiguous_unit_prices: 0,
+        errors: 0,
+      },
+      plan: {
+        changes: [],
+      },
+    }));
   const runRuleApplication = async () => ({
     mode: "dry-run",
     rules_loaded: 1,
@@ -207,6 +232,7 @@ function createTestApp() {
     config,
     db,
     runImporter,
+    runExcelPriceImporter,
     runRuleApplication,
   });
 
@@ -295,4 +321,54 @@ test("admin can read products, edit product, run import dry-run, and apply rules
   assert.equal(applyRulesResponse.status, 200);
   assert.equal(applyRulesResponse.body.summary.mode, "dry-run");
   assert.ok(db.state.auditActions.includes("enrichment.apply_rules.dry_run"));
+});
+
+test("admin import prices route accepts .xls and uses excel-dataonly importer", async () => {
+  let excelImporterCalled = false;
+  const { app, db } = createTestApp({
+    runExcelPriceImporter: async (_options) => {
+      excelImporterCalled = true;
+      return {
+        mode: "dry-run",
+        parser_summary: {
+          rows_read: 12,
+          products_parsed: 3,
+          row_type_counts: { header_rows: 3, detail_rows: 6, meta_rows: 3, ignored_rows: 0 },
+        },
+        summary: {
+          products_processed: 3,
+          sku_found: 2,
+          missing_sku: 1,
+          units_processed: 5,
+          price_rows_planned_updates: 4,
+          barcodes_new: 2,
+          barcodes_existing: 2,
+          skipped_no_price: 1,
+          skipped_ambiguous_unit_prices: 0,
+          errors: 0,
+        },
+        plan: {
+          changes: [],
+        },
+      };
+    },
+  });
+
+  const agent = request.agent(app);
+  const csrfToken = await loginAs(agent, "admin@example.com", "admin-pass-123");
+
+  const importResponse = await agent
+    .post("/admin/import/prices")
+    .set("x-csrf-token", csrfToken)
+    .attach("file", FIXTURE_CSV, "rpt_sql_allmpdtentryexceldataonly.xls")
+    .field("commit", "false")
+    .field("mode", "price-only")
+    .field("source_format", "auto")
+    .field("price_history", "off");
+
+  assert.equal(importResponse.status, 200);
+  assert.equal(importResponse.body.summary.mode, "dry-run");
+  assert.equal(importResponse.body.summary.source_format, "excel-dataonly");
+  assert.equal(excelImporterCalled, true);
+  assert.ok(db.state.auditActions.includes("import.prices.dry_run"));
 });

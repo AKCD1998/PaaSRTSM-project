@@ -12,10 +12,18 @@ function fileToken(file) {
   return `${file.name}:${file.size}:${file.lastModified}`;
 }
 
+function isExcelFile(file) {
+  if (!file?.name) {
+    return false;
+  }
+  return /\.(xls|xlsx)$/i.test(file.name);
+}
+
 function buildFormData(file, form, commitValue) {
   const formData = new FormData();
   formData.set("file", file);
   formData.set("mode", "price-only");
+  formData.set("source_format", "auto");
   formData.set("price_history", form.priceHistory);
   formData.set("commit", String(commitValue));
   if (form.limit) {
@@ -93,7 +101,7 @@ export function ImportPricesPage() {
 
   async function runDryRun() {
     if (!file) {
-      showToast("Choose a CSV file first", "error");
+      showToast("Choose a CSV/XLS file first", "error");
       return;
     }
     await withLoading(async () => {
@@ -138,7 +146,10 @@ export function ImportPricesPage() {
   return (
     <div className="stack">
       <h1>Monthly Price Update</h1>
-      <p className="muted">Price-only mode is enforced. Dry-run required before commit.</p>
+      <p className="muted">
+        Price-only mode is enforced. Dry-run required before commit. Excel Data Only import supports
+        current-price updates (price history must be off).
+      </p>
 
       <div className="info-card">
         <form
@@ -149,12 +160,16 @@ export function ImportPricesPage() {
           }}
         >
           <label className="label-span-2">
-            CSV File
+            Source File (CSV or Excel Data Only)
             <input
               type="file"
-              accept=".csv,text/csv"
+              accept=".csv,text/csv,.xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               onChange={(event) => {
-                setFile(event.target.files?.[0] || null);
+                const nextFile = event.target.files?.[0] || null;
+                setFile(nextFile);
+                if (isExcelFile(nextFile)) {
+                  setForm((prev) => ({ ...prev, priceHistory: "off" }));
+                }
                 setLastDryRunToken("");
               }}
             />
@@ -167,6 +182,7 @@ export function ImportPricesPage() {
             Price History
             <select
               value={form.priceHistory}
+              disabled={isExcelFile(file)}
               onChange={(event) => {
                 setForm((prev) => ({ ...prev, priceHistory: event.target.value }));
                 setLastDryRunToken("");

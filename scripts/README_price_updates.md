@@ -67,3 +67,7 @@ The script always writes a run log under `logs/price_import_YYYYMMDD_HHMMSS.json
 - Enrichment fields are not modified by price-only mode.
 - Wholesale tiers are updated when numeric tier prices are present in CSV parse output.
 - Barcode reassignment is blocked in `price-only` mode (conflicts are logged in summary counters).
+- Admin API `POST /admin/import/prices` now supports both:
+  - CSV (`source_format=csv` or auto-detected by file extension)
+  - Crystal Excel Data Only (`.xls/.xlsx`, `source_format=excel-dataonly` or auto)
+- For Excel Data Only source, `price_history=on` is not supported (current-price upsert only).

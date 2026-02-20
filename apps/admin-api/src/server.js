@@ -80,6 +80,9 @@ function createApp(overrides = {}) {
   const db = overrides.db || createDbPool(config);
   const runImporter =
     overrides.runImporter || require("../../../scripts/import_adapos_csv").runImporter;
+  const runExcelPriceImporter =
+    overrides.runExcelPriceImporter ||
+    require("../../../scripts/import_adapos_prices_from_excel_dataonly").runImport;
   const runRuleApplication =
     overrides.runRuleApplication || require("../../../scripts/apply_enrichment_rules").runRuleApplication;
 
@@ -137,6 +140,7 @@ function createApp(overrides = {}) {
       config,
       db,
       runImporter,
+      runExcelPriceImporter,
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
