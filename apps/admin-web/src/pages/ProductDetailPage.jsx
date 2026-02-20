@@ -192,6 +192,45 @@ export function ProductDetailPage() {
       </div>
 
       <div className="info-card">
+        <h3>Unit Prices</h3>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Unit</th>
+                <th>Retail Tier 1</th>
+                <th>Extra Tiers (2-8)</th>
+                <th>Currency</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(product.unit_prices || []).length === 0 && (
+                <tr>
+                  <td colSpan={5} className="empty-cell">
+                    No unit prices
+                  </td>
+                </tr>
+              )}
+              {(product.unit_prices || []).map((row) => (
+                <tr key={row.id}>
+                  <td>{row.unit || "-"}</td>
+                  <td>{formatNumber(row.retail_price)}</td>
+                  <td>
+                    {(row.tiers || [])
+                      .map((tier) => `T${tier.tier}: ${formatNumber(tier.price)}`)
+                      .join(", ") || "-"}
+                  </td>
+                  <td>{row.currency || "-"}</td>
+                  <td>{formatDateTime(row.updated_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="info-card">
         <div className="row-space">
           <h3>Edit Fields</h3>
           {!isAdmin && <span className="pill role-staff">staff read-only</span>}

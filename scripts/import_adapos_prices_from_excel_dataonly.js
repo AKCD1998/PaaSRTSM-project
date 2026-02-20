@@ -8,6 +8,8 @@ const { parseAdaPosExcelDataOnly } = require("./import_adapos_excel_dataonly");
 
 const PRICE_CURRENCY = "THB";
 const SOURCE_TAG = "adapos_excel_dataonly";
+const UNIT_TIER_MIN = 2;
+const UNIT_TIER_MAX = 8;
 const WHOLESALE_OPTIONAL_START = 2; // C..J => optional D..J, wholesale mapped from F..J
 const WHOLESALE_TIERS = 5;
 const PREVIEW_LIMIT = 20;
@@ -120,12 +122,17 @@ function extractWholesaleTiers(unitEntry) {
   return tiers;
 }
 
-function priceSignature(candidate) {
-  const payload = {
-    retail_tier_1: candidate.retail_tier_1,
-    wholesale: candidate.wholesale_tiers.map((entry) => entry.value),
-  };
-  return JSON.stringify(payload);
+function extractUnitPriceTiers(unitEntry) {
+  const optional = (unitEntry.retail_tiers_optional || []).map(numberOrNull);
+  const tiers = [];
+  for (let tier = UNIT_TIER_MIN; tier <= UNIT_TIER_MAX; tier += 1) {
+    const idx = tier - UNIT_TIER_MIN;
+    tiers.push({
+      tier,
+      value: optional[idx] == null ? null : optional[idx],
+    });
+  }
+  return tiers;
 }
 
 function collectIncomingBarcodes(units) {
@@ -151,7 +158,7 @@ function collectIncomingBarcodes(units) {
 
 function buildProductPlan(product) {
   const incomingBarcodes = collectIncomingBarcodes(product.units || []);
-  const candidates = [];
+  const pricedUnits = [];
   let skippedNoPriceUnits = 0;
 
   for (const unitEntry of product.units || []) {
@@ -163,29 +170,20 @@ function buildProductPlan(product) {
       skippedNoPriceUnits += 1;
       continue;
     }
-    candidates.push({
+    pricedUnits.push({
       unit,
       retail_tier_1: numberOrNull(unitEntry.retail_tier_1),
       retail_tiers_optional: [...(unitEntry.retail_tiers_optional || [])].map(numberOrNull),
+      unit_price_tiers: extractUnitPriceTiers(unitEntry),
       wholesale_tiers: extractWholesaleTiers(unitEntry),
     });
   }
 
-  let selectedUnit = null;
   let price_skip_reason = "";
-  if (candidates.length === 0) {
+  if (pricedUnits.length === 0) {
     price_skip_reason = "no_price_data";
-  } else if (candidates.length === 1) {
-    selectedUnit = candidates[0];
-  } else {
-    const firstSignature = priceSignature(candidates[0]);
-    const same = candidates.every((candidate) => priceSignature(candidate) === firstSignature);
-    if (same) {
-      selectedUnit = candidates[0];
-    } else {
-      price_skip_reason = "ambiguous_unit_prices";
-    }
   }
+  const legacy_selected_unit = pricedUnits[0] || null;
 
   return {
     product_code: normalizeText(product.product_code),
@@ -195,9 +193,10 @@ function buildProductPlan(product) {
     supplier_code: normalizeText(product.supplier_code),
     updated_at: product.updated_at || null,
     units_total: (product.units || []).length,
-    units_with_price_data: candidates.length,
+    units_with_price_data: pricedUnits.length,
     skipped_no_price_units: skippedNoPriceUnits,
-    selected_unit: selectedUnit,
+    priced_units: pricedUnits,
+    legacy_selected_unit,
     price_skip_reason,
     incoming_barcodes: incomingBarcodes,
   };
@@ -222,6 +221,25 @@ function planWholesaleChanges(existingTierMap, incomingWholesaleTiers) {
   const changes = [];
   const existing = existingTierMap || new Map();
   for (const entry of incomingWholesaleTiers || []) {
+    if (entry.value === null) {
+      continue;
+    }
+    const oldValue = existing.has(entry.tier) ? numberOrNull(existing.get(entry.tier)) : null;
+    if (oldValue === null) {
+      changes.push({ tier: entry.tier, action: "insert", old_price: null, new_price: entry.value });
+    } else if (almostEqual(oldValue, entry.value)) {
+      changes.push({ tier: entry.tier, action: "unchanged", old_price: oldValue, new_price: entry.value });
+    } else {
+      changes.push({ tier: entry.tier, action: "update", old_price: oldValue, new_price: entry.value });
+    }
+  }
+  return changes;
+}
+
+function planUnitTierChanges(existingTierMap, incomingUnitTiers) {
+  const changes = [];
+  const existing = existingTierMap || new Map();
+  for (const entry of incomingUnitTiers || []) {
     if (entry.value === null) {
       continue;
     }
@@ -353,6 +371,44 @@ async function loadWholesaleTierMap(client, skuIds) {
   return out;
 }
 
+async function loadUnitPriceState(client, skuIds) {
+  const ids = ensureUnique(skuIds);
+  if (ids.length === 0) {
+    return new Map();
+  }
+  const query = `
+    SELECT
+      up.id AS sku_unit_price_id,
+      up.sku_id,
+      up.unit,
+      up.retail_price,
+      ut.tier,
+      ut.price AS tier_price
+    FROM public.sku_unit_prices up
+    LEFT JOIN public.sku_unit_price_tiers ut
+      ON ut.sku_unit_price_id = up.id
+    WHERE up.sku_id = ANY($1::int[])
+      AND up.currency = $2
+      AND up.is_active = TRUE
+  `;
+  const result = await client.query(query, [ids, PRICE_CURRENCY]);
+  const out = new Map();
+  for (const row of result.rows) {
+    const key = `${Number(row.sku_id)}|${normalizeUnit(row.unit)}`;
+    if (!out.has(key)) {
+      out.set(key, {
+        sku_unit_price_id: Number(row.sku_unit_price_id),
+        retail_price: numberOrNull(row.retail_price),
+        tiers: new Map(),
+      });
+    }
+    if (row.tier != null) {
+      out.get(key).tiers.set(Number(row.tier), numberOrNull(row.tier_price));
+    }
+  }
+  return out;
+}
+
 async function loadBarcodeState(client, skuIds, incomingBarcodes) {
   const ids = ensureUnique(skuIds);
   const barcodeList = ensureUnique(incomingBarcodes);
@@ -398,11 +454,22 @@ async function loadBarcodeState(client, skuIds, incomingBarcodes) {
 }
 
 function buildImportPlan(productPlans, dbState) {
+  const skuMap = dbState.skuMap || new Map();
+  const retailMap = dbState.retailMap || new Map();
+  const wholesaleMap = dbState.wholesaleMap || new Map();
+  const unitPriceStateMap = dbState.unitPriceState || new Map();
+  const barcodeStateBySku = dbState.barcodeState?.bySku || new Map();
+  const barcodeOwners = dbState.barcodeState?.owners || new Map();
+
   const summary = {
     products_processed: productPlans.length,
     sku_found: 0,
     missing_sku: 0,
     units_processed: 0,
+    unit_price_rows_planned_updates: 0,
+    unit_price_tiers_planned_updates: 0,
+    legacy_price_rows_planned_updates: 0,
+    legacy_wholesale_rows_planned_updates: 0,
     price_rows_planned_updates: 0,
     price_rows_applied_updates: 0,
     barcodes_new: 0,
@@ -417,7 +484,7 @@ function buildImportPlan(productPlans, dbState) {
 
   for (const product of productPlans) {
     summary.units_processed += product.units_total;
-    const skuId = dbState.skuMap.get(product.product_code) || null;
+    const skuId = skuMap.get(product.product_code) || null;
     if (!skuId) {
       summary.missing_sku += 1;
       changes.push({
@@ -431,13 +498,13 @@ function buildImportPlan(productPlans, dbState) {
     }
     summary.sku_found += 1;
 
-    const retailState = dbState.retailMap.get(skuId) || { price_id: null, price: null };
-    const wholesaleState = dbState.wholesaleMap.get(skuId) || new Map();
-    const barcodeState = dbState.barcodeState.bySku.get(skuId) || {
+    const retailState = retailMap.get(skuId) || { price_id: null, price: null };
+    const wholesaleState = wholesaleMap.get(skuId) || new Map();
+    const barcodeState = barcodeStateBySku.get(skuId) || {
       by_barcode: new Set(),
       has_primary: false,
     };
-    const barcodePlan = planBarcodeChanges(barcodeState, dbState.barcodeState.owners, skuId, product.incoming_barcodes);
+    const barcodePlan = planBarcodeChanges(barcodeState, barcodeOwners, skuId, product.incoming_barcodes);
     summary.barcodes_new += barcodePlan.inserts.length;
     summary.barcodes_existing += barcodePlan.existing.length;
     summary.barcodes_conflicts += barcodePlan.conflicts.length;
@@ -451,56 +518,83 @@ function buildImportPlan(productPlans, dbState) {
         status: "skipped_no_price",
         changed_tiers_count: 0,
         barcode_changes: {
-          inserts: barcodePlan.inserts.length,
+          inserts: barcodePlan.inserts,
           existing: barcodePlan.existing.length,
-          conflicts: barcodePlan.conflicts.length,
+          conflicts: barcodePlan.conflicts,
           primary_to_set: barcodePlan.primary_to_set || "",
         },
       });
       continue;
     }
 
-    if (product.price_skip_reason === "ambiguous_unit_prices") {
-      summary.skipped_ambiguous_unit_prices += 1;
-      changes.push({
-        product_code: product.product_code,
-        sku_id: skuId,
-        unit: "-",
-        status: "skipped_ambiguous_unit_prices",
-        changed_tiers_count: 0,
-        barcode_changes: {
-          inserts: barcodePlan.inserts.length,
-          existing: barcodePlan.existing.length,
-          conflicts: barcodePlan.conflicts.length,
-          primary_to_set: barcodePlan.primary_to_set || "",
-        },
-      });
-      continue;
-    }
-
-    const selected = product.selected_unit;
-    const retailPlan = planRetailChange(retailState.price, selected.retail_tier_1);
-    const wholesalePlans = planWholesaleChanges(wholesaleState, selected.wholesale_tiers);
-    const changedWholesale = wholesalePlans.filter((entry) => entry.action === "insert" || entry.action === "update");
-
+    const unitChanges = [];
     let changedTierCount = 0;
-    if (retailPlan.action === "insert" || retailPlan.action === "update") {
-      summary.price_rows_planned_updates += 1;
-      changedTierCount += 1;
+    for (const pricedUnit of product.priced_units) {
+      const unitStateKey = `${skuId}|${normalizeUnit(pricedUnit.unit)}`;
+      const unitState = unitPriceStateMap.get(unitStateKey) || {
+        sku_unit_price_id: null,
+        retail_price: null,
+        tiers: new Map(),
+      };
+      const unitRetailPlan = planRetailChange(unitState.retail_price, pricedUnit.retail_tier_1);
+      const unitTierPlans = planUnitTierChanges(unitState.tiers, pricedUnit.unit_price_tiers);
+      const changedUnitTiers = unitTierPlans.filter((entry) => entry.action === "insert" || entry.action === "update");
+      const unitRetailChanged = unitRetailPlan.action === "insert" || unitRetailPlan.action === "update";
+      if (unitRetailChanged) {
+        summary.unit_price_rows_planned_updates += 1;
+      }
+      summary.unit_price_tiers_planned_updates += changedUnitTiers.length;
+      changedTierCount += (unitRetailChanged ? 1 : 0) + changedUnitTiers.length;
+
+      unitChanges.push({
+        sku_unit_price_id: unitState.sku_unit_price_id,
+        unit: pricedUnit.unit,
+        retail: unitRetailPlan,
+        tiers: unitTierPlans,
+        source_updated_at: product.updated_at || null,
+      });
     }
-    summary.price_rows_planned_updates += changedWholesale.length;
-    changedTierCount += changedWholesale.length;
+
+    const legacy = product.legacy_selected_unit || null;
+    let legacyUpdate = null;
+    if (legacy) {
+      const retailPlan = planRetailChange(retailState.price, legacy.retail_tier_1);
+      const wholesalePlans = planWholesaleChanges(wholesaleState, legacy.wholesale_tiers);
+      const changedWholesale = wholesalePlans.filter((entry) => entry.action === "insert" || entry.action === "update");
+      const legacyRetailChanged = retailPlan.action === "insert" || retailPlan.action === "update";
+      if (legacyRetailChanged) {
+        summary.legacy_price_rows_planned_updates += 1;
+      }
+      summary.legacy_wholesale_rows_planned_updates += changedWholesale.length;
+      changedTierCount += (legacyRetailChanged ? 1 : 0) + changedWholesale.length;
+
+      legacyUpdate = {
+        unit: legacy.unit,
+        retail: {
+          ...retailPlan,
+          price_id: retailState.price_id,
+        },
+        wholesale: wholesalePlans,
+      };
+    }
+
+    summary.price_rows_planned_updates =
+      summary.unit_price_rows_planned_updates +
+      summary.unit_price_tiers_planned_updates +
+      summary.legacy_price_rows_planned_updates +
+      summary.legacy_wholesale_rows_planned_updates;
+
+    const previewUnit = unitChanges[0] || null;
 
     changes.push({
       product_code: product.product_code,
       sku_id: skuId,
-      unit: selected.unit,
+      unit: previewUnit ? previewUnit.unit : "-",
       status: "planned",
-      retail: {
-        ...retailPlan,
-        price_id: retailState.price_id,
-      },
-      wholesale: wholesalePlans,
+      retail: previewUnit ? previewUnit.retail : { action: "skip", old_price: null, new_price: null },
+      wholesale: legacyUpdate ? legacyUpdate.wholesale : [],
+      unit_changes: unitChanges,
+      legacy_update: legacyUpdate,
       changed_tiers_count: changedTierCount,
       barcode_changes: {
         inserts: barcodePlan.inserts,
@@ -527,62 +621,121 @@ async function applyChanges(client, plan) {
 
     const skuId = change.sku_id;
 
-    if (change.retail.action === "insert") {
-      const insertRetail = `
-        INSERT INTO public.prices (
-          sku_id, price, currency, effective_start, effective_end, updated_at
+    for (const unitChange of change.unit_changes || []) {
+      const upsertUnit = `
+        INSERT INTO public.sku_unit_prices AS tgt (
+          sku_id,
+          unit,
+          retail_price,
+          currency,
+          is_active,
+          source,
+          source_updated_at,
+          updated_at
         )
-        VALUES ($1, $2, $3, now(), NULL, now())
+        VALUES ($1, $2, $3, $4, TRUE, $5, $6, now())
+        ON CONFLICT (sku_id, unit, currency)
+        DO UPDATE SET
+          retail_price = COALESCE(EXCLUDED.retail_price, tgt.retail_price),
+          is_active = TRUE,
+          source = EXCLUDED.source,
+          source_updated_at = COALESCE(EXCLUDED.source_updated_at, tgt.source_updated_at),
+          updated_at = now()
+        RETURNING id
       `;
-      await client.query(insertRetail, [skuId, change.retail.new_price, PRICE_CURRENCY]);
-      appliedRows += 1;
-    } else if (change.retail.action === "update") {
-      if (change.retail.price_id) {
-        const updateById = `
-          UPDATE public.prices
-          SET
-            price = $1,
-            updated_at = now(),
-            effective_start = COALESCE(effective_start, now()),
-            effective_end = NULL
-          WHERE price_id = $2
-        `;
-        await client.query(updateById, [change.retail.new_price, change.retail.price_id]);
-      } else {
-        const updateActive = `
-          UPDATE public.prices
-          SET
-            price = $1,
-            updated_at = now(),
-            effective_start = COALESCE(effective_start, now()),
-            effective_end = NULL
-          WHERE sku_id = $2
-            AND currency = $3
-            AND effective_end IS NULL
-        `;
-        await client.query(updateActive, [change.retail.new_price, skuId, PRICE_CURRENCY]);
+      const unitResult = await client.query(upsertUnit, [
+        skuId,
+        unitChange.unit,
+        unitChange.retail.new_price,
+        PRICE_CURRENCY,
+        SOURCE_TAG,
+        unitChange.source_updated_at,
+      ]);
+      const skuUnitPriceId = Number(unitResult.rows[0].id);
+      const unitRetailChanged = unitChange.retail.action === "insert" || unitChange.retail.action === "update";
+      if (unitRetailChanged) {
+        appliedRows += 1;
       }
-      appliedRows += 1;
+
+      for (const tierPlan of unitChange.tiers || []) {
+        if (!(tierPlan.action === "insert" || tierPlan.action === "update")) {
+          continue;
+        }
+        const upsertUnitTier = `
+          INSERT INTO public.sku_unit_price_tiers (
+            sku_unit_price_id, tier, price, is_active, updated_at
+          )
+          VALUES ($1, $2, $3, TRUE, now())
+          ON CONFLICT (sku_unit_price_id, tier)
+          DO UPDATE SET
+            price = EXCLUDED.price,
+            is_active = TRUE,
+            updated_at = now()
+        `;
+        await client.query(upsertUnitTier, [skuUnitPriceId, tierPlan.tier, tierPlan.new_price]);
+        appliedRows += 1;
+      }
     }
 
-    for (const tierPlan of change.wholesale) {
-      if (!(tierPlan.action === "insert" || tierPlan.action === "update")) {
-        continue;
+    if (change.legacy_update) {
+      const legacyRetail = change.legacy_update.retail;
+      if (legacyRetail.action === "insert") {
+        const insertRetail = `
+          INSERT INTO public.prices (
+            sku_id, price, currency, effective_start, effective_end, updated_at
+          )
+          VALUES ($1, $2, $3, now(), NULL, now())
+        `;
+        await client.query(insertRetail, [skuId, legacyRetail.new_price, PRICE_CURRENCY]);
+        appliedRows += 1;
+      } else if (legacyRetail.action === "update") {
+        if (legacyRetail.price_id) {
+          const updateById = `
+            UPDATE public.prices
+            SET
+              price = $1,
+              updated_at = now(),
+              effective_start = COALESCE(effective_start, now()),
+              effective_end = NULL
+            WHERE price_id = $2
+          `;
+          await client.query(updateById, [legacyRetail.new_price, legacyRetail.price_id]);
+        } else {
+          const updateActive = `
+            UPDATE public.prices
+            SET
+              price = $1,
+              updated_at = now(),
+              effective_start = COALESCE(effective_start, now()),
+              effective_end = NULL
+            WHERE sku_id = $2
+              AND currency = $3
+              AND effective_end IS NULL
+          `;
+          await client.query(updateActive, [legacyRetail.new_price, skuId, PRICE_CURRENCY]);
+        }
+        appliedRows += 1;
       }
-      const upsertTier = `
-        INSERT INTO public.sku_price_tiers (
-          sku_id, price_kind, tier, price, currency, is_active, updated_at
-        )
-        VALUES ($1, 'wholesale', $2, $3, $4, TRUE, now())
-        ON CONFLICT (sku_id, price_kind, tier)
-        DO UPDATE SET
-          price = EXCLUDED.price,
-          currency = EXCLUDED.currency,
-          is_active = TRUE,
-          updated_at = now()
-      `;
-      await client.query(upsertTier, [skuId, tierPlan.tier, tierPlan.new_price, PRICE_CURRENCY]);
-      appliedRows += 1;
+
+      for (const tierPlan of change.legacy_update.wholesale || []) {
+        if (!(tierPlan.action === "insert" || tierPlan.action === "update")) {
+          continue;
+        }
+        const upsertTier = `
+          INSERT INTO public.sku_price_tiers (
+            sku_id, price_kind, tier, price, currency, is_active, updated_at
+          )
+          VALUES ($1, 'wholesale', $2, $3, $4, TRUE, now())
+          ON CONFLICT (sku_id, price_kind, tier)
+          DO UPDATE SET
+            price = EXCLUDED.price,
+            currency = EXCLUDED.currency,
+            is_active = TRUE,
+            updated_at = now()
+        `;
+        await client.query(upsertTier, [skuId, tierPlan.tier, tierPlan.new_price, PRICE_CURRENCY]);
+        appliedRows += 1;
+      }
     }
 
     for (const barcodeEntry of change.barcode_changes.inserts || []) {
@@ -669,16 +822,31 @@ async function loadDbState(client, productPlans) {
     plan.incoming_barcodes.map((entry) => entry.barcode),
   );
 
-  const [retailMap, wholesaleMap, barcodeState] = await Promise.all([
-    loadActiveRetailMap(client, skuIds),
-    loadWholesaleTierMap(client, skuIds),
-    loadBarcodeState(client, skuIds, incomingBarcodes),
-  ]);
+  let retailMap = null;
+  let wholesaleMap = null;
+  let unitPriceState = null;
+  let barcodeState = null;
+  try {
+    [retailMap, wholesaleMap, unitPriceState, barcodeState] = await Promise.all([
+      loadActiveRetailMap(client, skuIds),
+      loadWholesaleTierMap(client, skuIds),
+      loadUnitPriceState(client, skuIds),
+      loadBarcodeState(client, skuIds, incomingBarcodes),
+    ]);
+  } catch (error) {
+    if (error && error.code === "42P01") {
+      throw new Error(
+        `Required unit-price tables are missing. Run migration migrations/011_add_sku_unit_prices.sql first. Original error: ${error.message}`,
+      );
+    }
+    throw error;
+  }
 
   return {
     skuMap,
     retailMap,
     wholesaleMap,
+    unitPriceState,
     barcodeState,
   };
 }
@@ -828,9 +996,9 @@ module.exports = {
   collectIncomingBarcodes,
   buildProductPlan,
   planRetailChange,
+  planUnitTierChanges,
   planWholesaleChanges,
   planBarcodeChanges,
   buildImportPlan,
   runImport,
 };
-

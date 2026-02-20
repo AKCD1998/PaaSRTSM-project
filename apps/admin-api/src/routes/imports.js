@@ -157,6 +157,10 @@ function summarizeExcelPriceImportResult(result) {
     skipped_rows: (summary.skipped_no_price || 0) + (summary.skipped_ambiguous_unit_prices || 0),
     planned_actions: {
       prices_update_or_insert: summary.price_rows_planned_updates || 0,
+      unit_price_rows: summary.unit_price_rows_planned_updates || 0,
+      unit_price_tier_rows: summary.unit_price_tiers_planned_updates || 0,
+      legacy_price_rows: summary.legacy_price_rows_planned_updates || 0,
+      legacy_wholesale_rows: summary.legacy_wholesale_rows_planned_updates || 0,
       barcodes_new: summary.barcodes_new || 0,
       barcodes_existing: summary.barcodes_existing || 0,
       missing_sku: summary.missing_sku || 0,

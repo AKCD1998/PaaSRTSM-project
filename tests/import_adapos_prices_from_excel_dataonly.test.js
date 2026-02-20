@@ -6,6 +6,7 @@ const assert = require("node:assert/strict");
 const {
   buildProductPlan,
   planRetailChange,
+  planUnitTierChanges,
   planWholesaleChanges,
   planBarcodeChanges,
   buildImportPlan,
@@ -81,6 +82,7 @@ test("missing SKU is skipped and logged in import plan", () => {
     skuMap: new Map(),
     retailMap: new Map(),
     wholesaleMap: new Map(),
+    unitPriceState: new Map(),
     barcodeState: { bySku: new Map(), owners: new Map() },
   });
 
@@ -91,3 +93,60 @@ test("missing SKU is skipped and logged in import plan", () => {
   assert.equal(plan.changes[0].status, "missing_sku");
 });
 
+test("unit-level plan keeps multiple units with different prices", () => {
+  const productPlan = buildProductPlan({
+    product_code: "IC-005555",
+    product_name: "ยา A",
+    category: "",
+    units: [
+      {
+        unit: "แผง",
+        retail_tier_1: 35,
+        retail_tiers_optional: [30, 25, 0, 0, 0, 0, 0],
+        barcodes: [{ barcode: "9999900280388", primary: true }],
+      },
+      {
+        unit: "10 ชิ้น",
+        retail_tier_1: 250,
+        retail_tiers_optional: [250, 250, 80, 80, 80, 80, 80],
+        barcodes: [{ barcode: "6921875051901", primary: true }],
+      },
+    ],
+  });
+
+  const plan = buildImportPlan([productPlan], {
+    skuMap: new Map([["IC-005555", 6401]]),
+    retailMap: new Map(),
+    wholesaleMap: new Map(),
+    unitPriceState: new Map(),
+    barcodeState: { bySku: new Map(), owners: new Map() },
+  });
+
+  assert.equal(plan.summary.sku_found, 1);
+  assert.equal(plan.summary.skipped_no_price, 0);
+  assert.equal(plan.changes[0].status, "planned");
+  assert.equal(plan.changes[0].unit_changes.length, 2);
+  assert.deepEqual(
+    plan.changes[0].unit_changes.map((entry) => [entry.unit, entry.retail.new_price]),
+    [
+      ["แผง", 35],
+      ["10 ชิ้น", 250],
+    ],
+  );
+});
+
+test("unit tier planning updates only provided tiers", () => {
+  const existing = new Map([
+    [2, 90],
+    [3, 80],
+  ]);
+  const planned = planUnitTierChanges(existing, [
+    { tier: 2, value: 90 },
+    { tier: 3, value: 75 },
+    { tier: 4, value: null },
+  ]);
+  assert.deepEqual(planned, [
+    { tier: 2, action: "unchanged", old_price: 90, new_price: 90 },
+    { tier: 3, action: "update", old_price: 80, new_price: 75 },
+  ]);
+});

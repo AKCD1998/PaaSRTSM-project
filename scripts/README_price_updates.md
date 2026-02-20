@@ -46,6 +46,11 @@ node scripts/import_adapos_csv.js --file path/to/monthly_adapos.csv --mode price
 ## Crystal Excel (Data Only) price-only import
 Use this when the CSV export lacks complete prices, but Crystal `Excel (Data Only)` has full price rows.
 
+Run migration for unit-level prices first:
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/011_add_sku_unit_prices.sql
+```
+
 Dry run:
 ```bash
 node scripts/import_adapos_prices_from_excel_dataonly.js --file path/to/rpt_sql_allmpdtentryexceldataonly.xls
@@ -62,6 +67,11 @@ node scripts/import_adapos_prices_from_excel_dataonly.js --file path/to/rpt_sql_
 ```
 
 The script always writes a run log under `logs/price_import_YYYYMMDD_HHMMSS.json`.
+
+Unit-level behavior:
+- Stores prices per `(sku_id, unit)` in `public.sku_unit_prices`.
+- Stores optional tiers 2..8 per unit in `public.sku_unit_price_tiers`.
+- Keeps legacy tables (`prices`, `sku_price_tiers`) updated from the first priced unit for backward compatibility.
 
 ## Notes
 - Enrichment fields are not modified by price-only mode.

@@ -196,10 +196,10 @@ async function queryProducts(db, filters) {
       s.enrichment_status,
       s.avg_cost,
       s.updated_at,
-      retail.price AS retail_price,
-      retail.currency AS retail_currency,
+      COALESCE(retail.price, unit_retail.retail_price) AS retail_price,
+      COALESCE(retail.currency, unit_retail.currency) AS retail_currency,
       retail.effective_start AS retail_effective_start,
-      retail.updated_at AS retail_updated_at
+      COALESCE(retail.updated_at, unit_retail.updated_at) AS retail_updated_at
     FROM public.skus s
     LEFT JOIN LATERAL (
       SELECT p.price, p.currency, p.effective_start, p.updated_at
@@ -209,13 +209,59 @@ async function queryProducts(db, filters) {
       ORDER BY p.effective_start DESC NULLS LAST, p.price_id DESC
       LIMIT 1
     ) retail ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT up.retail_price, up.currency, up.updated_at
+      FROM public.sku_unit_prices up
+      WHERE up.sku_id = s.sku_id
+        AND up.is_active = TRUE
+        AND up.retail_price IS NOT NULL
+      ORDER BY up.unit ASC, up.id ASC
+      LIMIT 1
+    ) unit_retail ON TRUE
     ${where.whereSql}
     ORDER BY s.sku_id DESC
     LIMIT $${where.params.length + 1}
     OFFSET $${where.params.length + 2}
   `;
 
-  const listResult = await db.query(listSql, listParams);
+  let listResult = null;
+  try {
+    listResult = await db.query(listSql, listParams);
+  } catch (error) {
+    if (error?.code !== "42P01") {
+      throw error;
+    }
+    const legacyListSql = `
+      SELECT
+        s.sku_id,
+        s.company_code,
+        s.display_name,
+        s.category_name,
+        s.supplier_code,
+        s.product_kind,
+        s.enrichment_status,
+        s.avg_cost,
+        s.updated_at,
+        retail.price AS retail_price,
+        retail.currency AS retail_currency,
+        retail.effective_start AS retail_effective_start,
+        retail.updated_at AS retail_updated_at
+      FROM public.skus s
+      LEFT JOIN LATERAL (
+        SELECT p.price, p.currency, p.effective_start, p.updated_at
+        FROM public.prices p
+        WHERE p.sku_id = s.sku_id
+          AND p.effective_end IS NULL
+        ORDER BY p.effective_start DESC NULLS LAST, p.price_id DESC
+        LIMIT 1
+      ) retail ON TRUE
+      ${where.whereSql}
+      ORDER BY s.sku_id DESC
+      LIMIT $${where.params.length + 1}
+      OFFSET $${where.params.length + 2}
+    `;
+    listResult = await db.query(legacyListSql, listParams);
+  }
   return {
     total,
     limit: filters.limit,
@@ -296,6 +342,42 @@ async function queryProductDetail(db, skuId, includeHistory) {
   `;
   const tiersResult = await db.query(tiersSql, [skuId]);
 
+  const unitPricesSql = `
+    SELECT
+      up.id,
+      up.unit,
+      up.retail_price,
+      up.currency,
+      up.updated_at,
+      up.source_updated_at,
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'tier', ut.tier,
+            'price', ut.price,
+            'is_active', ut.is_active
+          )
+          ORDER BY ut.tier ASC
+        ) FILTER (WHERE ut.id IS NOT NULL),
+        '[]'::json
+      ) AS tiers
+    FROM public.sku_unit_prices up
+    LEFT JOIN public.sku_unit_price_tiers ut
+      ON ut.sku_unit_price_id = up.id
+    WHERE up.sku_id = $1
+      AND up.is_active = TRUE
+    GROUP BY up.id, up.unit, up.retail_price, up.currency, up.updated_at, up.source_updated_at
+    ORDER BY up.unit ASC, up.id ASC
+  `;
+  let unitPricesResult = { rows: [] };
+  try {
+    unitPricesResult = await db.query(unitPricesSql, [skuId]);
+  } catch (error) {
+    if (error?.code !== "42P01") {
+      throw error;
+    }
+  }
+
   let priceHistory = [];
   if (includeHistory) {
     const historySql = `
@@ -320,6 +402,7 @@ async function queryProductDetail(db, skuId, includeHistory) {
     barcodes: barcodesResult.rows,
     retail_price: retailResult.rows[0] || null,
     wholesale_tiers: tiersResult.rows,
+    unit_prices: unitPricesResult.rows,
     price_history: priceHistory,
   };
 }
