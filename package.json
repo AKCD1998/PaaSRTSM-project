@@ -1,0 +1,27 @@
+{
+  "name": "paasrtsm-project",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "admin-api:start": "node apps/admin-api/src/server.js",
+    "import:adapos": "node scripts/import_adapos_csv.js",
+    "import:sales": "node scripts/import_sales_daily_csv.js",
+    "enrichment:apply": "node scripts/apply_enrichment_rules.js",
+    "enrichment:report": "node scripts/enrichment_report_top_sellers.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "csv-parse": "^5.5.6",
+    "express": "^4.21.2",
+    "iconv-lite": "^0.6.3",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.1"
+  }
+}
