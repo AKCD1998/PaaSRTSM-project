@@ -377,6 +377,18 @@ ul {
   gap: 12px;
 }
 
+.login-title {
+  font-family: "Aptos Display", "Trebuchet MS", sans-serif;
+  font-weight: 700;
+  font-size: 1.8rem;
+  color: var(--ink-main);
+  letter-spacing: 0.01em;
+}
+
+.login-form-grid {
+  grid-template-columns: 1fr;
+}
+
 .toggle-inline {
   display: flex;
   align-items: center;

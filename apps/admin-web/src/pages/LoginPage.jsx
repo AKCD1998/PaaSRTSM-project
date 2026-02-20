@@ -30,11 +30,11 @@ export function LoginPage() {
   return (
     <div className="login-wrap">
       <div className="login-card">
-        <div className="brand-title">Inventory Admin</div>
+        <div className="login-title">Inventory Admin</div>
         <p className="muted">
           Sign in with your assigned admin/staff credentials.
         </p>
-        <form className="form-grid" onSubmit={handleSubmit}>
+        <form className="form-grid login-form-grid" onSubmit={handleSubmit}>
           <label>
             Username / Email
             <input
