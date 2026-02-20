@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+**/dist/
+**/build/
+**/out/
+.vite/
+**/.vite/
+.parcel-cache/
+**/.parcel-cache/
+coverage/
+**/coverage/
+.nyc_output/
+
+# TypeScript / tooling caches
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment files (keep examples)
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+
+# Temp files/directories
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+
+# Test reports
+test-results/
+playwright-report/
