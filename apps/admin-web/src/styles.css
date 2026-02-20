@@ -274,7 +274,7 @@ ul {
 
 .actions-inline {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 10px;
   flex-wrap: wrap;
 }
