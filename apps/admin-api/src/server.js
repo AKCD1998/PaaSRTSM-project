@@ -31,6 +31,13 @@ function appendVaryHeader(res, value) {
   }
 }
 
+function normalizeOrigin(origin) {
+  return String(origin || "")
+    .trim()
+    .replace(/\/+$/g, "")
+    .toLowerCase();
+}
+
 function createCorsMiddleware(config) {
   return function corsMiddleware(req, res, next) {
     const origin = req.headers.origin ? String(req.headers.origin) : "";
@@ -38,7 +45,7 @@ function createCorsMiddleware(config) {
       return next();
     }
 
-    const normalizedOrigin = origin.toLowerCase();
+    const normalizedOrigin = normalizeOrigin(origin);
     const allowOrigin = config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
     if (!allowOrigin) {
       if (req.method === "OPTIONS") {

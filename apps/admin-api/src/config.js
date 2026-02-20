@@ -34,17 +34,30 @@ function parseAllowlist(value) {
   );
 }
 
+function normalizeOrigin(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\/+$/g, "")
+    .toLowerCase();
+}
+
 function parseCsvSet(value, options = {}) {
   if (!value) {
     return new Set();
   }
   const lowercase = Boolean(options.lowercase);
+  const normalizer = typeof options.normalizer === "function" ? options.normalizer : null;
   return new Set(
     String(value)
       .split(",")
       .map((entry) => entry.trim())
       .filter(Boolean)
-      .map((entry) => (lowercase ? entry.toLowerCase() : entry)),
+      .map((entry) => {
+        if (normalizer) {
+          return normalizer(entry);
+        }
+        return lowercase ? entry.toLowerCase() : entry;
+      }),
   );
 }
 
@@ -71,7 +84,9 @@ function loadConfig(env = process.env) {
     cookieSameSite,
     sessionTtlHours: parseIntWithFallback(env.SESSION_TTL_HOURS, 12),
     trustProxy: parseBool(env.TRUST_PROXY, true),
-    corsAllowedOrigins: parseCsvSet(env.CORS_ALLOWED_ORIGINS || "", { lowercase: true }),
+    corsAllowedOrigins: parseCsvSet(env.CORS_ALLOWED_ORIGINS || "", {
+      normalizer: normalizeOrigin,
+    }),
     corsAllowAllOrigins: parseBool(env.CORS_ALLOW_ALL, false),
     loginRateLimitMax: parseIntWithFallback(env.LOGIN_RATE_LIMIT_MAX, 10),
     loginRateLimitWindowMs: parseIntWithFallback(env.LOGIN_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
