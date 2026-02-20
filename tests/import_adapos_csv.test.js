@@ -9,6 +9,7 @@ const {
   decodeAdaPosBuffer,
   parseAdaPosRows,
   buildDryRunPlan,
+  parseProductRow,
 } = require("../scripts/import_adapos_csv");
 
 const FIXTURE_PATH = path.join(__dirname, "fixtures", "adapos_sample.csv");
@@ -73,4 +74,76 @@ test("dry-run planning is deterministic for same input", () => {
     medicine: 3,
     supplement: 1,
   });
+});
+
+test("parser accepts alphanumeric SKU and rejects non-product pseudo code", () => {
+  const base = [
+    "จากรหัส :    ถึงรหัส :",
+    "รายงาน - รายละเอียดสินค้า",
+    "วันที่พิมพ์ : 20/02/2026   เวลา :  9:55:11",
+    "รหัสสินค้า",
+    "ชื่อสินค้า",
+    "กลุ่มสินค้า",
+    "บาร์โค้ด",
+    "ต้นทุนเฉลี่ย",
+    "ผู้จำหน่าย",
+    "ราคาขายปลีก",
+    "1 ",
+    "2",
+    "3 ",
+    "4 ",
+    "5 ",
+    "ผู้แก้ไข",
+    "วันที่",
+    "เวลา",
+    "รายงาน",
+    "Page -1 of 1",
+  ];
+
+  const alphaSkuRow = [
+    ...base,
+    "IC-000001",
+    "ATK Test Kit",
+    "อุปกรณ์การแพทย์",
+    "8850099990001",
+    "25.00",
+    "TT00999",
+    "39.00",
+    "35.00",
+    "34.00",
+    "",
+    "",
+    "admin",
+    "20/02/2026",
+    "09:55:11",
+    "C:\\REPORT\\ITEM.RPT",
+    "Page -1 of 1",
+  ];
+  const alphaParsed = parseProductRow(alphaSkuRow, 1);
+  assert.equal(alphaParsed.product.sku_code, "IC-000001");
+  assert.equal(alphaParsed.product.name_th, "ATK Test Kit");
+  assert.equal(alphaParsed.product.retail_price, 39);
+  assert.equal(alphaParsed.product.wholesale_tiers.length, 2);
+
+  const pseudoCodeRow = [
+    ...base,
+    "Credit Note",
+    "Credit Note",
+    "",
+    "",
+    "0.00",
+    "TT00001",
+    "0.00",
+    "",
+    "",
+    "",
+    "",
+    "admin",
+    "20/02/2026",
+    "09:55:11",
+    "C:\\REPORT\\ITEM.RPT",
+    "Page -1 of 1",
+  ];
+  const pseudoParsed = parseProductRow(pseudoCodeRow, 2);
+  assert.equal(pseudoParsed.skipReason, "no_sku_code");
 });

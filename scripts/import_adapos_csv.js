@@ -34,7 +34,9 @@ const KNOWN_LABELS = new Set([
   "page -1 of 1",
 ]);
 
-const SKU_RE = /^\d{9}$/;
+const SKU_NUMERIC_RE = /^\d{5,20}$/;
+const SKU_ALPHA_DASH_RE = /^[A-Za-z]{1,8}-\d{3,12}$/;
+const SKU_ALPHA_NUM_RE = /^[A-Za-z]{1,8}\d{3,12}$/;
 const BARCODE_RE = /^\d{8,14}$/;
 const SUPPLIER_RE = /^[A-Za-z]{1,6}\d{3,}$/;
 const DATE_RE = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
@@ -45,6 +47,7 @@ const IMPORT_MODE_FULL = "full";
 const IMPORT_MODE_PRICE_ONLY = "price-only";
 const PRICE_HISTORY_OFF = "off";
 const PRICE_HISTORY_ON = "on";
+const NON_PRODUCT_SKU_CODES = new Set(["CREDIT NOTE", "DEBIT NOTE", "DEPOSIT", "DISCOUNT", "OTHER"]);
 
 function usage() {
   return [
@@ -235,12 +238,54 @@ function inferProductKind(name, category) {
   return PRODUCT_KIND_DEFAULT;
 }
 
+function normalizeSkuToken(value) {
+  const raw = normalizeCell(value);
+  if (!raw) {
+    return "";
+  }
+  return raw.replace(/\s+/g, "");
+}
+
+function isPotentialSkuCode(value) {
+  const token = normalizeSkuToken(value);
+  if (!token) {
+    return false;
+  }
+  if (isLikelyLabel(token) || isLikelyAuditToken(token)) {
+    return false;
+  }
+  if (NON_PRODUCT_SKU_CODES.has(token.toUpperCase())) {
+    return false;
+  }
+  // Supplier codes (for example TT00001) can be mistaken as SKU in fallback scans.
+  if (SUPPLIER_RE.test(token) && !token.includes("-")) {
+    return false;
+  }
+  return SKU_NUMERIC_RE.test(token) || SKU_ALPHA_DASH_RE.test(token) || SKU_ALPHA_NUM_RE.test(token);
+}
+
 function extractSkuCandidate(row) {
+  const hasStructuredLabels =
+    normalizeCell(row[3] || "").includes("รหัสสินค้า") && normalizeCell(row[4] || "").includes("ชื่อสินค้า");
+  if (hasStructuredLabels && row.length > 20) {
+    const structuredCode = normalizeSkuToken(row[19] || "");
+    const structuredName = normalizeCell(row[20] || "");
+    if (
+      isPotentialSkuCode(structuredCode) &&
+      structuredName &&
+      parseNumber(structuredName) === null &&
+      !isLikelyLabel(structuredName) &&
+      !isLikelyAuditToken(structuredName)
+    ) {
+      return { index: 19, sku: structuredCode };
+    }
+  }
+
   const candidates = [];
   for (let i = 0; i < row.length; i += 1) {
-    const compact = normalizeCell(row[i]).replace(/\s+/g, "");
-    if (SKU_RE.test(compact)) {
-      candidates.push({ index: i, sku: compact });
+    const token = normalizeSkuToken(row[i]);
+    if (isPotentialSkuCode(token)) {
+      candidates.push({ index: i, sku: token });
     }
   }
   if (candidates.length === 0) {
