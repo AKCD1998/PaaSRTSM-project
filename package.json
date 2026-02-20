@@ -6,6 +6,9 @@
   "scripts": {
     "admin-api:start": "node apps/admin-api/src/server.js",
     "import:adapos": "node scripts/import_adapos_csv.js",
+    "import:adapos-excel": "node scripts/import_adapos_excel_dataonly.js",
+    "import:adapos:prices": "node scripts/import_adapos_prices_from_excel_dataonly.js",
+    "import:adapos:prices:commit": "node scripts/import_adapos_prices_from_excel_dataonly.js --commit",
     "import:sales": "node scripts/import_sales_daily_csv.js",
     "enrichment:apply": "node scripts/apply_enrichment_rules.js",
     "enrichment:report": "node scripts/enrichment_report_top_sellers.js",
@@ -19,7 +22,8 @@
     "iconv-lite": "^0.6.3",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "supertest": "^7.1.1"

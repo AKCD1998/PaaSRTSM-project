@@ -81,6 +81,24 @@ Apply enrichment rules immediately after import commit:
 node scripts/import_adapos_csv.js --file path/to/adapos.csv --commit --apply-rules --db-url "postgresql://..."
 ```
 
+## Crystal Export (Excel Data Only) parser
+For Crystal `Excel (Data Only)` repeating-block files (not flat CSV), use:
+
+```bash
+node scripts/import_adapos_excel_dataonly.js --file path/to/rpt_sql_allmpdtentryexceldataonly.xls --dry-run
+```
+
+Write parsed block output to JSON:
+
+```bash
+node scripts/import_adapos_excel_dataonly.js --file path/to/rpt_sql_allmpdtentryexceldataonly.xls --json-out parsed_products.json
+```
+
+Safety behavior:
+- row classification is pattern-based (`header -> detail -> meta`)
+- if structure looks mismatched, parser prints first 20 rows with column letters + detected pattern counters and stops
+- no DB writes in this parser script
+
 ## Verify wholesale tiers
 ```sql
 SELECT count(*) FROM public.sku_price_tiers;

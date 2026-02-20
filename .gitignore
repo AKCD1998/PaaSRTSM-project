@@ -49,6 +49,7 @@ Thumbs.db
 # Temp files/directories
 tmp/
 temp/
+logs/
 *.tmp
 *.swp
 *.swo

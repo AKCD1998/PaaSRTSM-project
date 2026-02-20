@@ -43,6 +43,26 @@ node scripts/import_adapos_csv.js --file path/to/monthly_adapos.csv --mode price
 node scripts/import_adapos_csv.js --file path/to/monthly_adapos.csv --mode price-only --price-history on --commit --db-url "$DATABASE_URL"
 ```
 
+## Crystal Excel (Data Only) price-only import
+Use this when the CSV export lacks complete prices, but Crystal `Excel (Data Only)` has full price rows.
+
+Dry run:
+```bash
+node scripts/import_adapos_prices_from_excel_dataonly.js --file path/to/rpt_sql_allmpdtentryexceldataonly.xls
+```
+
+Commit in one transaction:
+```bash
+node scripts/import_adapos_prices_from_excel_dataonly.js --file path/to/rpt_sql_allmpdtentryexceldataonly.xls --commit --db-url "$DATABASE_URL"
+```
+
+Quick structure sanity check (no DB):
+```bash
+node scripts/import_adapos_prices_from_excel_dataonly.js --file path/to/rpt_sql_allmpdtentryexceldataonly.xls --check
+```
+
+The script always writes a run log under `logs/price_import_YYYYMMDD_HHMMSS.json`.
+
 ## Notes
 - Enrichment fields are not modified by price-only mode.
 - Wholesale tiers are updated when numeric tier prices are present in CSV parse output.
