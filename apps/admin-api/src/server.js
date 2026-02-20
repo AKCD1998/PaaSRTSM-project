@@ -20,6 +20,54 @@ const { createProductsRouter } = require("./routes/products");
 const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
 
+function appendVaryHeader(res, value) {
+  const existing = String(res.getHeader("Vary") || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (!existing.includes(value)) {
+    existing.push(value);
+    res.setHeader("Vary", existing.join(", "));
+  }
+}
+
+function createCorsMiddleware(config) {
+  return function corsMiddleware(req, res, next) {
+    const origin = req.headers.origin ? String(req.headers.origin) : "";
+    if (!origin) {
+      return next();
+    }
+
+    const normalizedOrigin = origin.toLowerCase();
+    const allowOrigin = config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
+    if (!allowOrigin) {
+      if (req.method === "OPTIONS") {
+        return res.status(403).json({
+          error: "CORS origin not allowed",
+          request_id: req.requestId || null,
+        });
+      }
+      return next();
+    }
+
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id",
+    );
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    appendVaryHeader(res, "Origin");
+    appendVaryHeader(res, "Access-Control-Request-Method");
+    appendVaryHeader(res, "Access-Control-Request-Headers");
+
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+    return next();
+  };
+}
+
 function createApp(overrides = {}) {
   const config = overrides.config || loadConfig(process.env);
   const db = overrides.db || createDbPool(config);
@@ -43,6 +91,7 @@ function createApp(overrides = {}) {
     res.set("x-request-id", req.requestId);
     next();
   });
+  app.use(createCorsMiddleware(config));
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: false, limit: "1mb" }));
   app.use(cookieParser());
