@@ -12,6 +12,8 @@
     "import:sales": "node scripts/import_sales_daily_csv.js",
     "enrichment:apply": "node scripts/apply_enrichment_rules.js",
     "enrichment:report": "node scripts/enrichment_report_top_sellers.js",
+    "embeddings:backfill": "node scripts/backfill_sku_embeddings.js",
+    "embeddings:sync": "node scripts/sync_sku_embeddings.js",
     "test": "node --test"
   },
   "dependencies": {

@@ -182,3 +182,157 @@ SELECT setval(pg_get_serial_sequence('public.prices', 'price_id'), COALESCE(MAX(
 SELECT setval(pg_get_serial_sequence('public.item_components', 'component_id'), COALESCE(MAX(component_id), 1), true) FROM public.item_components;
 ```
 
+## 10) Update (2026-02-21): Hybrid PostgreSQL + pgvector for SKU RAG
+
+### 10.1 เป้าหมายรอบนี้
+- ทำ pipeline แบบ production-safe สำหรับ Hybrid Search:
+  - PostgreSQL = source of truth (โดยเฉพาะ pricing/billing)
+  - pgvector = semantic retrieval สำหรับ SKU
+- หลีกเลี่ยง destructive operations (ไม่มี `DROP`, ไม่มี `TRUNCATE`)
+- เน้น safe default: สคริปต์ backfill/sync เป็น dry-run โดย default
+
+### 10.2 Migration ใหม่
+- ไฟล์: `migrations/012_add_sku_embeddings.sql`
+- สิ่งที่ migration ทำ:
+  - `CREATE EXTENSION IF NOT EXISTS vector;`
+  - สร้างตาราง `public.sku_embeddings`
+  - FK `sku_embeddings.sku_id -> skus.sku_id ON DELETE CASCADE`
+  - unique index ที่ `sku_id` (1 embedding row ต่อ 1 SKU)
+  - metadata indexes (B-tree expression + GIN)
+  - vector index:
+    - พยายามสร้าง `HNSW` ก่อน
+    - ถ้าไม่รองรับ fallback เป็น `IVFFLAT (lists=100)` + `ANALYZE`
+
+โครงสร้างหลักของ `public.sku_embeddings`:
+- `id bigserial PK`
+- `sku_id integer NOT NULL`
+- `embedding vector(1536) NOT NULL`
+- `embedding_dim smallint NOT NULL`
+- `embedding_model text NOT NULL`
+- `embedding_provider text NOT NULL`
+- `text_for_embedding text NOT NULL`
+- `content_hash text NOT NULL`
+- `metadata jsonb NOT NULL DEFAULT '{}'::jsonb`
+- `source_updated_at timestamptz`
+- `updated_at timestamptz NOT NULL DEFAULT now()`
+
+### 10.3 Embedding Provider abstraction
+- ไฟล์: `apps/admin-api/src/embeddings/provider.js`
+- รองรับ provider ผ่าน env:
+  - `EMBEDDING_PROVIDER=openai|local|mock`
+  - `EMBEDDING_MODEL=...`
+  - `EMBEDDING_DIM=...`
+- มี deterministic `mock` provider สำหรับ test/integration ที่ไม่พึ่ง API ภายนอก
+- ไม่มีการ hardcode secret; อ่านผ่าน env เท่านั้น
+
+### 10.4 SKU text + metadata builder
+- ไฟล์: `apps/admin-api/src/embeddings/sku-text.js`
+- สร้าง `text_for_embedding` จากฟิลด์ที่อ่านได้โดยมนุษย์ เช่น:
+  - `display_name`, `generic_name`, `strength_text`, `form`, `route`
+  - `category_name`, `supplier_code`, `product_kind`, `pack_level`, `uom`
+- สร้าง metadata เพื่อใช้ filter ตอน retrieval:
+  - `product_type`, `level`, `company_code`, `category_name`, `supplier_code`, `lang`, `source`
+
+### 10.5 Backfill + Incremental Sync scripts
+- Backfill: `scripts/backfill_sku_embeddings.js`
+- Incremental sync (stale/missing): `scripts/sync_sku_embeddings.js`
+- Shared helper: `scripts/lib/db_config.js`
+
+หลักการสำคัญ:
+- default = dry-run
+- ต้องใส่ `--execute` ถึงจะเขียนข้อมูล
+- เขียนแบบ idempotent UPSERT ตาม `sku_id`
+- ใช้ `content_hash` + source/model/provider checks เพื่อลดการ update ซ้ำไม่จำเป็น
+- log เฉพาะ `sku_id`, text size, dim, action (ไม่ log ข้อความเต็ม ไม่ log secret)
+
+คำสั่งใช้งานหลัก:
+```bash
+# run migration
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/012_add_sku_embeddings.sql
+
+# backfill dry-run (default)
+node scripts/backfill_sku_embeddings.js --db-url "$DATABASE_URL"
+
+# backfill execute
+node scripts/backfill_sku_embeddings.js --execute --db-url "$DATABASE_URL"
+
+# incremental sync dry-run (default)
+node scripts/sync_sku_embeddings.js --db-url "$DATABASE_URL"
+
+# incremental sync execute
+node scripts/sync_sku_embeddings.js --execute --db-url "$DATABASE_URL"
+```
+
+### 10.6 Hybrid retrieval service + API
+- Service:
+  - `apps/admin-api/src/services/sku-embedding-indexer.js`
+  - `apps/admin-api/src/services/sku-hybrid-search.js`
+- Routes:
+  - `apps/admin-api/src/routes/search.js`
+  - mount ใน `apps/admin-api/src/server.js` ที่ `/api/search`
+
+Endpoints:
+- `GET /api/search/health`
+  - เช็กว่า `pgvector` เปิดแล้ว + ตาราง `sku_embeddings` มีอยู่
+- `GET /api/search/skus?q=...&k=...&product_kind=...&level=...`
+  - ถ้า `q` ว่าง: filter only
+  - ถ้า `q` ไม่ว่าง: vector similarity + keyword boost + metadata filters
+- `POST /api/search/skus/sync`
+  - admin only + CSRF
+  - trigger sync แบบ manual ได้
+
+> หมายเหตุ: pricing ยังอ่านจาก SQL (`prices` และ fallback ที่มีอยู่) ไม่คำนวณจาก embeddings
+
+### 10.7 Config ที่เพิ่ม
+- อัปเดต `apps/admin-api/.env.example`
+- อัปเดต `apps/admin-api/src/config.js`
+- ตัวแปรใหม่:
+  - `EMBEDDING_PROVIDER`
+  - `EMBEDDING_MODEL`
+  - `EMBEDDING_DIM`
+  - `EMBEDDING_TIMEOUT_MS`
+  - `OPENAI_BASE_URL` (ถ้าใช้ openai endpoint)
+  - `OPENAI_API_KEY` (เก็บใน env เท่านั้น)
+  - `EMBEDDING_LOCAL_URL` (ถ้าใช้ local provider)
+
+### 10.8 Script aliases ใน package.json
+- `npm run embeddings:backfill`
+- `npm run embeddings:sync`
+
+### 10.9 เอกสารประกอบที่เพิ่ม
+- `scripts/README_embeddings.md`
+- `docs/RAG_VECTOR_CONTEXT_FOR_DRUG_DB.md`
+
+### 10.10 Tests ที่เพิ่มและผลรัน
+ไฟล์ test ใหม่:
+- `tests/sku_embedding_text.test.js`
+- `tests/sku_embedding_upsert.test.js`
+- `tests/sku_hybrid_search_query.test.js`
+- `tests/sku_search_api.test.js`
+
+ผลรันล่าสุด:
+- `npm test` ผ่านทั้งหมด
+- `32 passed, 0 failed`
+
+### 10.11 รายการไฟล์ที่เพิ่ม/แก้ (รอบ Hybrid)
+เพิ่ม:
+- `migrations/012_add_sku_embeddings.sql`
+- `apps/admin-api/src/embeddings/provider.js`
+- `apps/admin-api/src/embeddings/sku-text.js`
+- `apps/admin-api/src/services/sku-embedding-indexer.js`
+- `apps/admin-api/src/services/sku-hybrid-search.js`
+- `apps/admin-api/src/routes/search.js`
+- `scripts/backfill_sku_embeddings.js`
+- `scripts/sync_sku_embeddings.js`
+- `scripts/lib/db_config.js`
+- `scripts/README_embeddings.md`
+- `tests/sku_embedding_text.test.js`
+- `tests/sku_embedding_upsert.test.js`
+- `tests/sku_hybrid_search_query.test.js`
+- `tests/sku_search_api.test.js`
+
+แก้ไข:
+- `apps/admin-api/src/server.js`
+- `apps/admin-api/src/config.js`
+- `apps/admin-api/.env.example`
+- `package.json`

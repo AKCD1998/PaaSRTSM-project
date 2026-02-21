@@ -19,6 +19,7 @@ const { createMeRouter } = require("./routes/me");
 const { createProductsRouter } = require("./routes/products");
 const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
+const { createSearchRouter } = require("./routes/search");
 
 function appendVaryHeader(res, value) {
   const existing = String(res.getHeader("Vary") || "")
@@ -85,6 +86,7 @@ function createApp(overrides = {}) {
     require("../../../scripts/import_adapos_prices_from_excel_dataonly").runImport;
   const runRuleApplication =
     overrides.runRuleApplication || require("../../../scripts/apply_enrichment_rules").runRuleApplication;
+  const searchEmbeddingProvider = overrides.searchEmbeddingProvider || null;
 
   const requireAuthMiddleware = requireAuth(config);
   const loginRateLimitMiddleware =
@@ -155,6 +157,17 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/search",
+    createSearchRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
+      embeddingProvider: searchEmbeddingProvider,
     }),
   );
 

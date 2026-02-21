@@ -1,5 +1,7 @@
 "use strict";
 
+const { inferEmbeddingDimension } = require("./embeddings/provider");
+
 function parseBool(value, fallback) {
   if (value == null || value === "") {
     return fallback;
@@ -69,10 +71,27 @@ function parseCookieSameSite(value, fallback = "lax") {
   return fallback;
 }
 
+function parseOptionalPositiveInt(value, fallback = null) {
+  if (value == null || value === "") {
+    return fallback;
+  }
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) {
+    return fallback;
+  }
+  return n;
+}
+
 function loadConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV || "development";
   const cookieSecure = parseBool(env.COOKIE_SECURE, nodeEnv === "production");
   const cookieSameSite = parseCookieSameSite(env.COOKIE_SAME_SITE, "lax");
+  const embeddingProvider = String(env.EMBEDDING_PROVIDER || "mock").trim().toLowerCase();
+  const embeddingModel = String(
+    env.EMBEDDING_MODEL || (embeddingProvider === "openai" ? "text-embedding-3-small" : "mock-embedding-model"),
+  ).trim();
+  const embeddingDimension =
+    parseOptionalPositiveInt(env.EMBEDDING_DIM, null) || inferEmbeddingDimension(embeddingModel) || 1536;
 
   return {
     nodeEnv,
@@ -91,6 +110,11 @@ function loadConfig(env = process.env) {
     loginRateLimitMax: parseIntWithFallback(env.LOGIN_RATE_LIMIT_MAX, 10),
     loginRateLimitWindowMs: parseIntWithFallback(env.LOGIN_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
     maxUploadBytes: parseIntWithFallback(env.MAX_UPLOAD_MB, 25) * 1024 * 1024,
+    embeddingProvider,
+    embeddingModel,
+    embeddingDimension,
+    embeddingTimeoutMs: parseIntWithFallback(env.EMBEDDING_TIMEOUT_MS, 30_000),
+    embeddingOpenAiBaseUrl: env.OPENAI_BASE_URL || "https://api.openai.com/v1",
     adminUsers: parseAllowlist(env.ADMIN_USERS),
     staffUsers: parseAllowlist(env.STAFF_USERS),
     adminPasswordHash: env.ADMIN_PASSWORD_HASH || "",
