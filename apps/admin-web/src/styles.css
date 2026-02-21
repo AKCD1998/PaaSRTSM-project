@@ -479,6 +479,91 @@ ul {
   animation: spin 0.9s linear infinite;
 }
 
+.progress-overlay-backdrop {
+  z-index: 1500;
+}
+
+.progress-overlay-card {
+  width: min(680px, 94vw);
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 16px;
+  display: grid;
+  gap: 10px;
+}
+
+.progress-overlay-header {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+
+.progress-overlay-title {
+  font-weight: 700;
+}
+
+.progress-overlay-status {
+  font-size: 0.9rem;
+  color: var(--ink-muted);
+}
+
+.progress-overlay-step {
+  font-size: 0.92rem;
+}
+
+.progress-overlay-muted {
+  color: var(--ink-muted);
+  font-size: 0.9rem;
+}
+
+.progress-overlay-error {
+  color: #8b2f24;
+  border: 1px solid #f1c5be;
+  background: #fff4f2;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
+}
+
+.progress-bar-wrap {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: #e7eff4;
+  border: 1px solid #c9d9e3;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #007b80 0%, #009ca3 100%);
+  transition: width 220ms ease;
+}
+
+.progress-bar-fill-indeterminate {
+  width: 35%;
+  position: absolute;
+  animation: indeterminateSlide 1.2s ease-in-out infinite;
+}
+
+.progress-overlay-meta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  color: #245062;
+  font-size: 0.86rem;
+}
+
+.progress-overlay-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .toast-viewport {
   position: fixed;
   right: 12px;
@@ -557,6 +642,15 @@ dd {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes indeterminateSlide {
+  0% {
+    left: -35%;
+  }
+  100% {
+    left: 100%;
   }
 }
 

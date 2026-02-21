@@ -1,9 +1,16 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../lib/api";
 import { stableFormToken, titleize } from "../lib/format";
 import { useAuth } from "../context/AuthContext";
 import { useUi } from "../context/UiContext";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { ProgressOverlay } from "../components/ProgressOverlay";
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
 
 function fileToken(file) {
   if (!file) {
@@ -81,7 +88,8 @@ function SummaryBlock({ summary }) {
 
 export function ImportProductsPage() {
   const { isAdmin, csrfToken } = useAuth();
-  const { withLoading, showToast } = useUi();
+  const { showToast } = useUi();
+  const mountedRef = useRef(true);
   const [file, setFile] = useState(null);
   const [summary, setSummary] = useState(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -93,6 +101,26 @@ export function ImportProductsPage() {
     batchSize: "500",
   });
   const [lastDryRunToken, setLastDryRunToken] = useState("");
+  const [progressOverlay, setProgressOverlay] = useState({
+    open: false,
+    title: "",
+    status: "running",
+    stepLabel: "",
+    processed: null,
+    total: null,
+    percent: null,
+    meta: null,
+    startedAt: null,
+    finishedAt: null,
+    errorMessage: "",
+    networkMessage: "",
+  });
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const currentToken = useMemo(
     () =>
@@ -105,45 +133,120 @@ export function ImportProductsPage() {
 
   const canCommit = isAdmin && Boolean(summary) && summary.mode === "dry-run" && lastDryRunToken === currentToken;
 
+  const setProgressSafe = useCallback((updater) => {
+    if (!mountedRef.current) {
+      return;
+    }
+    setProgressOverlay((prev) => (typeof updater === "function" ? updater(prev) : updater));
+  }, []);
+
+  function openProgress(title, stepLabel) {
+    setProgressSafe({
+      open: true,
+      title,
+      status: "running",
+      stepLabel,
+      processed: null,
+      total: null,
+      percent: null,
+      meta: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      errorMessage: "",
+      networkMessage: "",
+    });
+  }
+
+  function summaryErrorCount(rawSummary) {
+    if (!rawSummary) {
+      return null;
+    }
+    if (Array.isArray(rawSummary.parse_errors)) {
+      return rawSummary.parse_errors.length;
+    }
+    const n = Number(rawSummary.parse_errors);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  async function markProgressSucceeded(rawSummary, stepLabel) {
+    const rowsRead = Number(rawSummary?.rows_read);
+    const totalRows = Number.isFinite(rowsRead) ? rowsRead : null;
+    const errors = summaryErrorCount(rawSummary);
+
+    setProgressSafe((prev) => ({
+      ...prev,
+      status: "succeeded",
+      stepLabel,
+      processed: totalRows,
+      total: totalRows,
+      percent: 100,
+      meta: {
+        inserted: null,
+        updated: null,
+        errors,
+      },
+      finishedAt: new Date().toISOString(),
+      errorMessage: "",
+      networkMessage: "",
+    }));
+
+    await sleep(850);
+    setProgressSafe((prev) => ({
+      ...prev,
+      open: false,
+    }));
+  }
+
+  function markProgressFailed(stepLabel, message) {
+    setProgressSafe((prev) => ({
+      ...prev,
+      status: "failed",
+      stepLabel,
+      finishedAt: new Date().toISOString(),
+      errorMessage: message,
+      networkMessage: "",
+    }));
+  }
+
   async function runDryRun() {
     if (!file) {
       showToast("Choose a CSV file first", "error");
       return;
     }
 
-    await withLoading(async () => {
-      try {
-        const formData = buildFormData(file, form, false);
-        const data = await api.importProducts(formData, csrfToken);
+    openProgress("Import Products (Dry-run)", "อ่านไฟล์และตรวจรูปแบบ");
+    try {
+      const formData = buildFormData(file, form, false);
+      const data = await api.importProducts(formData, csrfToken);
+      if (mountedRef.current) {
         setSummary(data.summary || null);
         setLastDryRunToken(currentToken);
-        showToast("Dry-run completed", "success");
-      } catch (error) {
-        if (error instanceof ApiError) {
-          showToast(error.message, "error");
-        } else {
-          showToast("Dry-run failed", "error");
-        }
       }
-    });
+      await markProgressSucceeded(data.summary || null, "อ่านไฟล์และตรวจรูปแบบ");
+      showToast("Dry-run completed", "success");
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : "Dry-run failed";
+      markProgressFailed("อ่านไฟล์และตรวจรูปแบบ", message);
+      showToast(message, "error");
+    }
   }
 
   async function runCommit() {
     setConfirmOpen(false);
-    await withLoading(async () => {
-      try {
-        const formData = buildFormData(file, form, true);
-        const data = await api.importProducts(formData, csrfToken);
+    openProgress("Import Products (Execute)", "Upsert เข้าฐานข้อมูล");
+    try {
+      const formData = buildFormData(file, form, true);
+      const data = await api.importProducts(formData, csrfToken);
+      if (mountedRef.current) {
         setSummary(data.summary || null);
-        showToast("Import commit finished", "success");
-      } catch (error) {
-        if (error instanceof ApiError) {
-          showToast(error.message, "error");
-        } else {
-          showToast("Commit failed", "error");
-        }
       }
-    });
+      await markProgressSucceeded(data.summary || null, "Upsert เข้าฐานข้อมูล");
+      showToast("Import commit finished", "success");
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : "Commit failed";
+      markProgressFailed("Upsert เข้าฐานข้อมูล", message);
+      showToast(message, "error");
+    }
   }
 
   if (!isAdmin) {
@@ -261,6 +364,30 @@ export function ImportProductsPage() {
         confirmLabel="Commit"
         onConfirm={runCommit}
         onCancel={() => setConfirmOpen(false)}
+      />
+
+      <ProgressOverlay
+        open={progressOverlay.open}
+        title={progressOverlay.title}
+        status={progressOverlay.status}
+        stepLabel={progressOverlay.stepLabel}
+        processed={progressOverlay.processed}
+        total={progressOverlay.total}
+        percent={progressOverlay.percent}
+        meta={progressOverlay.meta}
+        startedAt={progressOverlay.startedAt}
+        finishedAt={progressOverlay.finishedAt}
+        errorMessage={progressOverlay.errorMessage}
+        networkMessage={progressOverlay.networkMessage}
+        onClose={
+          progressOverlay.status === "running" || progressOverlay.status === "queued"
+            ? undefined
+            : () =>
+                setProgressSafe((prev) => ({
+                  ...prev,
+                  open: false,
+                }))
+        }
       />
     </div>
   );
