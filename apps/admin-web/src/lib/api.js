@@ -142,4 +142,27 @@ export const api = {
       csrfToken,
     });
   },
+  triggerSkuEmbeddingSync(payload, csrfToken) {
+    return request("/api/search/skus/sync", {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
+  listSkuEmbeddingSyncJobs(params) {
+    return request("/api/search/skus/sync/jobs", {
+      query: params,
+    });
+  },
+  getSkuEmbeddingSyncJob(jobId, params) {
+    return request(`/api/search/skus/sync/jobs/${jobId}`, {
+      query: params,
+    });
+  },
+  cancelSkuEmbeddingSyncJob(jobId, csrfToken) {
+    return request(`/api/search/skus/sync/jobs/${jobId}/cancel`, {
+      method: "POST",
+      csrfToken,
+    });
+  },
 };

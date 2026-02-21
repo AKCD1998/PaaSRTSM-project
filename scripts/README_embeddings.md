@@ -3,6 +3,7 @@
 ## 1) Run migration
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/012_add_sku_embeddings.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/013_add_embedding_sync_jobs.sql
 ```
 
 ## 2) Environment
@@ -50,7 +51,10 @@ node scripts/sync_sku_embeddings.js --execute --since "2026-02-01T00:00:00Z" --d
 ## 5) API endpoints
 - Health: `GET /api/search/health`
 - Hybrid SKU search (admin/staff auth required): `GET /api/search/skus?q=...&k=20&product_kind=medicine&level=base`
-- Manual sync trigger (admin + CSRF): `POST /api/search/skus/sync`
+- Async sync trigger (admin + CSRF): `POST /api/search/skus/sync`
+- Sync jobs list (admin): `GET /api/search/skus/sync/jobs?limit=50`
+- Sync job detail (admin): `GET /api/search/skus/sync/jobs/:job_id?items_limit=200`
+- Sync cancel (admin + CSRF): `POST /api/search/skus/sync/jobs/:job_id/cancel`
 
 Example curl (search):
 ```bash
@@ -79,3 +83,5 @@ LIMIT 20;
 - Price must come from `public.prices` (SQL) for deterministic billing.
 - Migration attempts `HNSW`; if unavailable it falls back to `IVFFLAT`.
 - For `IVFFLAT`, tune `lists` for dataset size and run `ANALYZE` after bulk load.
+- Sync trigger endpoint is rate-limited to 1 request/minute/admin.
+- Only one active sync job is allowed at a time (`queued` or `running`); additional triggers return `409`.

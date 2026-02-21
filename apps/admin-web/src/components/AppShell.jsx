@@ -49,6 +49,11 @@ export function AppShell({ children }) {
               Apply Rules
             </NavLink>
           )}
+          {isAdmin && (
+            <NavLink to="/embeddings/sync" className={navClass}>
+              Embedding Jobs
+            </NavLink>
+          )}
         </nav>
       </aside>
       <main className="main-panel">

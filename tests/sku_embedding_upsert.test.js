@@ -41,5 +41,30 @@ test("upsertSkuEmbedding returns unchanged when conflict update is skipped", asy
   };
 
   const result = await upsertSkuEmbedding(db, sampleRecord(), { execute: true });
-  assert.equal(result.action, "unchanged");
+  assert.equal(result.action, "skip");
+  assert.equal(result.reason, "unchanged");
+});
+
+test("upsertSkuEmbedding dry-run does not issue write SQL", async () => {
+  let queryCalled = false;
+  const db = {
+    async query() {
+      queryCalled = true;
+      return { rowCount: 0, rows: [] };
+    },
+  };
+
+  const result = await upsertSkuEmbedding(db, sampleRecord(), {
+    execute: false,
+    existingRow: {
+      embedding_sku_id: 101,
+      existing_content_hash: "abc123",
+      existing_embedding_model: "text-embedding-3-small",
+      existing_embedding_provider: "mock",
+      embedding_source_updated_at: "2026-02-21T10:00:00.000Z",
+    },
+  });
+
+  assert.equal(result.action, "skip");
+  assert.equal(queryCalled, false);
 });

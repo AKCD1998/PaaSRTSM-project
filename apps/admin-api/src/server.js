@@ -87,6 +87,7 @@ function createApp(overrides = {}) {
   const runRuleApplication =
     overrides.runRuleApplication || require("../../../scripts/apply_enrichment_rules").runRuleApplication;
   const searchEmbeddingProvider = overrides.searchEmbeddingProvider || null;
+  const searchEmbeddingSyncJobRunner = overrides.searchEmbeddingSyncJobRunner || null;
 
   const requireAuthMiddleware = requireAuth(config);
   const loginRateLimitMiddleware =
@@ -168,6 +169,7 @@ function createApp(overrides = {}) {
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
       embeddingProvider: searchEmbeddingProvider,
+      embeddingSyncJobRunner: searchEmbeddingSyncJobRunner,
     }),
   );
 

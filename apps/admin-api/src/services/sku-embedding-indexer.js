@@ -14,6 +14,10 @@ function clampBatchSize(value) {
   return Math.min(n, MAX_BATCH_SIZE);
 }
 
+function normalizeText(value) {
+  return String(value == null ? "" : value).trim();
+}
+
 function parsePositiveInt(value, fallback = null) {
   if (value == null || value === "") {
     return fallback;
@@ -25,12 +29,87 @@ function parsePositiveInt(value, fallback = null) {
   return n;
 }
 
+function normalizeNullableText(value) {
+  const normalized = normalizeText(value);
+  return normalized === "" ? null : normalized;
+}
+
+function normalizeTimestamp(value) {
+  if (!value) {
+    return null;
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date.toISOString();
+}
+
+function timestampsEqual(a, b) {
+  return normalizeTimestamp(a) === normalizeTimestamp(b);
+}
+
 function sleep(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n <= 0) {
     return Promise.resolve();
   }
   return new Promise((resolve) => setTimeout(resolve, n));
+}
+
+function normalizeSyncFilters(filters = {}) {
+  const source = filters && typeof filters === "object" ? filters : {};
+  const companyCode = normalizeNullableText(source.company_code || source.companyCode);
+  const productKind = normalizeNullableText(source.product_kind || source.productKind);
+  const categoryName = normalizeNullableText(source.category_name || source.categoryName);
+  const supplierCode = normalizeNullableText(source.supplier_code || source.supplierCode);
+  const skuIdMin = parsePositiveInt(source.sku_id_min ?? source.skuIdMin, null);
+  const skuIdMax = parsePositiveInt(source.sku_id_max ?? source.skuIdMax, null);
+
+  return {
+    companyCode,
+    productKind,
+    categoryName,
+    supplierCode,
+    skuIdMin,
+    skuIdMax,
+  };
+}
+
+function buildSyncFilterClause(filters, params) {
+  const clauses = [];
+
+  if (filters.companyCode) {
+    params.push(filters.companyCode);
+    clauses.push(`s.company_code = $${params.length}`);
+  }
+
+  if (filters.productKind) {
+    params.push(filters.productKind);
+    clauses.push(`s.product_kind = $${params.length}`);
+  }
+
+  if (filters.categoryName) {
+    params.push(`%${filters.categoryName}%`);
+    clauses.push(`s.category_name ILIKE $${params.length}`);
+  }
+
+  if (filters.supplierCode) {
+    params.push(`%${filters.supplierCode}%`);
+    clauses.push(`s.supplier_code ILIKE $${params.length}`);
+  }
+
+  if (filters.skuIdMin != null) {
+    params.push(filters.skuIdMin);
+    clauses.push(`s.sku_id >= $${params.length}`);
+  }
+
+  if (filters.skuIdMax != null) {
+    params.push(filters.skuIdMax);
+    clauses.push(`s.sku_id <= $${params.length}`);
+  }
+
+  return clauses;
 }
 
 function toVectorLiteral(vector) {
@@ -45,6 +124,20 @@ function toVectorLiteral(vector) {
     return Number(n.toFixed(10));
   });
   return `[${values.join(",")}]`;
+}
+
+function classifyDryRunAction(sku, record) {
+  if (!sku.embedding_sku_id) {
+    return "insert";
+  }
+
+  const unchanged =
+    normalizeNullableText(sku.existing_content_hash) === normalizeNullableText(record.contentHash) &&
+    normalizeNullableText(sku.existing_embedding_model) === normalizeNullableText(record.embeddingModel) &&
+    normalizeNullableText(sku.existing_embedding_provider) === normalizeNullableText(record.embeddingProvider) &&
+    timestampsEqual(sku.embedding_source_updated_at, record.sourceUpdatedAt);
+
+  return unchanged ? "skip" : "update";
 }
 
 function computeContentHash(text) {
@@ -131,10 +224,15 @@ function buildUpsertSkuEmbeddingStatement(record) {
 
 async function upsertSkuEmbedding(db, record, options = {}) {
   const execute = Boolean(options.execute);
+  const existingRow = options.existingRow || null;
   if (!execute) {
+    const action = classifyDryRunAction(existingRow || {}, record);
     return {
-      action: "planned",
+      action,
       skuId: record.skuId,
+      contentHashBefore: normalizeNullableText(existingRow?.existing_content_hash),
+      contentHashAfter: record.contentHash,
+      reason: action === "skip" ? "unchanged" : "dry_run_prediction",
     };
   }
 
@@ -142,13 +240,19 @@ async function upsertSkuEmbedding(db, record, options = {}) {
   const result = await db.query(statement.sql, statement.params);
   if (result.rowCount === 0) {
     return {
-      action: "unchanged",
+      action: "skip",
       skuId: record.skuId,
+      contentHashBefore: normalizeNullableText(existingRow?.existing_content_hash),
+      contentHashAfter: record.contentHash,
+      reason: "unchanged",
     };
   }
   return {
-    action: result.rows[0]?.inserted ? "inserted" : "updated",
+    action: result.rows[0]?.inserted ? "insert" : "update",
     skuId: record.skuId,
+    contentHashBefore: normalizeNullableText(existingRow?.existing_content_hash),
+    contentHashAfter: record.contentHash,
+    reason: result.rows[0]?.inserted ? "inserted" : "updated",
   };
 }
 
@@ -157,6 +261,27 @@ async function fetchSkuEmbeddingBatch(db, options = {}) {
   const batchSize = clampBatchSize(options.batchSize);
   const onlyStale = Boolean(options.onlyStale);
   const updatedSince = options.updatedSince || null;
+  const embeddingModel = normalizeNullableText(options.embeddingModel);
+  const embeddingProvider = normalizeNullableText(options.embeddingProvider);
+  const filters = normalizeSyncFilters(options.filters || {});
+
+  const params = [afterSkuId, updatedSince, onlyStale, embeddingModel, embeddingProvider];
+  const where = [
+    "s.sku_id > $1",
+    "($2::timestamptz IS NULL OR s.updated_at >= $2::timestamptz)",
+    `(
+      NOT $3::boolean
+      OR e.sku_id IS NULL
+      OR e.source_updated_at IS NULL
+      OR e.source_updated_at < s.updated_at
+      OR ($4::text IS NOT NULL AND e.embedding_model IS DISTINCT FROM $4::text)
+      OR ($5::text IS NOT NULL AND e.embedding_provider IS DISTINCT FROM $5::text)
+    )`,
+  ];
+
+  const filterClauses = buildSyncFilterClause(filters, params);
+  where.push(...filterClauses);
+  params.push(batchSize);
 
   const sql = `
     SELECT
@@ -180,25 +305,22 @@ async function fetchSkuEmbeddingBatch(db, options = {}) {
       s.updated_at AS sku_updated_at,
       i.display_name AS item_display_name,
       i.generic_name AS item_generic_name,
+      e.sku_id AS embedding_sku_id,
+      e.content_hash AS existing_content_hash,
+      e.embedding_model AS existing_embedding_model,
+      e.embedding_provider AS existing_embedding_provider,
       e.source_updated_at AS embedding_source_updated_at
     FROM public.skus s
     LEFT JOIN public.items i
       ON i.item_id = s.item_id
     LEFT JOIN public.sku_embeddings e
       ON e.sku_id = s.sku_id
-    WHERE s.sku_id > $1
-      AND ($2::timestamptz IS NULL OR s.updated_at >= $2::timestamptz)
-      AND (
-        NOT $3::boolean
-        OR e.sku_id IS NULL
-        OR e.source_updated_at IS NULL
-        OR e.source_updated_at < s.updated_at
-      )
+    WHERE ${where.join("\n      AND ")}
     ORDER BY s.sku_id ASC
-    LIMIT $4
+    LIMIT $${params.length}
   `;
 
-  const result = await db.query(sql, [afterSkuId, updatedSince, onlyStale, batchSize]);
+  const result = await db.query(sql, params);
   return result.rows;
 }
 
@@ -210,6 +332,10 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
   const maxRows = parsePositiveInt(options.limit, null);
   const rateLimitMs = parsePositiveInt(options.rateLimitMs, 0) || 0;
   const logger = typeof options.logger === "function" ? options.logger : () => {};
+  const onItem = typeof options.onItem === "function" ? options.onItem : null;
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+  const shouldCancel = typeof options.shouldCancel === "function" ? options.shouldCancel : null;
+  const filters = normalizeSyncFilters(options.filters || {});
 
   const summary = {
     mode: execute ? "execute" : "dry-run",
@@ -223,11 +349,17 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
     batches: 0,
     last_sku_id: null,
     only_stale: onlyStale,
+    canceled: false,
   };
 
   let afterSkuId = parsePositiveInt(options.afterSkuId, 0) || 0;
 
   while (true) {
+    if (shouldCancel && (await shouldCancel(summary))) {
+      summary.canceled = true;
+      break;
+    }
+
     const remaining = maxRows == null ? batchSize : Math.max(maxRows - summary.processed, 0);
     if (remaining === 0) {
       break;
@@ -237,6 +369,9 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
       afterSkuId,
       updatedSince,
       onlyStale,
+      embeddingModel: embeddingProvider.model,
+      embeddingProvider: embeddingProvider.name,
+      filters,
       batchSize: Math.min(batchSize, remaining),
     });
     if (rows.length === 0) {
@@ -246,6 +381,11 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
     summary.batches += 1;
 
     for (const sku of rows) {
+      if (shouldCancel && (await shouldCancel(summary))) {
+        summary.canceled = true;
+        break;
+      }
+
       const textForEmbedding = buildSkuEmbeddingText(sku);
       if (!textForEmbedding) {
         summary.skipped += 1;
@@ -253,6 +393,20 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
         afterSkuId = sku.sku_id;
         summary.last_sku_id = sku.sku_id;
         logger(`[sku-embeddings] sku_id=${sku.sku_id} skipped=empty_text`);
+        if (onItem) {
+          await onItem({
+            skuId: sku.sku_id,
+            action: "skip",
+            reason: "empty_text",
+            contentHashBefore: normalizeNullableText(sku.existing_content_hash),
+            contentHashAfter: null,
+            errorMessage: null,
+            mode: summary.mode,
+          });
+        }
+        if (onProgress) {
+          await onProgress({ ...summary });
+        }
         continue;
       }
 
@@ -265,8 +419,25 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
         }
 
         const record = buildSkuEmbeddingRecord(sku, embeddingProvider, embeddingVector);
-        const writeResult = await upsertSkuEmbedding(db, record, { execute });
-        summary[writeResult.action] += 1;
+        const writeResult = await upsertSkuEmbedding(db, record, {
+          execute,
+          existingRow: sku,
+        });
+        if (writeResult.action === "insert") {
+          summary.inserted += 1;
+          if (!execute) {
+            summary.planned += 1;
+          }
+        } else if (writeResult.action === "update") {
+          summary.updated += 1;
+          if (!execute) {
+            summary.planned += 1;
+          }
+        } else if (writeResult.action === "skip") {
+          summary.unchanged += writeResult.reason === "unchanged" ? 1 : 0;
+          summary.skipped += writeResult.reason === "unchanged" ? 0 : 1;
+        }
+
         summary.processed += 1;
         summary.last_sku_id = sku.sku_id;
         afterSkuId = sku.sku_id;
@@ -274,6 +445,21 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
         logger(
           `[sku-embeddings] sku_id=${sku.sku_id} text_chars=${textForEmbedding.length} dim=${embeddingVector.length} action=${writeResult.action}`,
         );
+
+        if (onItem) {
+          await onItem({
+            skuId: sku.sku_id,
+            action: writeResult.action,
+            reason: writeResult.reason || "",
+            contentHashBefore: writeResult.contentHashBefore || normalizeNullableText(sku.existing_content_hash),
+            contentHashAfter: writeResult.contentHashAfter || null,
+            errorMessage: null,
+            mode: summary.mode,
+          });
+        }
+        if (onProgress) {
+          await onProgress({ ...summary });
+        }
 
         if (rateLimitMs > 0) {
           await sleep(rateLimitMs);
@@ -284,7 +470,25 @@ async function indexSkuEmbeddings(db, embeddingProvider, options = {}) {
         summary.last_sku_id = sku.sku_id;
         afterSkuId = sku.sku_id;
         logger(`[sku-embeddings] sku_id=${sku.sku_id} error=${error.message}`);
+        if (onItem) {
+          await onItem({
+            skuId: sku.sku_id,
+            action: "error",
+            reason: "processing_error",
+            contentHashBefore: normalizeNullableText(sku.existing_content_hash),
+            contentHashAfter: null,
+            errorMessage: error.message,
+            mode: summary.mode,
+          });
+        }
+        if (onProgress) {
+          await onProgress({ ...summary });
+        }
       }
+    }
+
+    if (summary.canceled) {
+      break;
     }
   }
 
@@ -295,7 +499,12 @@ module.exports = {
   DEFAULT_BATCH_SIZE,
   MAX_BATCH_SIZE,
   clampBatchSize,
+  normalizeSyncFilters,
+  buildSyncFilterClause,
+  normalizeTimestamp,
+  timestampsEqual,
   toVectorLiteral,
+  classifyDryRunAction,
   computeContentHash,
   buildSkuEmbeddingRecord,
   buildUpsertSkuEmbeddingStatement,

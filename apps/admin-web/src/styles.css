@@ -359,6 +359,35 @@ ul {
   background: #f4f5f6;
 }
 
+.status-queued {
+  background: #fff8e5;
+  color: #6d4a06;
+}
+
+.status-running {
+  background: #e8f3ff;
+  color: #1d4f8f;
+}
+
+.status-succeeded {
+  background: #def8ec;
+  color: #17563f;
+}
+
+.status-failed {
+  background: #ffe8e5;
+  color: #8a2f24;
+}
+
+.status-canceled {
+  background: #f1f3f5;
+  color: #4d5963;
+}
+
+.row-selected {
+  background: #f0f7fb;
+}
+
 .login-wrap {
   min-height: 100vh;
   display: grid;
