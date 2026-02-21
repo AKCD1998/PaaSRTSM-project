@@ -618,6 +618,43 @@ ul {
   gap: 12px;
 }
 
+.product-picker-modal-card {
+  width: min(1200px, 96vw);
+  max-height: 90vh;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.product-picker-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.product-picker-table-wrap {
+  overflow: auto;
+  max-height: min(55vh, 560px);
+}
+
+.product-picker-row {
+  cursor: pointer;
+}
+
+.product-picker-row:hover {
+  background: #f6fbff;
+}
+
+.product-picker-error {
+  color: #8b2f24;
+  border: 1px solid #f1c5be;
+  background: #fff4f2;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

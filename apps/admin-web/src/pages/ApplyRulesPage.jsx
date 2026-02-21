@@ -4,6 +4,7 @@ import { formatDateTime, stableFormToken } from "../lib/format";
 import { useAuth } from "../context/AuthContext";
 import { useUi } from "../context/UiContext";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { ProductPickerModal } from "../components/ProductPickerModal";
 
 const EMPTY_RULE_FORM = {
   isEnabled: true,
@@ -112,6 +113,8 @@ export function ApplyRulesPage() {
   const [rulesLoading, setRulesLoading] = useState(false);
   const [editingRuleId, setEditingRuleId] = useState(null);
   const [ruleForm, setRuleForm] = useState(() => ({ ...EMPTY_RULE_FORM }));
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [selectedProduct, setSelectedProduct] = useState(null);
 
   const currentToken = useMemo(() => stableFormToken(applyForm), [applyForm]);
   const canCommit = isAdmin && summary?.mode === "dry-run" && lastDryRunToken === currentToken;
@@ -289,14 +292,33 @@ export function ApplyRulesPage() {
             saveRule();
           }}
         >
-          <label className="toggle-inline">
-            <input
-              type="checkbox"
-              checked={ruleForm.isEnabled}
-              onChange={(event) => setRuleForm((prev) => ({ ...prev, isEnabled: event.target.checked }))}
-            />
-            Rule Enabled
-          </label>
+          <div className="stack">
+            <div className="actions-inline">
+              <label className="toggle-inline">
+                <input
+                  type="checkbox"
+                  checked={ruleForm.isEnabled}
+                  onChange={(event) => setRuleForm((prev) => ({ ...prev, isEnabled: event.target.checked }))}
+                />
+                Rule Enabled
+              </label>
+              <button type="button" className="btn btn-secondary" onClick={() => setPickerOpen(true)}>
+                Product to enrich
+              </button>
+            </div>
+            {selectedProduct ? (
+              <div className="actions-inline">
+                <span className="muted">
+                  Selected: {selectedProduct.sku_id} - {selectedProduct.display_name || "-"}
+                </span>
+                <button type="button" className="btn btn-secondary" onClick={() => setPickerOpen(true)}>
+                  Change
+                </button>
+              </div>
+            ) : (
+              <span className="muted">No product selected.</span>
+            )}
+          </div>
           <label>
             Priority
             <input
@@ -558,6 +580,14 @@ export function ApplyRulesPage() {
         confirmLabel="Commit"
         onConfirm={runCommit}
         onCancel={() => setConfirmOpen(false)}
+      />
+
+      <ProductPickerModal
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onSelect={(product) => {
+          setSelectedProduct(product);
+        }}
       />
     </div>
   );
