@@ -4,8 +4,34 @@ const express = require("express");
 const { auditLog } = require("../audit");
 const { auditBase } = require("../utils/audit-payload");
 
+const VALID_RULE_STATUS = new Set(["missing", "partial", "verified"]);
+
 function normalizeText(value) {
   return String(value == null ? "" : value).trim();
+}
+
+function normalizeNullableText(value) {
+  const normalized = normalizeText(value);
+  return normalized === "" ? null : normalized;
+}
+
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj || {}, key);
+}
+
+function readBodyValue(body, aliases) {
+  for (const alias of aliases) {
+    if (hasOwn(body, alias)) {
+      return {
+        present: true,
+        value: body[alias],
+      };
+    }
+  }
+  return {
+    present: false,
+    value: undefined,
+  };
 }
 
 function parsePositiveInt(value, fallback, maxValue = null) {
@@ -110,6 +136,199 @@ function parseApplyRulesBody(body) {
   };
 }
 
+function parseRuleId(rawRuleId) {
+  const ruleId = parsePositiveInt(rawRuleId, null);
+  if (ruleId == null) {
+    throw new Error("rule_id must be a positive integer");
+  }
+  return ruleId;
+}
+
+function parseRuleWriteBody(body, options = {}) {
+  const isUpdate = Boolean(options.isUpdate);
+  const payload = {};
+  const textFieldAliases = [
+    { aliases: ["match_name_regex", "matchNameRegex"], column: "match_name_regex" },
+    { aliases: ["match_category_regex", "matchCategoryRegex"], column: "match_category_regex" },
+    { aliases: ["match_supplier_regex", "matchSupplierRegex"], column: "match_supplier_regex" },
+    { aliases: ["set_generic_name", "setGenericName"], column: "set_generic_name" },
+    { aliases: ["set_strength_text", "setStrengthText"], column: "set_strength_text" },
+    { aliases: ["set_form", "setForm"], column: "set_form" },
+    { aliases: ["set_route", "setRoute"], column: "set_route" },
+    { aliases: ["set_product_kind", "setProductKind"], column: "set_product_kind" },
+    { aliases: ["note"], column: "note" },
+  ];
+
+  for (const field of textFieldAliases) {
+    const resolved = readBodyValue(body, field.aliases);
+    if (isUpdate && !resolved.present) {
+      continue;
+    }
+    payload[field.column] = normalizeNullableText(resolved.value);
+  }
+
+  const enabledValue = readBodyValue(body, ["is_enabled", "isEnabled"]);
+  if (!isUpdate || enabledValue.present) {
+    payload.is_enabled = parseBoolean(enabledValue.value, true);
+  }
+
+  const priorityValue = readBodyValue(body, ["priority"]);
+  if (!isUpdate || priorityValue.present) {
+    const priority = parsePositiveInt(priorityValue.value, 100, 100000);
+    if (priority == null) {
+      throw new Error("priority must be a positive integer");
+    }
+    payload.priority = priority;
+  }
+
+  const setStatusValue = readBodyValue(body, ["set_status", "setStatus"]);
+  if (!isUpdate || setStatusValue.present) {
+    const status = normalizeText(setStatusValue.value).toLowerCase() || "partial";
+    if (!VALID_RULE_STATUS.has(status)) {
+      throw new Error("set_status must be one of missing|partial|verified");
+    }
+    payload.set_status = status;
+  }
+
+  if (!isUpdate) {
+    const hasMatcher =
+      Boolean(payload.match_name_regex) ||
+      Boolean(payload.match_category_regex) ||
+      Boolean(payload.match_supplier_regex);
+    if (!hasMatcher) {
+      throw new Error("at least one matcher is required (name/category/supplier regex)");
+    }
+  }
+
+  if (isUpdate && Object.keys(payload).length === 0) {
+    throw new Error("no updatable fields provided");
+  }
+
+  return payload;
+}
+
+async function listRules(db) {
+  const result = await db.query(
+    `
+      SELECT
+        rule_id,
+        is_enabled,
+        priority,
+        match_name_regex,
+        match_category_regex,
+        match_supplier_regex,
+        set_generic_name,
+        set_strength_text,
+        set_form,
+        set_route,
+        set_product_kind,
+        set_status,
+        note,
+        created_at,
+        updated_at
+      FROM public.enrichment_rules
+      ORDER BY priority ASC, rule_id ASC
+    `,
+  );
+  return result.rows;
+}
+
+async function createRule(db, payload) {
+  const result = await db.query(
+    `
+      INSERT INTO public.enrichment_rules (
+        is_enabled,
+        priority,
+        match_name_regex,
+        match_category_regex,
+        match_supplier_regex,
+        set_generic_name,
+        set_strength_text,
+        set_form,
+        set_route,
+        set_product_kind,
+        set_status,
+        note,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now()
+      )
+      RETURNING
+        rule_id,
+        is_enabled,
+        priority,
+        match_name_regex,
+        match_category_regex,
+        match_supplier_regex,
+        set_generic_name,
+        set_strength_text,
+        set_form,
+        set_route,
+        set_product_kind,
+        set_status,
+        note,
+        created_at,
+        updated_at
+    `,
+    [
+      payload.is_enabled,
+      payload.priority,
+      payload.match_name_regex,
+      payload.match_category_regex,
+      payload.match_supplier_regex,
+      payload.set_generic_name,
+      payload.set_strength_text,
+      payload.set_form,
+      payload.set_route,
+      payload.set_product_kind,
+      payload.set_status,
+      payload.note,
+    ],
+  );
+  return result.rows[0];
+}
+
+async function updateRule(db, ruleId, payload) {
+  const updates = [];
+  const params = [];
+  let idx = 1;
+  for (const [column, value] of Object.entries(payload)) {
+    updates.push(`${column} = $${idx}`);
+    params.push(value);
+    idx += 1;
+  }
+  updates.push("updated_at = now()");
+  params.push(ruleId);
+
+  const result = await db.query(
+    `
+      UPDATE public.enrichment_rules
+      SET ${updates.join(", ")}
+      WHERE rule_id = $${idx}
+      RETURNING
+        rule_id,
+        is_enabled,
+        priority,
+        match_name_regex,
+        match_category_regex,
+        match_supplier_regex,
+        set_generic_name,
+        set_strength_text,
+        set_form,
+        set_route,
+        set_product_kind,
+        set_status,
+        note,
+        created_at,
+        updated_at
+    `,
+    params,
+  );
+  return result.rows[0] || null;
+}
+
 function createEnrichmentRouter(deps) {
   const {
     config,
@@ -121,6 +340,108 @@ function createEnrichmentRouter(deps) {
   } = deps;
 
   const router = express.Router();
+
+  router.get(
+    "/rules",
+    requireAuthMiddleware,
+    requireRoleMiddleware("admin"),
+    async (req, res, next) => {
+      try {
+        const rows = await listRules(db);
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          rows,
+        });
+      } catch (error) {
+        if (error.code === "42P01") {
+          return res.status(400).json({
+            error: "enrichment_rules table not found. Run migrations/004_add_enrichment_workflow.sql first.",
+            request_id: req.requestId,
+          });
+        }
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
+    "/rules",
+    requireAuthMiddleware,
+    requireRoleMiddleware("admin"),
+    requireCsrfMiddleware,
+    async (req, res, next) => {
+      let payload = null;
+      try {
+        payload = parseRuleWriteBody(req.body || {}, { isUpdate: false });
+      } catch (error) {
+        return res.status(400).json({
+          error: error.message,
+          request_id: req.requestId,
+        });
+      }
+
+      try {
+        const row = await createRule(db, payload);
+        return res.status(201).json({
+          ok: true,
+          request_id: req.requestId,
+          row,
+        });
+      } catch (error) {
+        if (error.code === "42P01") {
+          return res.status(400).json({
+            error: "enrichment_rules table not found. Run migrations/004_add_enrichment_workflow.sql first.",
+            request_id: req.requestId,
+          });
+        }
+        return next(error);
+      }
+    },
+  );
+
+  router.put(
+    "/rules/:rule_id",
+    requireAuthMiddleware,
+    requireRoleMiddleware("admin"),
+    requireCsrfMiddleware,
+    async (req, res, next) => {
+      let ruleId = null;
+      let payload = null;
+      try {
+        ruleId = parseRuleId(req.params.rule_id);
+        payload = parseRuleWriteBody(req.body || {}, { isUpdate: true });
+      } catch (error) {
+        return res.status(400).json({
+          error: error.message,
+          request_id: req.requestId,
+        });
+      }
+
+      try {
+        const row = await updateRule(db, ruleId, payload);
+        if (!row) {
+          return res.status(404).json({
+            error: "Rule not found",
+            request_id: req.requestId,
+          });
+        }
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          row,
+        });
+      } catch (error) {
+        if (error.code === "42P01") {
+          return res.status(400).json({
+            error: "enrichment_rules table not found. Run migrations/004_add_enrichment_workflow.sql first.",
+            request_id: req.requestId,
+          });
+        }
+        return next(error);
+      }
+    },
+  );
 
   router.get(
     "/top-sellers",

@@ -336,3 +336,70 @@ Endpoints:
 - `apps/admin-api/src/config.js`
 - `apps/admin-api/.env.example`
 - `package.json`
+
+## 11) Update (2026-02-21): Embedding Sync Jobs + Frontend Progress UI
+
+### 11.1 สถานะ migration งาน sync jobs
+- รัน `migrations/013_add_embedding_sync_jobs.sql` สำเร็จบน PostgreSQL
+- ตารางที่เพิ่ม:
+  - `public.embedding_sync_jobs`
+  - `public.embedding_sync_job_items`
+- Indexes สำหรับ query job list/detail พร้อมใช้งาน
+- ไม่มีการ drop/truncate table เดิม (non-destructive)
+
+### 11.2 สถานะ backfill dry-run ล่าสุด
+ผล dry-run ล่าสุด:
+- Mode: `DRY-RUN`
+- Provider: `mock`
+- Model: `text-embedding-3-small`
+- Dimension: `1536`
+- Processed/Planned: `6477`
+- Errors: `0`
+- Inserted/Updated: `0` (ถูกต้องตาม dry-run เพราะยังไม่เขียน DB)
+
+สรุป:
+- pipeline อ่าน SKU ได้ครบตามที่คาดและไม่มี error
+- พร้อม execute เมื่อยืนยัน provider/credential และต้องการเขียนข้อมูลจริง
+
+### 11.3 ความคืบหน้า UI: Progress Indicator (Import + Embedding Sync)
+เพิ่ม progress overlay สำหรับงานที่ใช้เวลานานใน admin web:
+- spinner + progress bar
+- status text + elapsed time
+- แสดงจำนวนแถวแบบมีตัวคั่นหลักพัน
+- แสดง `queued/running/succeeded/failed/canceled`
+- ถ้าไม่รู้ total rows ใช้ indeterminate bar พร้อมข้อความ `กำลังคำนวณจำนวนทั้งหมด...`
+- กัน percent ถอยหลัง (progress bar ไม่ถอยกลับ)
+- รองรับ network hiccup ระหว่าง polling (`กำลังเชื่อมต่อ...`)
+- ป้องกัน setState หลัง unmount
+
+### 11.4 หน้าเว็บที่อัปเดต
+- `ImportProductsPage`:
+  - แสดง progress overlay ระหว่าง dry-run/commit import
+  - ปัจจุบัน import endpoint ยังเป็น sync จึงใช้ indeterminate fallback ระหว่างรอ response
+- `ImportPricesPage`:
+  - พฤติกรรมเดียวกับ ImportProductsPage
+- `EmbeddingSyncPage`:
+  - trigger job แล้ว poll job detail endpoint
+  - แสดง processed/inserted/updated/errors
+  - มีปุ่ม cancel ใน overlay เมื่อสถานะยัง active และ backend รองรับ
+
+### 11.5 ไฟล์ที่เพิ่ม/แก้ (รอบ Progress UI)
+เพิ่ม:
+- `apps/admin-web/src/components/ProgressOverlay.jsx`
+- `apps/admin-web/src/lib/progress.js`
+- `apps/admin-web/src/lib/pollJob.js`
+
+แก้ไข:
+- `apps/admin-web/src/pages/EmbeddingSyncPage.jsx`
+- `apps/admin-web/src/pages/ImportProductsPage.jsx`
+- `apps/admin-web/src/pages/ImportPricesPage.jsx`
+- `apps/admin-web/src/styles.css`
+
+### 11.6 ผลตรวจสอบหลังแก้
+- `npm run build` (admin-web) ผ่าน
+- `npm test` (root) ผ่านทั้งหมด
+  - ผลล่าสุด: `37 passed, 0 failed`
+
+### 11.7 หมายเหตุเรื่องความสามารถ progress จริง
+- Embedding sync: มี async job endpoint แล้ว จึงแสดงสถานะ progress จาก job ได้
+- Import products/prices: ถ้ายังไม่มี backend progress/job endpoint แยก จะโชว์ได้แบบ indeterminate ระหว่าง request เท่านั้น (ไม่ fake %)

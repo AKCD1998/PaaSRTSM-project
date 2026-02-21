@@ -142,6 +142,23 @@ export const api = {
       csrfToken,
     });
   },
+  listEnrichmentRules() {
+    return request("/admin/enrichment/rules");
+  },
+  createEnrichmentRule(payload, csrfToken) {
+    return request("/admin/enrichment/rules", {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
+  updateEnrichmentRule(ruleId, payload, csrfToken) {
+    return request(`/admin/enrichment/rules/${ruleId}`, {
+      method: "PUT",
+      body: payload,
+      csrfToken,
+    });
+  },
   triggerSkuEmbeddingSync(payload, csrfToken) {
     return request("/api/search/skus/sync", {
       method: "POST",
