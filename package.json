@@ -5,6 +5,7 @@
   "type": "commonjs",
   "scripts": {
     "admin-api:start": "node apps/admin-api/src/server.js",
+    "db:migrate": "node scripts/db_migrate.js",
     "import:adapos": "node scripts/import_adapos_csv.js",
     "import:adapos-excel": "node scripts/import_adapos_excel_dataonly.js",
     "import:adapos:prices": "node scripts/import_adapos_prices_from_excel_dataonly.js",

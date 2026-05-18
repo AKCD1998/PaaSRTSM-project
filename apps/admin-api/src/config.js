@@ -110,6 +110,7 @@ function loadConfig(env = process.env) {
     loginRateLimitMax: parseIntWithFallback(env.LOGIN_RATE_LIMIT_MAX, 10),
     loginRateLimitWindowMs: parseIntWithFallback(env.LOGIN_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
     maxUploadBytes: parseIntWithFallback(env.MAX_UPLOAD_MB, 25) * 1024 * 1024,
+    defaultPeriodDays: parseIntWithFallback(env.DEFAULT_PERIOD_DAYS, 30),
     embeddingProvider,
     embeddingModel,
     embeddingDimension,
@@ -119,6 +120,7 @@ function loadConfig(env = process.env) {
     staffUsers: parseAllowlist(env.STAFF_USERS),
     adminPasswordHash: env.ADMIN_PASSWORD_HASH || "",
     staffPasswordHash: env.STAFF_PASSWORD_HASH || "",
+    posApiKeys: parseCsvSet(env.POS_API_KEYS || ""),
   };
 }
 

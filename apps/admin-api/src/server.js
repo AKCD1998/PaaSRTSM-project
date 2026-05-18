@@ -20,6 +20,9 @@ const { createProductsRouter } = require("./routes/products");
 const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
 const { createSearchRouter } = require("./routes/search");
+const { createLoyaltyRouter } = require("./routes/loyalty");
+const { createOrderingRouter } = require("./routes/ordering");
+const { createSyncRouter } = require("./routes/sync");
 
 function appendVaryHeader(res, value) {
   const existing = String(res.getHeader("Vary") || "")
@@ -63,6 +66,7 @@ function createCorsMiddleware(config) {
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id",
+      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id, X-API-Key",
     );
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     appendVaryHeader(res, "Origin");
@@ -161,6 +165,13 @@ function createApp(overrides = {}) {
     }),
   );
   app.use(
+    "/api/loyalty",
+    createLoyaltyRouter({
+      config,
+      db,
+    }),
+  );
+  app.use(
     "/api/search",
     createSearchRouter({
       config,
@@ -170,6 +181,21 @@ function createApp(overrides = {}) {
       requireCsrfMiddleware: requireCsrf,
       embeddingProvider: searchEmbeddingProvider,
       embeddingSyncJobRunner: searchEmbeddingSyncJobRunner,
+    }),
+  );
+  app.use(
+    "/api",
+    createOrderingRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+    }),
+  );
+  app.use(
+    "/api/sync",
+    createSyncRouter({
+      config,
+      db,
     }),
   );
 

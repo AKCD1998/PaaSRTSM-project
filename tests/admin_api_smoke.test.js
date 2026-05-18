@@ -27,6 +27,7 @@ function buildConfig() {
     staffUsers: new Set(["staff@example.com"]),
     adminPasswordHash: bcrypt.hashSync("admin-pass-123", 10),
     staffPasswordHash: bcrypt.hashSync("staff-pass-123", 10),
+    posApiKeys: new Set(["test-pos-key"]),
   };
 }
 
@@ -52,6 +53,12 @@ function createMockDb() {
 
   return {
     state,
+    connect() {
+      return {
+        query: this.query.bind(this),
+        async release() {},
+      };
+    },
     async query(sql, params) {
       const normalizedSql = String(sql).replace(/\s+/g, " ").trim().toLowerCase();
 
@@ -73,7 +80,11 @@ function createMockDb() {
         };
       }
 
-      if (normalizedSql.includes("left join lateral") && normalizedSql.includes("from public.skus s")) {
+      if (
+        normalizedSql.includes("left join lateral") &&
+        normalizedSql.includes("from public.skus s") &&
+        normalizedSql.includes("retail_price")
+      ) {
         return {
           rowCount: 1,
           rows: [
@@ -137,6 +148,118 @@ function createMockDb() {
               total_amount: "999.99",
             },
           ],
+        };
+      }
+
+      if (normalizedSql.includes("from public.barcodes b") && normalizedSql.includes("inner join public.skus s")) {
+        return {
+          rowCount: 1,
+          rows: [
+            {
+              ...state.product,
+              barcode: params[0],
+            },
+          ],
+        };
+      }
+
+      if (
+        normalizedSql.includes("from public.skus s") &&
+        normalizedSql.includes("where s.company_code = $1")
+      ) {
+        return {
+          rowCount: 1,
+          rows: [
+            {
+              ...state.product,
+              barcode: null,
+            },
+          ],
+        };
+      }
+
+      if (normalizedSql.includes("from core.branches") && normalizedSql.includes("order by branch_code asc")) {
+        return {
+          rowCount: 1,
+          rows: [{ branch_code: "B001", branch_name: "Main Branch", is_hq: true }],
+        };
+      }
+
+      if (
+        normalizedSql.includes("from public.skus s") &&
+        normalizedSql.includes("where s.company_code is not null") &&
+        normalizedSql.includes("limit 20")
+      ) {
+        return {
+          rowCount: 1,
+          rows: [
+            {
+              product_code: state.product.company_code,
+              product_name: state.product.display_name,
+              barcode: "8853935031319",
+              supplier: state.product.supplier_code,
+              unit: "BOX",
+              min_stock: "3",
+              max_stock: "20",
+              lead_time_days: "5",
+              stock_current: "10",
+              stock_retail: "6",
+              stock_warehouse: "4",
+            },
+          ],
+        };
+      }
+
+      if (normalizedSql.includes("with latest_stock as")) {
+        return {
+          rowCount: 1,
+          rows: [
+            {
+              product_code: state.product.company_code,
+              product_name: state.product.display_name,
+              barcode: "8853935031319",
+              unit: "BOX",
+              stock_current: "10",
+              sold_qty_period: "5",
+              purchased_qty_period: "8",
+              min_stock: "3",
+              max_stock: "20",
+              lead_time_days: "5",
+              supplier: state.product.supplier_code,
+            },
+          ],
+        };
+      }
+
+      if (normalizedSql.startsWith("insert into ingest.sync_runs")) {
+        state.lastSyncRun = {
+          sync_run_id: 77,
+          sync_type: params[0],
+          source_name: params[1],
+          started_at: params[2],
+          finished_at: params[3],
+          status: params[4],
+          records_read: params[5],
+          records_sent: params[6],
+          message: params[7],
+        };
+        return {
+          rowCount: 1,
+          rows: [{ sync_run_id: 77 }],
+        };
+      }
+
+      if (normalizedSql.includes("from ingest.sync_runs")) {
+        return {
+          rowCount: state.lastSyncRun ? 1 : 0,
+          rows: state.lastSyncRun ? [state.lastSyncRun] : [],
+        };
+      }
+
+      if (normalizedSql.includes("from ingest.sync_errors")) {
+        return {
+          rowCount: 0,
+          rows: [],
         };
       }
 
@@ -323,6 +446,29 @@ test("admin can read products, edit product, run import dry-run, and apply rules
   assert.ok(db.state.auditActions.includes("enrichment.apply_rules.dry_run"));
 });
 
+test("pos loyalty eligibility endpoint blocks medicine items by barcode", async () => {
+  const { app } = createTestApp();
+
+  const response = await request(app)
+    .get("/api/loyalty/products/eligibility?barcode=8853935031319")
+    .set("x-pos-api-key", "test-pos-key");
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.matched_by, "barcode");
+  assert.equal(response.body.product.company_code, "630010001");
+  assert.equal(response.body.loyalty.eligible, false);
+  assert.equal(response.body.loyalty.reason, "medicine_blocked");
+});
+
+test("pos loyalty eligibility endpoint requires api key", async () => {
+  const { app } = createTestApp();
+
+  const response = await request(app).get("/api/loyalty/products/eligibility?company_code=630010001");
+
+  assert.equal(response.status, 401);
+});
+
 test("admin import prices route accepts .xls and uses excel-dataonly importer", async () => {
   let excelImporterCalled = false;
   const { app, db } = createTestApp({
@@ -371,4 +517,43 @@ test("admin import prices route accepts .xls and uses excel-dataonly importer", 
   assert.equal(importResponse.body.summary.source_format, "excel-dataonly");
   assert.equal(excelImporterCalled, true);
   assert.ok(db.state.auditActions.includes("import.prices.dry_run"));
+});
+
+test("ordering and sync routes are available on the unified backend", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+
+  const branchesResponse = await agent.get("/api/branches");
+  assert.equal(branchesResponse.status, 200);
+  assert.equal(branchesResponse.body[0].branchCode, "B001");
+
+  const searchResponse = await agent.get("/api/products/search?q=630010001");
+  assert.equal(searchResponse.status, 200);
+  assert.equal(searchResponse.body[0].productCode, "630010001");
+
+  const csrfToken = await loginAs(agent, "admin@example.com", "admin-pass-123");
+  assert.ok(csrfToken);
+
+  const stockDayResponse = await agent.get("/api/admin/stock-day?periodDays=30");
+  assert.equal(stockDayResponse.status, 200);
+  assert.equal(stockDayResponse.body[0].productCode, "630010001");
+  assert.equal(stockDayResponse.body[0].turnoverRate, 0.59);
+
+  const syncRunLogResponse = await request(app)
+    .post("/api/sync/run-log")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      syncType: "scheduled-sync",
+      sourceName: "adapos_sync",
+      status: "success",
+      recordsRead: 10,
+      recordsSent: 10,
+      message: "Sync completed.",
+    });
+  assert.equal(syncRunLogResponse.status, 200);
+  assert.equal(syncRunLogResponse.body.accepted, 1);
+
+  const syncStatusResponse = await agent.get("/api/admin/sync-status");
+  assert.equal(syncStatusResponse.status, 200);
+  assert.equal(syncStatusResponse.body.latestRun.syncType, "scheduled-sync");
 });
