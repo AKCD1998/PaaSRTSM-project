@@ -10,6 +10,19 @@ ALTER TABLE public.skus
   ADD COLUMN IF NOT EXISTS max_stock numeric(14,4) NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS lead_time_days numeric(14,2) NOT NULL DEFAULT 0;
 
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'public.skus'::regclass
+      AND conname = 'skus_company_code_key'
+  ) THEN
+    ALTER TABLE public.skus
+      ADD CONSTRAINT skus_company_code_key UNIQUE (company_code);
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS core.branches (
   branch_code text PRIMARY KEY,
   branch_name text NOT NULL,
