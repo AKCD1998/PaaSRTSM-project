@@ -131,6 +131,11 @@ function createAdaMockDb() {
           doc_type: params[1],
           branch_code: params[4],
           branch_code_to: params[5],
+          warehouse_code: params[6],
+          warehouse_code_to: params[7],
+          doc_date: params[8],
+          created_by: params[12],
+          approved_by: params[13],
           source_synced_at: params[19],
           raw_payload: JSON.parse(params[20]),
         });
@@ -144,7 +149,12 @@ function createAdaMockDb() {
           branch_code: params[2],
           line_no: params[3],
           product_code: params[4],
+          unit_code: params[6],
+          unit_name: params[7],
           qty: params[8],
+          qty_base: params[9],
+          stock_factor: params[10],
+          warehouse_code: params[13],
           source_synced_at: params[18],
           raw_payload: JSON.parse(params[19]),
         });
@@ -389,6 +399,67 @@ test("ADA transfers route validates payload shape and accepts headers plus lines
   assert.equal(accepted.body.acceptedLines, 1);
   assert.equal(db.state.transferHeaders.size, 1);
   assert.equal(db.state.transferLines.size, 1);
+});
+
+test("ADA transfers route accepts the real mother-PC camelCase payload shape", async () => {
+  const { app, db } = createTestApp();
+
+  const accepted = await request(app)
+    .post("/api/sync/ada/transfers")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSystem: "AdaAcc",
+      sourceSyncedAt: "2026-05-21T05:10:00.000Z",
+      headers: [
+        {
+          docNo: "TRF-002",
+          docType: "7",
+          docDate: "2026-05-21",
+          tnfDate: "2026-05-21",
+          branchFrm: "001",
+          branchTo: "000",
+          whFrm: "WH-A",
+          whTo: "WH-B",
+          type: "transfer",
+          total: 10,
+          vat: 0.7,
+          grand: 10.7,
+          deptCode: "D001",
+          usrCode: "dao1",
+        },
+      ],
+      lines: [
+        {
+          docNo: "TRF-002",
+          seqNo: 1,
+          productCode: "630010001",
+          unitCode: "BOX",
+          unitName: "Box",
+          factor: 1,
+          qty: 2,
+          qtyBase: 2,
+          branchFrm: "001",
+          branchTo: "000",
+          whFrm: "WH-A",
+          whTo: "WH-B",
+          docDate: "2026-05-21",
+        },
+      ],
+    });
+
+  assert.equal(accepted.status, 200);
+  assert.equal(accepted.body.acceptedHeaders, 1);
+  assert.equal(accepted.body.acceptedLines, 1);
+  assert.equal(db.state.transferHeaders.get("TRF-002|7|001").branch_code, "001");
+  assert.equal(db.state.transferHeaders.get("TRF-002|7|001").branch_code_to, "000");
+  assert.equal(db.state.transferHeaders.get("TRF-002|7|001").warehouse_code, "WH-A");
+  assert.equal(db.state.transferHeaders.get("TRF-002|7|001").warehouse_code_to, "WH-B");
+  assert.equal(db.state.transferHeaders.get("TRF-002|7|001").created_by, "dao1");
+  assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").branch_code, "001");
+  assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").unit_code, "BOX");
+  assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").qty_base, 2);
+  assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").stock_factor, 1);
+  assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").warehouse_code, "WH-A");
 });
 
 test("ADA run-log route records sync runs and writes sync_errors for failed runs", async () => {

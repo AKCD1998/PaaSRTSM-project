@@ -43,7 +43,42 @@ function parseTransferPayload(body) {
   if (!body || !Array.isArray(body.headers) || !Array.isArray(body.lines)) {
     return { error: "Payload must include headers and lines arrays." };
   }
-  return { headers: body.headers, lines: body.lines };
+
+  const headers = body.headers.map((record) => normalizeTransferHeaderRecord(record));
+  const indexes = buildTransferHeaderIndexes(headers);
+  const lines = body.lines.map((record) =>
+    normalizeTransferLineRecord(record, resolveRelatedTransferHeader(record, indexes)),
+  );
+
+  for (const header of headers) {
+    if (
+      !normalizeNullableText(header.docNo) ||
+      !normalizeNullableText(header.docType) ||
+      !normalizeNullableText(header.branchCode)
+    ) {
+      return {
+        error: "Each transfer header requires docNo, docType, and branchFrm/branchCode (or AdaAcc aliases).",
+      };
+    }
+  }
+
+  for (const line of lines) {
+    const lineNo = Number(line.lineNo);
+    if (
+      !normalizeNullableText(line.docNo) ||
+      !normalizeNullableText(line.docType) ||
+      !normalizeNullableText(line.branchCode) ||
+      !Number.isInteger(lineNo) ||
+      lineNo <= 0 ||
+      !normalizeNullableText(line.productCode)
+    ) {
+      return {
+        error: "Each transfer line requires docNo, docType, branchFrm/branchCode, seqNo/lineNo, and productCode (or AdaAcc aliases).",
+      };
+    }
+  }
+
+  return { headers, lines };
 }
 
 function parseRequiredApiKey(config, req) {
@@ -71,7 +106,7 @@ function getSyncRunId(body) {
 }
 
 function getRawPayload(record) {
-  return JSON.stringify(record || {});
+  return JSON.stringify(record?.__rawPayload || record || {});
 }
 
 function buildStockSnapshotKey(snapshotAt, branchCode, warehouseCode, productCode, lotNo, expiryDate) {
@@ -92,6 +127,78 @@ function pick(record, keys, fallback = null) {
     }
   }
   return fallback;
+}
+
+function normalizeTransferHeaderRecord(record) {
+  return {
+    ...record,
+    __rawPayload: record,
+    docNo: pick(record, ["FTPthDocNo", "docNo"]),
+    docType: pick(record, ["FTPthDocType", "docType"]),
+    branchCode: pick(record, ["FTBchCode", "branchCode", "branchFrm"]),
+    branchCodeTo: pick(record, ["FTBchCodeTo", "branchCodeTo", "branchTo"]),
+    warehouseCode: pick(record, ["FTWahCode", "warehouseCode", "whFrm"]),
+    warehouseCodeTo: pick(record, ["FTWahCodeTo", "warehouseCodeTo", "whTo"]),
+    docDate: pick(record, ["FDPthDocDate", "docDate", "tnfDate"]),
+    createdBy: pick(record, ["FTPthUsrName", "createdBy", "usrCode"]),
+    approvedBy: pick(record, ["FTPthApvCode", "approvedBy", "usrCode"]),
+  };
+}
+
+function buildTransferHeaderIndexes(headers) {
+  const byDocNoTypeBranch = new Map();
+  const byDocNoType = new Map();
+  const byDocNo = new Map();
+
+  for (const header of headers) {
+    const docNo = normalizeText(header.docNo || "");
+    const docType = normalizeText(header.docType || "");
+    const branchCode = normalizeText(header.branchCode || "");
+    if (docNo && docType && branchCode) {
+      byDocNoTypeBranch.set(`${docNo}|${docType}|${branchCode}`, header);
+    }
+    if (docNo && docType) {
+      byDocNoType.set(`${docNo}|${docType}`, header);
+    }
+    if (docNo) {
+      byDocNo.set(docNo, header);
+    }
+  }
+
+  return { byDocNoTypeBranch, byDocNoType, byDocNo };
+}
+
+function resolveRelatedTransferHeader(record, indexes) {
+  const docNo = normalizeText(pick(record, ["FTPthDocNo", "docNo"]) || "");
+  const docType = normalizeText(pick(record, ["FTPthDocType", "docType"]) || "");
+  const branchCode = normalizeText(pick(record, ["FTBchCode", "branchCode", "branchFrm"]) || "");
+
+  return (
+    indexes.byDocNoTypeBranch.get(`${docNo}|${docType}|${branchCode}`) ||
+    indexes.byDocNoType.get(`${docNo}|${docType}`) ||
+    indexes.byDocNo.get(docNo) ||
+    null
+  );
+}
+
+function normalizeTransferLineRecord(record, relatedHeader = null) {
+  return {
+    ...record,
+    __rawPayload: record,
+    docNo: pick(record, ["FTPthDocNo", "docNo"]),
+    docType: pick(record, ["FTPthDocType", "docType"], relatedHeader?.docType || null),
+    branchCode: pick(record, ["FTBchCode", "branchCode", "branchFrm"], relatedHeader?.branchCode || null),
+    branchCodeTo: pick(record, ["FTBchCodeTo", "branchCodeTo", "branchTo"], relatedHeader?.branchCodeTo || null),
+    lineNo: pick(record, ["FNPtdSeqNo", "lineNo", "seqNo"]),
+    productCode: pick(record, ["FTPtdPdtCode", "productCode"]),
+    unitCode: pick(record, ["FTPunCode", "unitCode"]),
+    unitName: pick(record, ["FTPunName", "unitName"]),
+    qty: pick(record, ["FCPtdQtyAll", "qty"]),
+    qtyBase: pick(record, ["FCPtdQtyBase", "qtyBase"]),
+    stockFactor: pick(record, ["FCPtdStkFac", "FCPtdFactor", "stockFactor", "factor"]),
+    warehouseCode: pick(record, ["FTWahCode", "warehouseCode", "whFrm"], relatedHeader?.warehouseCode || null),
+    docDate: pick(record, ["FDPthDocDate", "docDate", "tnfDate"], relatedHeader?.docDate || null),
+  };
 }
 
 async function upsertBranch(client, body, record) {
@@ -256,9 +363,9 @@ async function upsertProduct(client, body, record) {
 async function upsertTransferHeader(client, body, record) {
   const docNo = normalizeNullableText(pick(record, ["FTPthDocNo", "docNo"]));
   const docType = normalizeNullableText(pick(record, ["FTPthDocType", "docType"]));
-  const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+  const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode", "branchFrm"]));
   if (!docNo || !docType || !branchCode) {
-    throw new Error("Each transfer header requires FTPthDocNo, FTPthDocType, and FTBchCode.");
+    throw new Error("Each transfer header requires docNo, docType, and branchFrm/branchCode (or AdaAcc aliases).");
   }
 
   await client.query(
@@ -317,15 +424,15 @@ async function upsertTransferHeader(client, body, record) {
       normalizeNullableText(pick(record, ["FTPthStaDoc", "docStatus"])),
       normalizeNullableText(pick(record, ["FTPthStaPrcDoc", "processStatus"])),
       branchCode,
-      normalizeNullableText(pick(record, ["FTBchCodeTo", "branchCodeTo"])),
-      normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"])),
-      normalizeNullableText(pick(record, ["FTWahCodeTo", "warehouseCodeTo"])),
-      parseDate(pick(record, ["FDPthDocDate", "docDate"])),
+      normalizeNullableText(pick(record, ["FTBchCodeTo", "branchCodeTo", "branchTo"])),
+      normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode", "whFrm"])),
+      normalizeNullableText(pick(record, ["FTWahCodeTo", "warehouseCodeTo", "whTo"])),
+      parseDate(pick(record, ["FDPthDocDate", "docDate", "tnfDate"])),
       normalizeNullableText(pick(record, ["FTPthDocTime", "docTime"])),
       parseTimestamp(pick(record, ["FDPthApprove", "approvedAt"])),
       parseTimestamp(pick(record, ["FDPthPrcDate", "processedAt"])),
-      normalizeNullableText(pick(record, ["FTPthUsrName", "createdBy"])),
-      normalizeNullableText(pick(record, ["FTPthApvCode", "approvedBy"])),
+      normalizeNullableText(pick(record, ["FTPthUsrName", "createdBy", "usrCode"])),
+      normalizeNullableText(pick(record, ["FTPthApvCode", "approvedBy", "usrCode"])),
       normalizeNullableText(pick(record, ["FTPthRmk", "remark"])),
       normalizeNullableText(pick(record, ["FTPthRefDoc", "referenceDocNo"])),
       normalizeNullableText(pick(record, ["FTPthRefType", "referenceDocType"])),
@@ -340,11 +447,11 @@ async function upsertTransferHeader(client, body, record) {
 async function upsertTransferLine(client, body, record) {
   const docNo = normalizeNullableText(pick(record, ["FTPthDocNo", "docNo"]));
   const docType = normalizeNullableText(pick(record, ["FTPthDocType", "docType"]));
-  const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
-  const lineNo = Number(pick(record, ["FNPtdSeqNo", "lineNo"], 0));
+  const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode", "branchFrm"]));
+  const lineNo = Number(pick(record, ["FNPtdSeqNo", "lineNo", "seqNo"], 0));
   const productCode = normalizeNullableText(pick(record, ["FTPtdPdtCode", "productCode"]));
   if (!docNo || !docType || !branchCode || !Number.isInteger(lineNo) || lineNo <= 0 || !productCode) {
-    throw new Error("Each transfer line requires doc keys, positive lineNo, and FTPtdPdtCode.");
+    throw new Error("Each transfer line requires docNo, docType, branchFrm/branchCode, seqNo/lineNo, and productCode (or AdaAcc aliases).");
   }
 
   await client.query(
@@ -404,10 +511,10 @@ async function upsertTransferLine(client, body, record) {
       normalizeNullableText(pick(record, ["FTPunName", "unitName"])),
       toNumber(pick(record, ["FCPtdQtyAll", "qty"])),
       toNumber(pick(record, ["FCPtdQtyBase", "qtyBase"])),
-      toNumber(pick(record, ["FCPtdStkFac", "stockFactor"])),
+      toNumber(pick(record, ["FCPtdStkFac", "FCPtdFactor", "stockFactor", "factor"])),
       normalizeNullableText(pick(record, ["FTPtdLotNo", "lotNo"])),
       parseDate(pick(record, ["FDPtdExpired", "expiryDate"])),
-      normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"])),
+      normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode", "whFrm"])),
       normalizeNullableText(pick(record, ["FTPthRefDoc", "referenceDocNo"])),
       normalizeNullableText(pick(record, ["FNPtdRefSeqNo", "referenceLineNo"])),
       getSourceSystem(body),

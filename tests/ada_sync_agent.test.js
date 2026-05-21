@@ -159,8 +159,31 @@ test("runAdaSyncAgent execute mode posts payloads, advances watermarks, and logs
         payload: {
           sourceSystem: "AdaAcc",
           sourceSyncedAt: "2026-05-21T08:10:00.000Z",
-          headers: [{ FTPthDocNo: "TRF-001" }],
-          lines: [{ FTPthDocNo: "TRF-001", FNPtdSeqNo: 1 }],
+          headers: [
+            {
+              FTPthDocNo: "TRF-001",
+              FTPthDocType: "4",
+              FTBchCode: "000",
+              FTBchCodeTo: "001",
+              FDPthDocDate: "2026-05-20T00:00:00.000Z",
+              FTPthDocTime: "09:15:00",
+              FTPthStaDoc: "1",
+              FTPthStaPrcDoc: "",
+            },
+          ],
+          lines: [
+            {
+              FTPthDocNo: "TRF-001",
+              FTPthDocType: "4",
+              FTBchCode: "000",
+              FNPtdSeqNo: 1,
+              FTPtdPdtCode: "630010001",
+              FTPtdBarCode: "885000000001",
+              FCPtdQtyAll: 4,
+              FCPtdQtyBase: 4,
+              FCPtdStkFac: 1,
+            },
+          ],
         },
       },
     }),
@@ -174,6 +197,11 @@ test("runAdaSyncAgent execute mode posts payloads, advances watermarks, and logs
   assert.ok(calls[0].url.endsWith("/api/sync/ada/branches"));
   assert.ok(calls[1].url.endsWith("/api/sync/ada/transfers"));
   assert.ok(calls[2].url.endsWith("/api/sync/ada/run-log"));
+  assert.equal(calls[1].options.body.headers[0].FTBchCode, "000");
+  assert.equal(calls[1].options.body.headers[0].FTPthDocType, "4");
+  assert.equal(calls[1].options.body.headers[0].FDPthDocDate, "2026-05-20T00:00:00.000Z");
+  assert.equal(calls[1].options.body.lines[0].FTBchCode, "000");
+  assert.equal(calls[1].options.body.lines[0].FTPtdPdtCode, "630010001");
 
   const saved = await loadWatermarks(watermarkFile);
   assert.deepEqual(saved, {
