@@ -1,0 +1,19 @@
+
+> paasrtsm-project@1.0.0 derive:ada-analytics:standard
+> node scripts/derive_ada_analytics_standard.js
+
+Ada analytics derivation completed for standard windows: 7, 30, 90.
+analytics.product_stock_snapshots_deleted: 0
+analytics.product_stock_snapshots_inserted: 1
+analytics.product_sales_summary_periods_deleted[7d]: 0
+analytics.product_sales_summary_periods_inserted[7d]: 1
+analytics.product_purchase_summary_periods_deleted[7d]: 0
+analytics.product_purchase_summary_periods_inserted[7d]: 1
+analytics.product_sales_summary_periods_deleted[30d]: 0
+analytics.product_sales_summary_periods_inserted[30d]: 1
+analytics.product_purchase_summary_periods_deleted[30d]: 0
+analytics.product_purchase_summary_periods_inserted[30d]: 1
+analytics.product_sales_summary_periods_deleted[90d]: 0
+analytics.product_sales_summary_periods_inserted[90d]: 1
+analytics.product_purchase_summary_periods_deleted[90d]: 0
+analytics.product_purchase_summary_periods_inserted[90d]: 1

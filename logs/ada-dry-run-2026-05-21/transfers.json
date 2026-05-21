@@ -1,0 +1,68 @@
+{
+  "sourceSystem": "AdaAcc",
+  "sourceSyncedAt": "2026-05-21T02:20:00.000Z",
+  "headers": [
+    {
+      "docNo": "ADA-TRF-OUT-001",
+      "docType": "4",
+      "branchCode": "900",
+      "branchCodeTo": "901",
+      "warehouseCode": "WH-A",
+      "warehouseCodeTo": "WH-B",
+      "docDate": "2026-05-20",
+      "docTime": "090000",
+      "docStatus": "1",
+      "processStatus": "1",
+      "createdBy": "dry-run",
+      "remark": "Outbound dry run"
+    },
+    {
+      "docNo": "ADA-TRF-IN-001",
+      "docType": "7",
+      "branchCode": "901",
+      "branchCodeTo": "900",
+      "warehouseCode": "WH-B",
+      "warehouseCodeTo": "WH-A",
+      "docDate": "2026-05-20",
+      "docTime": "110000",
+      "docStatus": "1",
+      "processStatus": "1",
+      "createdBy": "dry-run",
+      "referenceDocNo": "ADA-TRF-OUT-001",
+      "referenceDocType": "4",
+      "remark": "Inbound dry run"
+    }
+  ],
+  "lines": [
+    {
+      "docNo": "ADA-TRF-OUT-001",
+      "docType": "4",
+      "branchCode": "900",
+      "lineNo": 1,
+      "productCode": "ADA-DRY-001",
+      "barcode": "9900000000011",
+      "unitCode": "BOX",
+      "unitName": "Box",
+      "qty": 3,
+      "qtyBase": 3,
+      "stockFactor": 1,
+      "warehouseCode": "WH-A"
+    },
+    {
+      "docNo": "ADA-TRF-IN-001",
+      "docType": "7",
+      "branchCode": "901",
+      "lineNo": 1,
+      "productCode": "ADA-DRY-001",
+      "barcode": "9900000000011",
+      "unitCode": "BOX",
+      "unitName": "Box",
+      "qty": 3,
+      "qtyBase": 3,
+      "stockFactor": 1,
+      "warehouseCode": "WH-B",
+      "referenceDocNo": "ADA-TRF-OUT-001",
+      "referenceLineNo": "1"
+    }
+  ]
+}

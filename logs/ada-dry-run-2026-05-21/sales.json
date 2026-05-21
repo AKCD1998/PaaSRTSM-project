@@ -1,0 +1,34 @@
+{
+  "sourceSystem": "AdaAcc",
+  "sourceSyncedAt": "2026-05-21T02:18:00.000Z",
+  "headers": [
+    {
+      "branchCode": "900",
+      "docNo": "ADA-SALE-001",
+      "docDate": "2026-05-20",
+      "docTime": "101500",
+      "customerCode": "CUST-001",
+      "paidStatus": "1",
+      "grandAmount": 240,
+      "netAmount": 240,
+      "vatAmount": 0,
+      "cashierCode": "USR1",
+      "terminalCode": "POS1"
+    }
+  ],
+  "lines": [
+    {
+      "branchCode": "900",
+      "docNo": "ADA-SALE-001",
+      "lineNo": 1,
+      "productCode": "ADA-DRY-001",
+      "barcode": "9900000000011",
+      "qty": 2,
+      "unitPrice": 120,
+      "discountAmount": 0,
+      "lineAmount": 240,
+      "stockFactor": 1,
+      "qtyBase": 2
+    }
+  ]
+}

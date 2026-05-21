@@ -6,6 +6,10 @@
   "scripts": {
     "admin-api:start": "node apps/admin-api/src/server.js",
     "db:migrate": "node scripts/db_migrate.js",
+    "derive:ada-foundations": "node scripts/derive_ada_foundations.js",
+    "derive:ada-analytics": "node scripts/derive_ada_analytics.js",
+    "derive:ada-analytics:standard": "node scripts/derive_ada_analytics_standard.js",
+    "derive:ada-reconciliation": "node scripts/derive_ada_reconciliation.js",
     "import:adapos": "node scripts/import_adapos_csv.js",
     "import:adapos-excel": "node scripts/import_adapos_excel_dataonly.js",
     "import:adapos:prices": "node scripts/import_adapos_prices_from_excel_dataonly.js",

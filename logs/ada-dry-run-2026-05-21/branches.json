@@ -1,0 +1,18 @@
+{
+  "sourceSystem": "AdaAcc",
+  "sourceSyncedAt": "2026-05-21T02:15:00.000Z",
+  "records": [
+    {
+      "branchCode": "900",
+      "branchName": "ADA Dry Run Dispatch",
+      "branchNameTh": "สาขาต้นทางทดสอบ",
+      "status": "1"
+    },
+    {
+      "branchCode": "901",
+      "branchName": "ADA Dry Run Receiving",
+      "branchNameTh": "สาขาปลายทางทดสอบ",
+      "status": "1"
+    }
+  ]
+}

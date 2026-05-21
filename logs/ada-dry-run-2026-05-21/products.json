@@ -1,0 +1,25 @@
+{
+  "sourceSystem": "AdaAcc",
+  "sourceSyncedAt": "2026-05-21T02:16:00.000Z",
+  "records": [
+    {
+      "productCode": "ADA-DRY-001",
+      "productName": "ADA Dry Run Product 001",
+      "productNameTh": "สินค้าทดสอบ ADA 001",
+      "supplierCode": "SUP-ADA",
+      "categoryCode": "TEST",
+      "categoryName": "Dry Run",
+      "unitSmall": "BOX",
+      "factorSmall": 1,
+      "stockCurrent": 12,
+      "stockRetail": 7,
+      "stockWarehouse": 5,
+      "minStock": 2,
+      "maxStock": 20,
+      "leadTimeDays": 3,
+      "isActive": "1",
+      "barcode1": "9900000000011",
+      "barcode2": "9900000000012"
+    }
+  ]
+}

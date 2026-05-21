@@ -1,0 +1,17 @@
+{
+  "sourceSystem": "AdaAcc",
+  "sourceSyncedAt": "2026-05-21T02:17:00.000Z",
+  "records": [
+    {
+      "productCode": "ADA-DRY-001",
+      "branchCode": "900",
+      "warehouseCode": "WH-A",
+      "barcode": "9900000000011",
+      "qtyOnHand": 12,
+      "qtyReserved": 1,
+      "unitCode": "BOX",
+      "qtyBase": 12,
+      "snapshotAt": "2026-05-21T02:17:00.000Z"
+    }
+  ]
+}

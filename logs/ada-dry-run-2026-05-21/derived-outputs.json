@@ -1,0 +1,168 @@
+{
+  "core_branches": [
+    {
+      "branch_code": "900",
+      "branch_name": "ADA Dry Run Dispatch",
+      "is_hq": false,
+      "is_active": true,
+      "source_system": "AdaAcc",
+      "source_table": "TCNMBranch",
+      "source_synced_at": "2026-05-21 02:15:00+00"
+    },
+    {
+      "branch_code": "901",
+      "branch_name": "ADA Dry Run Receiving",
+      "is_hq": false,
+      "is_active": true,
+      "source_system": "AdaAcc",
+      "source_table": "TCNMBranch",
+      "source_synced_at": "2026-05-21 02:15:00+00"
+    }
+  ],
+  "public_skus": [
+    {
+      "company_code": "ADA-DRY-001",
+      "display_name": "ADA Dry Run Product 001",
+      "uom": "BOX",
+      "qty_in_base": 1,
+      "pack_level": "base",
+      "category_name": "Dry Run",
+      "supplier_code": "SUP-ADA",
+      "min_stock": "2.0000",
+      "max_stock": "20.0000",
+      "lead_time_days": "3.00",
+      "status": "1",
+      "source_updated_by": "ada.refresh_products_into_public"
+    }
+  ],
+  "analytics_stock": [
+    {
+      "product_code": "ADA-DRY-001",
+      "snapshot_at": "2026-05-21 02:17:00+00",
+      "stock_current": "12.0000",
+      "stock_retail": "0.0000",
+      "stock_warehouse": "0.0000",
+      "source_name": "ada_derived"
+    }
+  ],
+  "analytics_sales": [
+    {
+      "product_code": "ADA-DRY-001",
+      "branch_code": "900",
+      "period_start": "2026-05-14",
+      "period_end": "2026-05-20",
+      "period_days": 7,
+      "sold_qty_base": "2.0000",
+      "avg_daily_usage": "0.2857",
+      "source_name": "ada_derived"
+    },
+    {
+      "product_code": "ADA-DRY-001",
+      "branch_code": "900",
+      "period_start": "2026-04-21",
+      "period_end": "2026-05-20",
+      "period_days": 30,
+      "sold_qty_base": "2.0000",
+      "avg_daily_usage": "0.0667",
+      "source_name": "ada_derived"
+    },
+    {
+      "product_code": "ADA-DRY-001",
+      "branch_code": "900",
+      "period_start": "2026-02-20",
+      "period_end": "2026-05-20",
+      "period_days": 90,
+      "sold_qty_base": "2.0000",
+      "avg_daily_usage": "0.0222",
+      "source_name": "ada_derived"
+    }
+  ],
+  "analytics_purchases": [
+    {
+      "product_code": "ADA-DRY-001",
+      "period_start": "2026-05-13",
+      "period_end": "2026-05-19",
+      "period_days": 7,
+      "purchased_qty_base": "5.0000",
+      "source_name": "ada_derived"
+    },
+    {
+      "product_code": "ADA-DRY-001",
+      "period_start": "2026-04-20",
+      "period_end": "2026-05-19",
+      "period_days": 30,
+      "purchased_qty_base": "5.0000",
+      "source_name": "ada_derived"
+    },
+    {
+      "product_code": "ADA-DRY-001",
+      "period_start": "2026-02-19",
+      "period_end": "2026-05-19",
+      "period_days": 90,
+      "purchased_qty_base": "5.0000",
+      "source_name": "ada_derived"
+    }
+  ],
+  "reconciliation_documents": [
+    {
+      "source_doc_no": "ADA-TRF-OUT-001",
+      "source_doc_type": "4",
+      "source_branch_code": "900",
+      "dispatch_branch_code": "900",
+      "receiving_branch_code": "901",
+      "source_direction": "outbound",
+      "process_state": "not_applicable",
+      "source_match_method": "inbound_reference_doc",
+      "matched_doc_no": "ADA-TRF-IN-001",
+      "matched_doc_type": "7",
+      "matched_branch_code": "901",
+      "matched_candidate_count": 1,
+      "unique_match": true,
+      "total_line_count": 1,
+      "total_qty_base": "3.0000"
+    },
+    {
+      "source_doc_no": "ADA-TRF-IN-001",
+      "source_doc_type": "7",
+      "source_branch_code": "901",
+      "dispatch_branch_code": "900",
+      "receiving_branch_code": "901",
+      "source_direction": "inbound",
+      "process_state": "processed",
+      "source_match_method": "inbound_reference_doc",
+      "matched_doc_no": "ADA-TRF-OUT-001",
+      "matched_doc_type": "4",
+      "matched_branch_code": "900",
+      "matched_candidate_count": 1,
+      "unique_match": true,
+      "total_line_count": 1,
+      "total_qty_base": "3.0000"
+    }
+  ],
+  "reconciliation_cases": [
+    {
+      "case_key": "outbound:900:4:ADA-TRF-OUT-001",
+      "outbound_doc_no": "ADA-TRF-OUT-001",
+      "inbound_doc_no": "ADA-TRF-IN-001",
+      "dispatch_branch_code": "900",
+      "receiving_branch_code": "901",
+      "source_match_status": "inbound_processed",
+      "source_match_method": "inbound_reference_doc",
+      "match_candidate_count": 1,
+      "inbound_process_state": "processed",
+      "expected_total_qty_base": "3.0000",
+      "source_received_total_qty_base": "3.0000",
+      "qty_delta_source": "0.0000"
+    }
+  ],
+  "reconciliation_case_lines": [
+    {
+      "case_key": "outbound:900:4:ADA-TRF-OUT-001",
+      "product_code": "ADA-DRY-001",
+      "outbound_qty_base": "3.0000",
+      "inbound_qty_base": "3.0000",
+      "qty_delta_source": "0.0000",
+      "line_status": "matched"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+
+> paasrtsm-project@1.0.0 derive:ada-reconciliation
+> node scripts/derive_ada_reconciliation.js
+
+Ada transfer reconciliation derivation completed.
+reconciliation.transfer_case_lines_deleted: 0
+reconciliation.transfer_cases_deleted: 0
+reconciliation.transfer_match_candidates_deleted: 0
+reconciliation.transfer_document_lines_deleted: 0
+reconciliation.transfer_documents_deleted: 0
+reconciliation.transfer_documents_inserted: 2
+reconciliation.transfer_document_lines_inserted: 2
+reconciliation.transfer_match_candidates_inserted: 1
+reconciliation.transfer_cases_inserted: 1
+reconciliation.transfer_case_lines_inserted: 1

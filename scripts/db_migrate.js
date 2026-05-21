@@ -4,6 +4,62 @@ const fs = require("fs/promises");
 const path = require("path");
 const { Pool } = require("pg");
 
+function parseEnvFile(contents) {
+  const env = {};
+  const lines = String(contents || "").split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const equalsIndex = line.indexOf("=");
+    if (equalsIndex <= 0) {
+      continue;
+    }
+
+    const key = line.slice(0, equalsIndex).trim();
+    let value = line.slice(equalsIndex + 1).trim();
+
+    if (
+      value.length >= 2
+      && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    env[key] = value;
+  }
+
+  return env;
+}
+
+async function loadEnvFallback(rootDir) {
+  const shellDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
+  if (shellDatabaseUrl) {
+    return;
+  }
+
+  const envPath = path.join(rootDir, "apps", "admin-api", ".env");
+  let contents = "";
+  try {
+    contents = await fs.readFile(envPath, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  const envVars = parseEnvFile(contents);
+  for (const [key, value] of Object.entries(envVars)) {
+    if (!process.env[key] || process.env[key] === "") {
+      process.env[key] = value;
+    }
+  }
+}
+
 function createPool(databaseUrl) {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required");
@@ -196,6 +252,7 @@ async function applySqlFile(client, filePath, rootDir) {
 
 async function run() {
   const rootDir = path.resolve(__dirname, "..");
+  await loadEnvFallback(rootDir);
   const databaseUrl = process.env.DATABASE_URL || "";
   const pool = createPool(databaseUrl);
   const client = await pool.connect();

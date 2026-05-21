@@ -1,0 +1,27 @@
+{
+  "sourceSystem": "AdaAcc",
+  "sourceSyncedAt": "2026-05-21T02:19:00.000Z",
+  "headers": [
+    {
+      "branchCode": "900",
+      "docNo": "ADA-PUR-001",
+      "docDate": "2026-05-19",
+      "supplierCode": "SUP-ADA",
+      "docStatus": "1",
+      "remark": "Dry run purchase"
+    }
+  ],
+  "lines": [
+    {
+      "branchCode": "900",
+      "docNo": "ADA-PUR-001",
+      "lineNo": 1,
+      "productCode": "ADA-DRY-001",
+      "barcode": "9900000000011",
+      "qty": 5,
+      "qtyBase": 5,
+      "stockFactor": 1,
+      "unitCode": "BOX"
+    }
+  ]
+}

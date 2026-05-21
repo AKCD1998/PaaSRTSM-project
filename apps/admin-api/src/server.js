@@ -22,6 +22,7 @@ const { createEnrichmentRouter } = require("./routes/enrichment");
 const { createSearchRouter } = require("./routes/search");
 const { createLoyaltyRouter } = require("./routes/loyalty");
 const { createOrderingRouter } = require("./routes/ordering");
+const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 
 function appendVaryHeader(res, value) {
@@ -189,6 +190,13 @@ function createApp(overrides = {}) {
       config,
       db,
       requireAuthMiddleware,
+    }),
+  );
+  app.use(
+    "/api/sync/ada",
+    createAdaSyncRouter({
+      config,
+      db,
     }),
   );
   app.use(

@@ -1,0 +1,438 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const bcrypt = require("bcryptjs");
+const request = require("supertest");
+
+const { createApp } = require("../apps/admin-api/src/server");
+
+function buildConfig(overrides = {}) {
+  return {
+    nodeEnv: "test",
+    port: 0,
+    databaseUrl: "postgresql://test:test@localhost:5432/test",
+    authJwtSecret: "test-jwt-secret",
+    cookieName: "admin_session",
+    cookieSecure: false,
+    cookieSameSite: "lax",
+    sessionTtlHours: 12,
+    trustProxy: false,
+    loginRateLimitMax: 20,
+    loginRateLimitWindowMs: 60_000,
+    maxUploadBytes: 5 * 1024 * 1024,
+    adminUsers: new Set(["admin@example.com"]),
+    staffUsers: new Set(["staff@example.com"]),
+    adminPasswordHash: bcrypt.hashSync("admin-pass-123", 10),
+    staffPasswordHash: bcrypt.hashSync("staff-pass-123", 10),
+    posApiKeys: new Set(["test-pos-key"]),
+    ...overrides,
+  };
+}
+
+function normalizeSql(sql) {
+  return String(sql).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function createAdaMockDb() {
+  const state = {
+    branches: new Map(),
+    products: new Map(),
+    productBarcodes: new Map(),
+    transferHeaders: new Map(),
+    transferLines: new Map(),
+    syncRuns: [],
+    syncErrors: [],
+    txLog: [],
+  };
+
+  const db = {
+    state,
+    connect() {
+      return {
+        query: db.query.bind(db),
+        async release() {},
+      };
+    },
+    async query(sql, params = []) {
+      const normalized = normalizeSql(sql);
+
+      if (normalized === "begin" || normalized === "commit" || normalized === "rollback") {
+        state.txLog.push(normalized);
+        return { rowCount: 0, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into public.audit_logs")) {
+        return {
+          rowCount: 1,
+          rows: [{ audit_id: 1, event_time: new Date().toISOString() }],
+        };
+      }
+
+      if (normalized.startsWith("insert into ada.branches")) {
+        state.branches.set(params[0], {
+          branch_code: params[0],
+          branch_name: params[1],
+          branch_name_th: params[2],
+          branch_status: params[3],
+          source_system: params[4],
+          source_table: params[5],
+          source_synced_at: params[6],
+          raw_payload: JSON.parse(params[7]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.products")) {
+        state.products.set(params[0], {
+          product_code: params[0],
+          product_name: params[1],
+          product_name_th: params[2],
+          supplier_code: params[3],
+          category_code: params[4],
+          category_name: params[5],
+          unit_small: params[6],
+          factor_small: params[7],
+          unit_medium: params[8],
+          factor_medium: params[9],
+          unit_large: params[10],
+          factor_large: params[11],
+          stock_current: params[12],
+          stock_retail: params[13],
+          stock_warehouse: params[14],
+          min_stock: params[15],
+          max_stock: params[16],
+          lead_time_days: params[17],
+          is_active: params[18],
+          source_system: params[19],
+          source_table: params[20],
+          source_synced_at: params[21],
+          raw_payload: JSON.parse(params[22]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.product_barcodes")) {
+        state.productBarcodes.set(`${params[0]}|${params[1]}`, {
+          product_code: params[0],
+          barcode: params[1],
+          barcode_role: params[2],
+          source_system: params[3],
+          source_table: params[4],
+          source_synced_at: params[5],
+          raw_payload: JSON.parse(params[6]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.transfer_headers")) {
+        state.transferHeaders.set(`${params[0]}|${params[1]}|${params[4]}`, {
+          doc_no: params[0],
+          doc_type: params[1],
+          branch_code: params[4],
+          branch_code_to: params[5],
+          source_synced_at: params[19],
+          raw_payload: JSON.parse(params[20]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.transfer_lines")) {
+        state.transferLines.set(`${params[0]}|${params[1]}|${params[2]}|${params[3]}|${params[4]}`, {
+          doc_no: params[0],
+          doc_type: params[1],
+          branch_code: params[2],
+          line_no: params[3],
+          product_code: params[4],
+          qty: params[8],
+          source_synced_at: params[18],
+          raw_payload: JSON.parse(params[19]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.sync_runs")) {
+        const syncRunId = state.syncRuns.length + 1;
+        const row = {
+          sync_run_id: syncRunId,
+          source_system: params[0],
+          source_location: params[1],
+          agent_name: params[2],
+          agent_version: params[3],
+          sync_type: params[4],
+          started_at: params[5],
+          finished_at: params[6],
+          status: params[7],
+          records_read: params[8],
+          records_sent: params[9],
+          watermark_from: params[10],
+          watermark_to: params[11],
+          message: params[12],
+          meta: JSON.parse(params[13]),
+        };
+        state.syncRuns.push(row);
+        return { rowCount: 1, rows: [{ sync_run_id: syncRunId }] };
+      }
+
+      if (normalized.startsWith("insert into ada.sync_errors")) {
+        state.syncErrors.push({
+          sync_run_id: params[0],
+          source_system: params[1],
+          source_table: params[2],
+          error_code: params[3],
+          error_message: params[4],
+          error_details: JSON.parse(params[5]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      throw new Error(`Unhandled mock query: ${normalized}`);
+    },
+    async end() {},
+  };
+
+  return db;
+}
+
+function createTestApp(configOverrides = {}) {
+  const db = createAdaMockDb();
+  const { app } = createApp({
+    config: buildConfig(configOverrides),
+    db,
+    runImporter: async () => ({}),
+    runExcelPriceImporter: async () => ({}),
+    runRuleApplication: async () => ({}),
+  });
+  return { app, db };
+}
+
+test("ADA sync routes enforce API key and allow valid requests", async () => {
+  const { app } = createTestApp();
+  const payload = {
+    records: [{ branchCode: "000", branchName: "Head Office" }],
+  };
+
+  const missingKey = await request(app).post("/api/sync/ada/branches").send(payload);
+  assert.equal(missingKey.status, 401);
+  assert.equal(missingKey.body.message, "Invalid API key.");
+
+  const wrongKey = await request(app)
+    .post("/api/sync/ada/branches")
+    .set("x-api-key", "wrong-key")
+    .send(payload);
+  assert.equal(wrongKey.status, 401);
+  assert.equal(wrongKey.body.message, "Invalid API key.");
+
+  const accepted = await request(app)
+    .post("/api/sync/ada/branches")
+    .set("x-api-key", "test-pos-key")
+    .send(payload);
+  assert.equal(accepted.status, 200);
+  assert.equal(accepted.body.accepted, 1);
+});
+
+test("ADA branches route rejects malformed payloads and upserts the latest branch row", async () => {
+  const { app, db } = createTestApp();
+
+  const malformed = await request(app)
+    .post("/api/sync/ada/branches")
+    .set("x-api-key", "test-pos-key")
+    .send({ branchCode: "000" });
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.body.message, "Payload must include a records array.");
+
+  const firstSync = await request(app)
+    .post("/api/sync/ada/branches")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      syncRunId: 42,
+      sourceSyncedAt: "2026-05-21T01:00:00.000Z",
+      records: [
+        {
+          FTBchCode: "000",
+          FTBchName: "SC Main",
+          FTBchNameTH: "สำนักงานใหญ่",
+          FTBchStaActive: "1",
+        },
+      ],
+    });
+  assert.equal(firstSync.status, 200);
+  assert.equal(firstSync.body.syncRunId, 42);
+  assert.equal(db.state.branches.size, 1);
+  assert.equal(db.state.branches.get("000").branch_name, "SC Main");
+
+  const secondSync = await request(app)
+    .post("/api/sync/ada/branches")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSystem: "AdaAccMirror",
+      sourceSyncedAt: "2026-05-21T02:00:00.000Z",
+      records: [
+        {
+          branchCode: "000",
+          branchName: "SC Main Updated",
+          status: "0",
+        },
+      ],
+    });
+  assert.equal(secondSync.status, 200);
+  assert.equal(db.state.branches.size, 1);
+  assert.equal(db.state.branches.get("000").branch_name, "SC Main Updated");
+  assert.equal(db.state.branches.get("000").branch_status, "0");
+  assert.equal(db.state.branches.get("000").source_system, "AdaAccMirror");
+  assert.deepEqual(db.state.txLog, ["begin", "commit", "begin", "commit"]);
+});
+
+test("ADA products route upserts product fields and barcode rows from a valid payload", async () => {
+  const { app, db } = createTestApp();
+
+  const firstSync = await request(app)
+    .post("/api/sync/ada/products")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSyncedAt: "2026-05-21T03:00:00.000Z",
+      records: [
+        {
+          FTPdtCode: "630010001",
+          FTPdtName: "Cetirizine 10 mg",
+          FTSplCode: "SUP-01",
+          FTPdtGrpCode: "MED",
+          FTPdtGrpName: "Medicine",
+          FTPdtSUnit: "BOX",
+          FCPdtMin: 2,
+          FCPdtMax: 15,
+          FCPdtLeadTime: 5,
+          FCPdtQtyNow: 10,
+          FTPdtStaActive: "1",
+          FTPdtBarCode1: "885000000001",
+          FTPdtBarCode2: "885000000002",
+        },
+      ],
+    });
+  assert.equal(firstSync.status, 200);
+  assert.equal(firstSync.body.accepted, 1);
+  assert.equal(db.state.products.size, 1);
+  assert.equal(db.state.productBarcodes.size, 2);
+  assert.equal(db.state.products.get("630010001").product_name, "Cetirizine 10 mg");
+
+  const secondSync = await request(app)
+    .post("/api/sync/ada/products")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSyncedAt: "2026-05-21T04:00:00.000Z",
+      records: [
+        {
+          productCode: "630010001",
+          productName: "Cetirizine 10 mg Updated",
+          supplierCode: "SUP-02",
+          categoryName: "OTC",
+          unitSmall: "TAB",
+          minStock: 3,
+          maxStock: 18,
+          leadTimeDays: 7,
+          stockCurrent: 12,
+          isActive: "1",
+          barcode1: "885000000001",
+          barcode2: "885000000002",
+        },
+      ],
+    });
+  assert.equal(secondSync.status, 200);
+  assert.equal(db.state.products.size, 1);
+  assert.equal(db.state.productBarcodes.size, 2);
+  assert.equal(db.state.products.get("630010001").product_name, "Cetirizine 10 mg Updated");
+  assert.equal(db.state.products.get("630010001").supplier_code, "SUP-02");
+  assert.equal(
+    db.state.productBarcodes.get("630010001|885000000001").source_synced_at,
+    "2026-05-21T04:00:00.000Z",
+  );
+});
+
+test("ADA transfers route validates payload shape and accepts headers plus lines", async () => {
+  const { app, db } = createTestApp();
+
+  const malformed = await request(app)
+    .post("/api/sync/ada/transfers")
+    .set("x-api-key", "test-pos-key")
+    .send({ records: [] });
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.body.message, "Payload must include headers and lines arrays.");
+
+  const accepted = await request(app)
+    .post("/api/sync/ada/transfers")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSyncedAt: "2026-05-21T05:00:00.000Z",
+      headers: [
+        {
+          FTPthDocNo: "TRF-001",
+          FTPthDocType: "4",
+          FTBchCode: "000",
+          FTBchCodeTo: "101",
+          FDPthDocDate: "2026-05-20T00:00:00.000Z",
+          FTPthStaDoc: "1",
+        },
+      ],
+      lines: [
+        {
+          FTPthDocNo: "TRF-001",
+          FTPthDocType: "4",
+          FTBchCode: "000",
+          FNPtdSeqNo: 1,
+          FTPtdPdtCode: "630010001",
+          FCPtdQtyAll: 4,
+        },
+      ],
+    });
+  assert.equal(accepted.status, 200);
+  assert.equal(accepted.body.acceptedHeaders, 1);
+  assert.equal(accepted.body.acceptedLines, 1);
+  assert.equal(db.state.transferHeaders.size, 1);
+  assert.equal(db.state.transferLines.size, 1);
+});
+
+test("ADA run-log route records sync runs and writes sync_errors for failed runs", async () => {
+  const { app, db } = createTestApp();
+
+  const success = await request(app)
+    .post("/api/sync/ada/run-log")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSystem: "AdaAcc",
+      sourceLocation: "mother-pc",
+      agentName: "adapos-sync",
+      agentVersion: "1.2.3",
+      syncType: "scheduled-sync",
+      status: "success",
+      recordsRead: 12,
+      recordsSent: 12,
+      message: "Sync completed.",
+      meta: { durationMs: 2500 },
+    });
+  assert.equal(success.status, 200);
+  assert.deepEqual(success.body, { accepted: 1, id: "1" });
+  assert.equal(db.state.syncRuns.length, 1);
+  assert.equal(db.state.syncErrors.length, 0);
+
+  const failed = await request(app)
+    .post("/api/sync/ada/run-log")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSystem: "AdaAcc",
+      sourceTable: "TPSTSalHD",
+      syncType: "scheduled-sync",
+      status: "failed",
+      recordsRead: 5,
+      recordsSent: 3,
+      message: "Sales sync failed.",
+      errorCode: "SQL_TIMEOUT",
+      errorDetails: { retryable: true },
+    });
+  assert.equal(failed.status, 200);
+  assert.deepEqual(failed.body, { accepted: 1, id: "2" });
+  assert.equal(db.state.syncRuns.length, 2);
+  assert.equal(db.state.syncErrors.length, 1);
+  assert.equal(db.state.syncErrors[0].sync_run_id, 2);
+  assert.equal(db.state.syncErrors[0].error_code, "SQL_TIMEOUT");
+  assert.deepEqual(db.state.syncErrors[0].error_details, { retryable: true });
+});
