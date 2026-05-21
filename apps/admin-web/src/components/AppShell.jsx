@@ -50,6 +50,11 @@ export function AppShell({ children }) {
             </NavLink>
           )}
           {isAdmin && (
+            <NavLink to="/reconciliation" className={navClass}>
+              Reconciliation
+            </NavLink>
+          )}
+          {isAdmin && (
             <NavLink to="/embeddings/sync" className={navClass}>
               Embedding Jobs
             </NavLink>

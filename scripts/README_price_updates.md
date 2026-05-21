@@ -1,5 +1,9 @@
 # Monthly AdaPos Price Updates
 
+Database configuration note:
+- `DATABASE_URL` must be a complete PostgreSQL connection string, including a fully qualified host.
+- For the current Render-hosted Postgres setup, set `PGSSLMODE=require`.
+
 ## Audit summary
 Current importer behavior now has two explicit modes:
 

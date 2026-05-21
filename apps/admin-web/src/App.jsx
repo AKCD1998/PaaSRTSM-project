@@ -13,6 +13,7 @@ import { ImportPricesPage } from "./pages/ImportPricesPage";
 import { TopSellersPage } from "./pages/TopSellersPage";
 import { ApplyRulesPage } from "./pages/ApplyRulesPage";
 import { EmbeddingSyncPage } from "./pages/EmbeddingSyncPage";
+import { ReconciliationPage } from "./pages/ReconciliationPage";
 
 function PrivateRoutes() {
   return (
@@ -43,6 +44,14 @@ function PrivateRoutes() {
           element={
             <RoleGuard roles={["admin"]}>
               <ApplyRulesPage />
+            </RoleGuard>
+          }
+        />
+        <Route
+          path="/reconciliation"
+          element={
+            <RoleGuard roles={["admin"]}>
+              <ReconciliationPage />
             </RoleGuard>
           }
         />

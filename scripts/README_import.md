@@ -32,6 +32,11 @@ Install dependencies:
 npm install
 ```
 
+Database configuration note:
+- `DATABASE_URL` must be a complete PostgreSQL connection string, including a fully qualified host.
+- For the current Render-hosted Postgres setup, set `PGSSLMODE=require`.
+- `npm run db:migrate` prefers a non-empty shell `DATABASE_URL`; if it is missing, the script falls back to `apps/admin-api/.env` and only fills missing env vars.
+
 Run migration:
 
 ```bash

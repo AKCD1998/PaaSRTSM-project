@@ -403,3 +403,120 @@ Endpoints:
 ### 11.7 หมายเหตุเรื่องความสามารถ progress จริง
 - Embedding sync: มี async job endpoint แล้ว จึงแสดงสถานะ progress จาก job ได้
 - Import products/prices: ถ้ายังไม่มี backend progress/job endpoint แยก จะโชว์ได้แบบ indeterminate ระหว่าง request เท่านั้น (ไม่ fake %)
+
+## 12) Update (2026-05-17): Loyalty drug-exclusion safeguard for SCCRMonPOS
+
+### 12.1 เป้าหมายรอบนี้
+- ใช้ฐานข้อมูลสินค้าใน `PaaSRTSM-project` เป็นแหล่งตัดสินว่า SKU ไหน “ร่วมสะสมแต้ม” ได้
+- บล็อกการให้แต้มกับสินค้าประเภทยาแบบ conservative
+- เตรียมทางเชื่อมให้ `SCCRMonPOS` เรียกมาตรวจสินค้าได้ก่อนคิดแต้ม
+
+### 12.2 หลักการตัดสินสิทธิ์แต้ม
+กติกาที่ implement รอบนี้จงใจ “เข้ม” มากกว่าฉลาด:
+- ถ้า `product_kind = medicine`:
+  - `eligible = false`
+  - `reason = "medicine_blocked"`
+- ถ้า `product_kind` ว่าง / ไม่มีข้อมูล:
+  - `eligible = false`
+  - `reason = "unknown_product_kind"`
+- ถ้า `product_kind` มีค่าและไม่ใช่ `medicine`:
+  - `eligible = true`
+  - `reason = "non_medicine_allowed"`
+
+ผลเชิงนโยบาย:
+- ยา = ไม่ได้แต้ม
+- สินค้ายังไม่จัดประเภท = ยังไม่ได้แต้ม
+- ได้แต้มเฉพาะสินค้าที่ฐานข้อมูลยืนยันแล้วว่าไม่ใช่ยา
+
+### 12.3 API ใหม่ที่เพิ่มสำหรับ POS
+เพิ่ม route ใหม่:
+- ไฟล์: `apps/admin-api/src/routes/loyalty.js`
+- mount ที่: `apps/admin-api/src/server.js`
+- base path: `/api/loyalty`
+
+endpoint ที่เพิ่ม:
+- `GET /api/loyalty/products/eligibility`
+
+query ที่รองรับ:
+- `barcode=<raw barcode>`
+- หรือ `company_code=<product code จาก POS>`
+
+พฤติกรรม:
+- ถ้าให้ `barcode` จะ lookup จาก `public.barcodes` แล้ว join ไป `public.skus`
+- ถ้าให้ `company_code` จะ lookup ตรงจาก `public.skus`
+- ถ้าไม่ส่งทั้งสองค่า:
+  - ตอบ `400`
+- ถ้าหาสินค้าไม่เจอ:
+  - ตอบ `404`
+- ถ้าเจอ:
+  - ตอบ product + loyalty decision
+
+ตัวอย่าง response:
+```json
+{
+  "ok": true,
+  "request_id": "uuid",
+  "matched_by": "barcode",
+  "product": {
+    "sku_id": 123,
+    "company_code": "630010001",
+    "display_name": "Cetirizine 10 mg",
+    "category_name": "ยาแก้แพ้",
+    "product_kind": "medicine",
+    "barcode": "8853935031319"
+  },
+  "loyalty": {
+    "eligible": false,
+    "reason": "medicine_blocked"
+  }
+}
+```
+
+### 12.4 Security ของ endpoint นี้
+route นี้ไม่ได้ใช้ admin/staff cookie session แบบหน้าเว็บ admin
+เพราะ caller คือโปรแกรม POS companion ไม่ใช่ browser admin
+
+สิ่งที่เพิ่ม:
+- config ใหม่ใน `apps/admin-api/src/config.js`
+- env ใหม่ใน `apps/admin-api/.env.example`
+
+ตัวแปรใหม่:
+- `POS_API_KEYS`
+
+วิธีใช้:
+- ใส่ key แบบ comma-separated ใน env
+- `SCCRMonPOS` ต้องส่ง header:
+  - `x-pos-api-key: <your-key>`
+
+ถ้า key ไม่ถูกต้องหรือไม่ส่งมา:
+- ตอบ `401 Unauthorized`
+
+### 12.5 ไฟล์ที่แก้ใน PaaSRTSM-project รอบนี้
+เพิ่ม:
+- `apps/admin-api/src/routes/loyalty.js`
+
+แก้:
+- `apps/admin-api/src/server.js`
+- `apps/admin-api/src/config.js`
+- `apps/admin-api/.env.example`
+- `tests/admin_api_smoke.test.js`
+
+### 12.6 Tests ที่เพิ่ม
+เพิ่ม test smoke coverage สำหรับ:
+- route ใช้งานได้เมื่อส่ง `x-pos-api-key`
+- route block สินค้า `medicine`
+- route ปฏิเสธ request ที่ไม่มี API key
+
+ผลรันล่าสุด:
+- `npm test` ผ่าน
+
+### 12.7 ข้อจำกัดที่ยังมีอยู่
+API นี้ “ตัดสินสิทธิ์ SKU” เท่านั้น
+มันยังไม่ได้:
+- รับรายการขายทั้งบิล
+- รวม subtotal ให้เอง
+- แยกยอด eligible/non-eligible อัตโนมัติจากบิลเต็ม
+
+สรุปคือ ตอนนี้ระบบฝั่งนี้ทำหน้าที่เป็น:
+- product eligibility service
+- ไม่ใช่ basket pricing/receipt calculation engine

@@ -2,6 +2,10 @@
 
 This workflow lets you keep commercial SKU import simple while gradually enriching drug-like metadata.
 
+Database configuration note:
+- `DATABASE_URL` must be a complete PostgreSQL connection string, including a fully qualified host.
+- For the current Render-hosted Postgres setup, set `PGSSLMODE=require`.
+
 ## 1) Migrations
 Run these after your existing schema migrations:
 

@@ -22,6 +22,7 @@ const { createEnrichmentRouter } = require("./routes/enrichment");
 const { createSearchRouter } = require("./routes/search");
 const { createLoyaltyRouter } = require("./routes/loyalty");
 const { createOrderingRouter } = require("./routes/ordering");
+const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 
@@ -182,6 +183,14 @@ function createApp(overrides = {}) {
       requireCsrfMiddleware: requireCsrf,
       embeddingProvider: searchEmbeddingProvider,
       embeddingSyncJobRunner: searchEmbeddingSyncJobRunner,
+    }),
+  );
+  app.use(
+    "/api/admin/reconciliation",
+    createReconciliationRouter({
+      db,
+      requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
     }),
   );
   app.use(

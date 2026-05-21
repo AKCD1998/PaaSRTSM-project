@@ -36,6 +36,8 @@ Adjust:
 VITE_ADMIN_API_BASE=http://localhost:3001
 ```
 
+If you run repo-level scripts from this checkout, keep database settings in the repo root shell or in `apps/admin-api/.env`, not in tracked example files. For the current Render-hosted Postgres setup, `DATABASE_URL` must be a complete connection string with a fully qualified host and `PGSSLMODE=require`.
+
 ## Run (dev)
 ```bash
 cd apps/admin-web

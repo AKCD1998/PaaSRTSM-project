@@ -182,4 +182,55 @@ export const api = {
       csrfToken,
     });
   },
+  listBranches() {
+    return request("/api/branches");
+  },
+  getReconciliationSummary(params) {
+    return request("/api/admin/reconciliation/summary", {
+      query: params,
+    });
+  },
+  listReconciliationCases(params) {
+    return request("/api/admin/reconciliation/cases", {
+      query: params,
+    });
+  },
+  getReconciliationCase(caseKey) {
+    return request(`/api/admin/reconciliation/cases/${encodeURIComponent(caseKey)}`);
+  },
+  confirmReconciliationReceipt(caseKey, payload, csrfToken) {
+    return request(`/api/admin/reconciliation/cases/${encodeURIComponent(caseKey)}/confirm-receipt`, {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
+  recordReconciliationDiscrepancy(caseKey, payload, csrfToken) {
+    return request(`/api/admin/reconciliation/cases/${encodeURIComponent(caseKey)}/discrepancy`, {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
+  approveReconciliationCase(caseKey, payload, csrfToken) {
+    return request(`/api/admin/reconciliation/cases/${encodeURIComponent(caseKey)}/approve`, {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
+  updateReconciliationCaseStatus(caseKey, payload, csrfToken) {
+    return request(`/api/admin/reconciliation/cases/${encodeURIComponent(caseKey)}/status`, {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
+  appendReconciliationEvent(caseKey, payload, csrfToken) {
+    return request(`/api/admin/reconciliation/cases/${encodeURIComponent(caseKey)}/events`, {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
 };

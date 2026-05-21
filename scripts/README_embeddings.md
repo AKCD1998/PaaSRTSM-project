@@ -1,5 +1,9 @@
 # SKU Embeddings (PostgreSQL + pgvector)
 
+Database configuration note:
+- `DATABASE_URL` must be a complete PostgreSQL connection string, including a fully qualified host.
+- For the current Render-hosted Postgres setup, set `PGSSLMODE=require`.
+
 ## 1) Run migration
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/012_add_sku_embeddings.sql

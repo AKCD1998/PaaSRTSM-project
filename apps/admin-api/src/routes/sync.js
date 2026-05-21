@@ -2,6 +2,9 @@
 
 const express = require("express");
 
+// Legacy-compatible simplified sync endpoints.
+// Keep these working during the transition to /api/sync/ada/*.
+
 function parseApiRecords(body) {
   if (!body || !Array.isArray(body.records)) {
     return { error: "Payload must include a records array." };
