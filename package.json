@@ -29,6 +29,7 @@
     "express": "^4.21.2",
     "iconv-lite": "^0.6.3",
     "jsonwebtoken": "^9.0.2",
+    "mssql": "^12.5.4",
     "multer": "^2.0.2",
     "pg": "^8.13.1",
     "xlsx": "^0.18.5"
