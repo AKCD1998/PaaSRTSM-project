@@ -1,0 +1,79 @@
+{
+  "datasets": {
+    "branches": {
+      "sourceTable": "TCNMBranch",
+      "watermarkTo": "2026-05-21T08:00:00.000Z",
+      "payload": {
+        "sourceSystem": "AdaAcc",
+        "sourceSyncedAt": "2026-05-21T08:00:00.000Z",
+        "records": [
+          {
+            "FTBchCode": "000",
+            "FTBchName": "SC Main",
+            "FTBchNameTH": "สำนักงานใหญ่",
+            "FTBchStaActive": "1"
+          },
+          {
+            "FTBchCode": "001",
+            "FTBchName": "Branch 001",
+            "FTBchNameTH": "สาขา 001",
+            "FTBchStaActive": "1"
+          }
+        ]
+      }
+    },
+    "products": {
+      "sourceTable": "TCNMPdt",
+      "watermarkTo": "2026-05-21T08:05:00.000Z",
+      "payload": {
+        "sourceSystem": "AdaAcc",
+        "sourceSyncedAt": "2026-05-21T08:05:00.000Z",
+        "records": [
+          {
+            "FTPdtCode": "630010001",
+            "FTPdtName": "Cetirizine 10 mg",
+            "FTSplCode": "SUP-01",
+            "FTPdtGrpCode": "MED",
+            "FTPdtGrpName": "Medicine",
+            "FTPdtSUnit": "BOX",
+            "FCPdtMin": 2,
+            "FCPdtMax": 15,
+            "FCPdtLeadTime": 5,
+            "FCPdtQtyNow": 10,
+            "FTPdtStaActive": "1",
+            "FTPdtBarCode1": "885000000001"
+          }
+        ]
+      }
+    },
+    "transfers": {
+      "sourceTable": "TCNTPdtTnfHD/TCNTPdtTnfDT",
+      "watermarkTo": "2026-05-20T00:00:00.000Z",
+      "payload": {
+        "sourceSystem": "AdaAcc",
+        "sourceSyncedAt": "2026-05-21T08:10:00.000Z",
+        "headers": [
+          {
+            "FTPthDocNo": "TRF-001",
+            "FTPthDocType": "4",
+            "FTBchCode": "000",
+            "FTBchCodeTo": "001",
+            "FDPthDocDate": "2026-05-20T00:00:00.000Z",
+            "FTPthStaDoc": "1",
+            "FTPthStaPrcDoc": ""
+          }
+        ],
+        "lines": [
+          {
+            "FTPthDocNo": "TRF-001",
+            "FTPthDocType": "4",
+            "FTBchCode": "000",
+            "FNPtdSeqNo": 1,
+            "FTPtdPdtCode": "630010001",
+            "FCPtdQtyAll": 4
+          }
+        ]
+      }
+    }
+  }
+}
