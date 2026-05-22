@@ -309,7 +309,10 @@ async function getPendingReceipts(db, branchCode = null) {
       FROM ada.pending_receipt_headers h
       LEFT JOIN ada.pending_receipt_lines l
         ON l.doc_no = h.doc_no
-      WHERE ($1::text IS NULL OR h.branch_code = $1)
+      WHERE ($1::text IS NULL OR (
+        h.branch_code = $1
+        OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
+      ))
       ORDER BY h.doc_date DESC, h.doc_time DESC, l.seq_no ASC
     `,
     params,
@@ -337,7 +340,10 @@ async function getApprovedReceipts(db, branchCode, date = null) {
       FROM ada.approved_receipt_headers h
       LEFT JOIN ada.approved_receipt_lines l
         ON l.doc_no = h.doc_no
-      WHERE h.branch_code = $1
+      WHERE (
+        h.branch_code = $1
+        OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
+      )
         AND ($2::text IS NULL OR CAST(h.doc_date AS DATE) = $2::date)
       ORDER BY h.doc_date DESC, h.doc_time DESC, l.seq_no ASC
     `,

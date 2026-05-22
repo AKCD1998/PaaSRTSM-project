@@ -40,6 +40,7 @@ function createReceiptMockDb() {
     approvedHeaders: new Map(),
     approvedLines: new Map(),
     txLog: [],
+    hqBranches: new Set(["000"]),
   };
 
   const db = {
@@ -185,7 +186,7 @@ function createReceiptMockDb() {
         const branchCode = params[0];
         const rows = [];
         for (const header of state.pendingHeaders.values()) {
-          if (branchCode && header.branch_code !== branchCode) continue;
+          if (branchCode && header.branch_code !== branchCode && !state.hqBranches.has(header.branch_code)) continue;
           const lines = state.pendingLines.get(header.doc_no) || [];
           if (!lines.length) {
             rows.push({ ...header, seq_no: null });
@@ -203,7 +204,7 @@ function createReceiptMockDb() {
         const date = params[1];
         const rows = [];
         for (const header of state.approvedHeaders.values()) {
-          if (header.branch_code !== branchCode) continue;
+          if (header.branch_code !== branchCode && !state.hqBranches.has(header.branch_code)) continue;
           if (date && String(header.doc_date) !== String(date)) continue;
           const lines = state.approvedLines.get(header.doc_no) || [];
           if (!lines.length) {
@@ -333,4 +334,106 @@ test("receipt sync and admin routes work on the shared backend contract", async 
   assert.equal(approvedAdmin.body.records[0].lines[0].productCode, "630010002");
 
   assert.deepEqual(db.state.txLog, ["begin", "commit", "begin", "commit"]);
+});
+
+test("viewer-vs-owner: branch 005 viewer sees own receipts plus HQ receipts", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  // Sync a HQ (branch 000) pending receipt
+  await request(app)
+    .post("/api/sync/ada/pending-receipts")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSyncedAt: "2026-05-22T01:00:00.000Z",
+      headers: [
+        {
+          FTBchCode: "000",
+          FTXihDocNo: "HQ-001",
+          FTXihDocType: "2",
+          FDXihDocDate: "2026-05-22",
+          FTSplCode: "SUP-HQ",
+          FTXihCstName: "HQ Supplier",
+          FCXihGrand: 500,
+        },
+      ],
+      lines: [
+        { FTBchCode: "000", FTXihDocNo: "HQ-001", FNXidSeqNo: 1, FTPdtCode: "P-HQ-001", FTPdtName: "HQ Product", FCXidQty: 5, FCXidQtyAll: 5 },
+      ],
+    });
+
+  // Sync a branch 005 pending receipt
+  await request(app)
+    .post("/api/sync/ada/pending-receipts")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSyncedAt: "2026-05-22T01:00:00.000Z",
+      headers: [
+        {
+          FTBchCode: "005",
+          FTXihDocNo: "BR005-001",
+          FTXihDocType: "2",
+          FDXihDocDate: "2026-05-22",
+          FTSplCode: "SUP-005",
+          FTXihCstName: "Branch 005 Supplier",
+          FCXihGrand: 200,
+        },
+      ],
+      lines: [
+        { FTBchCode: "005", FTXihDocNo: "BR005-001", FNXidSeqNo: 1, FTPdtCode: "P-005-001", FTPdtName: "Branch Product", FCXidQty: 2, FCXidQtyAll: 2 },
+      ],
+    });
+
+  // Viewer is branch 005 — should see both HQ-001 and BR005-001
+  const res005 = await agent.get("/api/admin/pending-receipts?branchCode=005");
+  assert.equal(res005.status, 200);
+  const docNos005 = res005.body.records.map((r) => r.docNo).sort();
+  assert.deepEqual(docNos005, ["BR005-001", "HQ-001"]);
+
+  // Verify receipt owner branch_code is unchanged (HQ record is still 000, branch record still 005)
+  const hqRecord = res005.body.records.find((r) => r.docNo === "HQ-001");
+  assert.equal(hqRecord.branchCode, "000");
+  const br005Record = res005.body.records.find((r) => r.docNo === "BR005-001");
+  assert.equal(br005Record.branchCode, "005");
+
+  // HQ viewer (branchCode=000) should only see HQ records (000 is both viewer and HQ owner)
+  const res000 = await agent.get("/api/admin/pending-receipts?branchCode=000");
+  assert.equal(res000.status, 200);
+  const docNos000 = res000.body.records.map((r) => r.docNo);
+  assert.ok(docNos000.includes("HQ-001"));
+  assert.ok(!docNos000.includes("BR005-001"));
+
+  // Sync HQ and branch 005 approved receipts
+  await request(app)
+    .post("/api/sync/ada/approved-receipts")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "000",
+      sourceSyncedAt: "2026-05-22T02:00:00.000Z",
+      records: [
+        { docNo: "AR-HQ-001", docType: "2", docDate: "2026-05-22", supplierCode: "SUP-HQ", supplierName: "HQ Supplier", grand: 500, staPrcDoc: "1", lines: [{ seqNo: 1, productCode: "P-HQ-001", productName: "HQ Product", qty: 5, qtyBase: 5 }] },
+      ],
+    });
+
+  await request(app)
+    .post("/api/sync/ada/approved-receipts")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "005",
+      sourceSyncedAt: "2026-05-22T02:00:00.000Z",
+      records: [
+        { docNo: "AR-BR005-001", docType: "2", docDate: "2026-05-22", supplierCode: "SUP-005", supplierName: "Branch 005 Supplier", grand: 200, staPrcDoc: "1", lines: [{ seqNo: 1, productCode: "P-005-001", productName: "Branch Product", qty: 2, qtyBase: 2 }] },
+      ],
+    });
+
+  // Branch 005 viewer sees HQ + own approved receipts
+  const appr005 = await agent.get("/api/admin/approved-receipts?branchCode=005&date=2026-05-22");
+  assert.equal(appr005.status, 200);
+  const apprDocNos005 = appr005.body.records.map((r) => r.docNo).sort();
+  assert.deepEqual(apprDocNos005, ["AR-BR005-001", "AR-HQ-001"]);
+
+  // branchCode on returned records is the real owner, not overwritten
+  const apprHq = appr005.body.records.find((r) => r.docNo === "AR-HQ-001");
+  assert.equal(apprHq.branchCode, "000");
 });
