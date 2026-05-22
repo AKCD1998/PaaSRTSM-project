@@ -1361,7 +1361,34 @@ function createAdaSyncRouter(deps) {
     };
   }
 
-  router.post("/branches", createRecordsHandler(upsertBranch));
+  router.post("/branches", async (req, res, next) => {
+    const { error, records } = parseApiRecords(req.body);
+    if (error) {
+      return res.status(400).json({ message: error });
+    }
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      for (const record of records) {
+        // eslint-disable-next-line no-await-in-loop
+        await upsertBranch(client, req.body, record);
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+    // Propagate ada.branches → core.branches so viewer-vs-owner queries are current.
+    try {
+      await db.query("SELECT * FROM ada.refresh_foundations()");
+    } catch (derivationError) {
+      // Non-fatal: branch data is synced; derivation will be retried on next branch sync.
+      console.error("ada.refresh_foundations() failed after branch upsert:", derivationError.message);
+    }
+    return res.json({ accepted: records.length, syncRunId: getSyncRunId(req.body) });
+  });
   router.post("/products", createRecordsHandler(upsertProduct));
   router.post("/sales", async (req, res, next) => {
     if (!req.body || !Array.isArray(req.body.headers) || !Array.isArray(req.body.lines)) {
