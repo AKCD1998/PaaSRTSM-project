@@ -861,11 +861,10 @@ async function replacePendingReceipts(client, body, headers, lines) {
   }
 
   for (const record of lines) {
-    const lineBranchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
     const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
     const seqNo = Number(pick(record, ["FNXidSeqNo", "seqNo"], 0));
-    if (!lineBranchCode || !docNo || !Number.isInteger(seqNo) || seqNo <= 0) {
-      throw new Error("Each pending receipt line requires FTBchCode/branchCode, FTXihDocNo/docNo, and positive FNXidSeqNo/seqNo.");
+    if (!docNo || !Number.isInteger(seqNo) || seqNo <= 0) {
+      throw new Error("Each pending receipt line requires FTXihDocNo/docNo and positive FNXidSeqNo/seqNo.");
     }
 
     await client.query(
