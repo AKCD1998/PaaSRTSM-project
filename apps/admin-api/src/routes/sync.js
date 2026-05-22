@@ -16,9 +16,90 @@ function normalizeText(value) {
   return String(value == null ? "" : value).trim();
 }
 
+function normalizeNullableText(value) {
+  const normalized = normalizeText(value);
+  return normalized || null;
+}
+
 function toNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function parseTimestamp(value, fallback = null) {
+  const normalized = normalizeNullableText(value);
+  return normalized || fallback;
+}
+
+function shouldMirrorAdaRunLog(body) {
+  const sourceName = normalizeText(body?.sourceName).toLowerCase();
+  const sourceSystem = normalizeText(body?.sourceSystem).toLowerCase();
+  return sourceName === "adapos_sync" || sourceSystem === "adaacc";
+}
+
+async function insertAdaRunLog(db, body) {
+  const result = await db.query(
+    `
+      INSERT INTO ada.sync_runs
+        (
+          source_system,
+          source_location,
+          agent_name,
+          agent_version,
+          sync_type,
+          started_at,
+          finished_at,
+          status,
+          records_read,
+          records_sent,
+          watermark_from,
+          watermark_to,
+          message,
+          meta
+        )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)
+      RETURNING sync_run_id
+    `,
+    [
+      normalizeText(body?.sourceSystem) || "AdaAcc",
+      normalizeNullableText(body?.sourceLocation),
+      normalizeNullableText(body?.agentName),
+      normalizeNullableText(body?.agentVersion),
+      normalizeText(body?.syncType) || "manual",
+      parseTimestamp(body?.startedAt, new Date().toISOString()),
+      parseTimestamp(body?.finishedAt),
+      normalizeText(body?.status) || "success",
+      Math.max(0, Math.floor(toNumber(body?.recordsRead, 0))),
+      Math.max(0, Math.floor(toNumber(body?.recordsSent, 0))),
+      normalizeNullableText(body?.watermarkFrom),
+      normalizeNullableText(body?.watermarkTo),
+      normalizeNullableText(body?.message),
+      JSON.stringify({
+        legacyRoute: true,
+        sourceName: normalizeText(body?.sourceName) || "adapos_sync",
+      }),
+    ],
+  );
+
+  if (String(body?.status || "").toLowerCase() === "failed") {
+    await db.query(
+      `
+        INSERT INTO ada.sync_errors
+          (sync_run_id, source_system, source_table, error_code, error_message, error_details)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+      `,
+      [
+        result.rows[0].sync_run_id,
+        normalizeText(body?.sourceSystem) || "AdaAcc",
+        normalizeNullableText(body?.sourceTable),
+        normalizeNullableText(body?.errorCode),
+        normalizeText(body?.message) || "Sync failed.",
+        JSON.stringify(body?.errorDetails || {}),
+      ],
+    );
+  }
+
+  return result.rows[0].sync_run_id;
 }
 
 function parseRequiredApiKey(config, req) {
@@ -337,6 +418,11 @@ function createSyncRouter(deps) {
         ],
       );
 
+      let adaSyncRunId = null;
+      if (shouldMirrorAdaRunLog(req.body)) {
+        adaSyncRunId = await insertAdaRunLog(db, req.body);
+      }
+
       if (String(req.body?.status || "").toLowerCase() === "failed") {
         await db.query(
           `
@@ -354,7 +440,11 @@ function createSyncRouter(deps) {
         );
       }
 
-      return res.json({ accepted: 1, id: String(result.rows[0].sync_run_id) });
+      return res.json({
+        accepted: 1,
+        id: String(result.rows[0].sync_run_id),
+        adaSyncRunId: adaSyncRunId == null ? null : String(adaSyncRunId),
+      });
     } catch (e) {
       return next(e);
     }

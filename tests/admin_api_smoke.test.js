@@ -249,6 +249,30 @@ function createMockDb() {
         };
       }
 
+      if (normalizedSql.startsWith("insert into ada.sync_runs")) {
+        state.lastAdaSyncRun = {
+          sync_run_id: 88,
+          source_system: params[0],
+          source_location: params[1],
+          agent_name: params[2],
+          agent_version: params[3],
+          sync_type: params[4],
+          started_at: params[5],
+          finished_at: params[6],
+          status: params[7],
+          records_read: params[8],
+          records_sent: params[9],
+          watermark_from: params[10],
+          watermark_to: params[11],
+          message: params[12],
+          meta: JSON.parse(params[13]),
+        };
+        return {
+          rowCount: 1,
+          rows: [{ sync_run_id: 88 }],
+        };
+      }
+
       if (normalizedSql.includes("from ingest.sync_runs")) {
         return {
           rowCount: state.lastSyncRun ? 1 : 0,
@@ -520,7 +544,7 @@ test("admin import prices route accepts .xls and uses excel-dataonly importer", 
 });
 
 test("ordering and sync routes are available on the unified backend", async () => {
-  const { app } = createTestApp();
+  const { app, db } = createTestApp();
   const agent = request.agent(app);
 
   const branchesResponse = await agent.get("/api/branches");
@@ -552,6 +576,11 @@ test("ordering and sync routes are available on the unified backend", async () =
     });
   assert.equal(syncRunLogResponse.status, 200);
   assert.equal(syncRunLogResponse.body.accepted, 1);
+  assert.equal(syncRunLogResponse.body.adaSyncRunId, "88");
+  assert.equal(db.state.lastAdaSyncRun.sync_type, "scheduled-sync");
+  assert.equal(db.state.lastAdaSyncRun.source_system, "AdaAcc");
+  assert.equal(db.state.lastAdaSyncRun.meta.legacyRoute, true);
+  assert.equal(db.state.lastAdaSyncRun.meta.sourceName, "adapos_sync");
 
   const syncStatusResponse = await agent.get("/api/admin/sync-status");
   assert.equal(syncStatusResponse.status, 200);

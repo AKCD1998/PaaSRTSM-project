@@ -70,6 +70,68 @@ function buildStockDayRow(product, periodDays) {
   };
 }
 
+function groupReceiptRows(rows, options = {}) {
+  const {
+    includeStaPrcDoc = false,
+    lineWarehouseField = "warehouse_code",
+    lineVatField = "line_vat",
+  } = options;
+
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.doc_no)) {
+      grouped.set(row.doc_no, {
+        docNo: row.doc_no,
+        branchCode: row.branch_code,
+        docType: row.doc_type,
+        docDate: row.doc_date,
+        docTime: row.doc_time,
+        supplierCode: row.supplier_code,
+        supplierName: row.supplier_name,
+        refExt: row.ref_ext,
+        refExtDate: row.ref_ext_date,
+        warehouseCode: row.warehouse_code,
+        total: Number(row.total || 0),
+        vat: Number(row.vat || 0),
+        grand: Number(row.grand || 0),
+        usrCode: row.usr_code,
+        createdBy: row.created_by,
+        createdAtAda: row.created_at_ada,
+        syncedAt: row.synced_at,
+        lines: [],
+      });
+
+      if (includeStaPrcDoc) {
+        grouped.get(row.doc_no).staPrcDoc = row.sta_prc_doc;
+      }
+    }
+
+    if (row.seq_no != null) {
+      grouped.get(row.doc_no).lines.push({
+        seqNo: row.seq_no,
+        productCode: row.product_code,
+        productName: row.product_name,
+        barcode: row.barcode,
+        unitCode: row.unit_code,
+        unitName: row.unit_name,
+        factor: Number(row.factor || 1),
+        qty: Number(row.qty || 0),
+        qtyBase: Number(row.qty_base || 0),
+        stockFactor: Number(row.stock_factor || 1),
+        setPrice: Number(row.set_price || 0),
+        net: Number(row.net || 0),
+        vat: Number(row[lineVatField] || 0),
+        costIn: Number(row.cost_in || 0),
+        lotNo: row.lot_no,
+        expiredDate: row.expired_date,
+        warehouseCode: row[lineWarehouseField],
+      });
+    }
+  }
+
+  return [...grouped.values()];
+}
+
 function validateOrderRequestBody(body) {
   const { branchCode, items } = body || {};
   if (!branchCode || !Array.isArray(items) || items.length === 0) {
@@ -229,6 +291,64 @@ async function getOrderRequestById(db, orderRequestId) {
         lineNote: row.line_note || "",
       })),
   };
+}
+
+async function getPendingReceipts(db, branchCode = null) {
+  const params = [branchCode];
+  const result = await db.query(
+    `
+      SELECT
+        h.doc_no, h.branch_code, h.doc_type, h.doc_date, h.doc_time,
+        h.supplier_code, h.supplier_name, h.ref_ext, h.ref_ext_date,
+        h.warehouse_code, h.total, h.vat, h.grand,
+        h.usr_code, h.created_by, h.created_at_ada, h.sta_doc, h.synced_at,
+        l.seq_no, l.product_code, l.product_name, l.barcode,
+        l.unit_code, l.unit_name, l.factor, l.qty, l.qty_base, l.stock_factor,
+        l.set_price, l.net, l.vat AS line_vat, l.cost_in, l.lot_no, l.expired_date,
+        l.warehouse_code AS line_warehouse_code
+      FROM ada.pending_receipt_headers h
+      LEFT JOIN ada.pending_receipt_lines l
+        ON l.doc_no = h.doc_no
+      WHERE ($1::text IS NULL OR h.branch_code = $1)
+      ORDER BY h.doc_date DESC, h.doc_time DESC, l.seq_no ASC
+    `,
+    params,
+  );
+
+  return groupReceiptRows(result.rows, {
+    includeStaPrcDoc: false,
+    lineWarehouseField: "line_warehouse_code",
+    lineVatField: "line_vat",
+  });
+}
+
+async function getApprovedReceipts(db, branchCode, date = null) {
+  const result = await db.query(
+    `
+      SELECT
+        h.doc_no, h.branch_code, h.doc_type, h.doc_date, h.doc_time,
+        h.supplier_code, h.supplier_name, h.ref_ext, h.ref_ext_date,
+        h.warehouse_code, h.total, h.vat, h.grand,
+        h.usr_code, h.created_by, h.created_at_ada, h.sta_doc, h.sta_prc_doc, h.synced_at,
+        l.seq_no, l.product_code, l.product_name, l.barcode,
+        l.unit_code, l.unit_name, l.factor, l.qty, l.qty_base, l.stock_factor,
+        l.set_price, l.net, l.vat AS line_vat, l.cost_in, l.lot_no, l.expired_date,
+        l.warehouse_code AS line_warehouse_code
+      FROM ada.approved_receipt_headers h
+      LEFT JOIN ada.approved_receipt_lines l
+        ON l.doc_no = h.doc_no
+      WHERE h.branch_code = $1
+        AND ($2::text IS NULL OR CAST(h.doc_date AS DATE) = $2::date)
+      ORDER BY h.doc_date DESC, h.doc_time DESC, l.seq_no ASC
+    `,
+    [branchCode, date],
+  );
+
+  return groupReceiptRows(result.rows, {
+    includeStaPrcDoc: true,
+    lineWarehouseField: "line_warehouse_code",
+    lineVatField: "line_vat",
+  });
 }
 
 function createOrderingRouter(deps) {
@@ -566,11 +686,38 @@ function createOrderingRouter(deps) {
     }
   });
 
+  router.get("/admin/pending-receipts", requireAuthMiddleware, async (req, res, next) => {
+    try {
+      return res.json({ records: await getPendingReceipts(db, req.query.branchCode || null) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.get("/admin/approved-receipts", requireAuthMiddleware, async (req, res, next) => {
+    const branchCode = String(req.query.branchCode || "").trim();
+    if (!branchCode) {
+      return res.status(400).json({ error: "branchCode required" });
+    }
+
+    try {
+      return res.json({
+        ok: true,
+        records: await getApprovedReceipts(db, branchCode, req.query.date ? String(req.query.date) : null),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   return router;
 }
 
 module.exports = {
   createOrderingRouter,
   buildStockDayRow,
+  getApprovedReceipts,
+  getPendingReceipts,
+  groupReceiptRows,
   validateOrderRequestBody,
 };

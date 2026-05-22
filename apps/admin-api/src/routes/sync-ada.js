@@ -81,6 +81,21 @@ function parseTransferPayload(body) {
   return { headers, lines };
 }
 
+function parsePendingReceiptPayload(body) {
+  if (!body || !Array.isArray(body.headers) || !Array.isArray(body.lines)) {
+    return { error: "Payload must include headers[] and lines[]." };
+  }
+  return { headers: body.headers, lines: body.lines };
+}
+
+function parseApprovedReceiptPayload(body) {
+  const branchCode = normalizeNullableText(body?.branchCode);
+  if (!branchCode || !Array.isArray(body?.records)) {
+    return { error: "branchCode and records[] required" };
+  }
+  return { branchCode, records: body.records };
+}
+
 function parseRequiredApiKey(config, req) {
   if (!config.posApiKeys || config.posApiKeys.size === 0) {
     return null;
@@ -764,6 +779,309 @@ const upsertPurchaseLine = createHeaderLineUpsert(
   "(branch_code, doc_no, line_no, product_code)",
 );
 
+async function replacePendingReceipts(client, body, headers, lines) {
+  const branchCodes = [...new Set(
+    headers
+      .map((record) => normalizeNullableText(pick(record, ["FTBchCode", "branchCode"])))
+      .filter(Boolean),
+  )];
+
+  if (!branchCodes.length) {
+    throw new Error("Each pending receipt header requires FTBchCode/branchCode.");
+  }
+
+  if (branchCodes.length > 1) {
+    throw new Error("Pending receipt sync supports one branchCode per payload.");
+  }
+
+  const branchCode = branchCodes[0];
+  await client.query("DELETE FROM ada.pending_receipt_headers WHERE branch_code = $1", [branchCode]);
+
+  for (const record of headers) {
+    const headerBranchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+    const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
+    if (!headerBranchCode || !docNo) {
+      throw new Error("Each pending receipt header requires FTBchCode/branchCode and FTXihDocNo/docNo.");
+    }
+
+    await client.query(
+      `
+        INSERT INTO ada.pending_receipt_headers
+          (
+            doc_no,
+            branch_code,
+            doc_type,
+            doc_date,
+            doc_time,
+            supplier_code,
+            supplier_name,
+            ref_ext,
+            ref_ext_date,
+            warehouse_code,
+            total,
+            vat,
+            grand,
+            usr_code,
+            created_by,
+            created_at_ada,
+            sta_doc,
+            source_system,
+            source_table,
+            source_synced_at,
+            raw_payload,
+            updated_at
+          )
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::jsonb, now())
+      `,
+      [
+        docNo,
+        headerBranchCode,
+        normalizeNullableText(pick(record, ["FTXihDocType", "docType"])),
+        parseDate(pick(record, ["FDXihDocDate", "docDate"])),
+        normalizeNullableText(pick(record, ["FTXihDocTime", "docTime"])),
+        normalizeNullableText(pick(record, ["FTSplCode", "supplierCode"])),
+        normalizeNullableText(pick(record, ["FTXihCstName", "supplierName"])),
+        normalizeNullableText(pick(record, ["FTXihRefExt", "refExt"])),
+        parseDate(pick(record, ["FDXihRefExtDate", "refExtDate"])),
+        normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"])),
+        toNumber(pick(record, ["FCXihTotal", "total"]), 0),
+        toNumber(pick(record, ["FCXihVat", "vat"]), 0),
+        toNumber(pick(record, ["FCXihGrand", "grand"]), 0),
+        normalizeNullableText(pick(record, ["FTUsrCode", "usrCode"])),
+        normalizeNullableText(pick(record, ["FTWhoIns", "createdBy"])),
+        parseTimestamp(pick(record, ["FDDateIns", "createdAtAda"])),
+        normalizeNullableText(pick(record, ["FTXihStaDoc", "staDoc"])),
+        getSourceSystem(body),
+        normalizeText(pick(record, ["sourceTable"], "TACTPiHD")),
+        getSourceSyncedAt(body),
+        getRawPayload(record),
+      ],
+    );
+  }
+
+  for (const record of lines) {
+    const lineBranchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+    const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
+    const seqNo = Number(pick(record, ["FNXidSeqNo", "seqNo"], 0));
+    if (!lineBranchCode || !docNo || !Number.isInteger(seqNo) || seqNo <= 0) {
+      throw new Error("Each pending receipt line requires FTBchCode/branchCode, FTXihDocNo/docNo, and positive FNXidSeqNo/seqNo.");
+    }
+
+    await client.query(
+      `
+        INSERT INTO ada.pending_receipt_lines
+          (
+            doc_no,
+            seq_no,
+            product_code,
+            product_name,
+            barcode,
+            unit_code,
+            unit_name,
+            factor,
+            qty,
+            qty_base,
+            stock_factor,
+            set_price,
+            net,
+            vat,
+            cost_in,
+            lot_no,
+            expired_date,
+            warehouse_code,
+            source_system,
+            source_table,
+            source_synced_at,
+            raw_payload,
+            updated_at
+          )
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb, now())
+      `,
+      [
+        docNo,
+        seqNo,
+        normalizeNullableText(pick(record, ["FTPdtCode", "productCode"])),
+        normalizeNullableText(pick(record, ["FTPdtName", "productName"])),
+        normalizeNullableText(pick(record, ["FTXidBarCode", "barcode"])),
+        normalizeNullableText(pick(record, ["FTPunCode", "unitCode"])),
+        normalizeNullableText(pick(record, ["FTXidUnitName", "unitName"])),
+        toNumber(pick(record, ["FCXidFactor", "factor"]), 1),
+        toNumber(pick(record, ["FCXidQty", "qty"]), 0),
+        toNumber(pick(record, ["FCXidQtyAll", "qtyBase"]), 0),
+        toNumber(pick(record, ["FCXidStkFac", "stockFactor"]), 1),
+        toNumber(pick(record, ["FCXidSetPrice", "setPrice"]), 0),
+        toNumber(pick(record, ["FCXidNet", "net"]), 0),
+        toNumber(pick(record, ["FCXidVat", "vat"]), 0),
+        toNumber(pick(record, ["FCXidCostIn", "costIn"]), 0),
+        normalizeNullableText(pick(record, ["FTXidLotNo", "lotNo"])),
+        parseDate(pick(record, ["FDXidExpired", "expiredDate"])),
+        normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"])),
+        getSourceSystem(body),
+        normalizeText(pick(record, ["sourceTable"], "TACTPiDT")),
+        getSourceSyncedAt(body),
+        getRawPayload(record),
+      ],
+    );
+  }
+
+  return { headersAccepted: headers.length, linesAccepted: lines.length, branchCode };
+}
+
+async function upsertApprovedReceiptRecord(client, body, branchCode, record) {
+  const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
+  if (!docNo) {
+    throw new Error("Each approved receipt record requires FTXihDocNo/docNo.");
+  }
+
+  await client.query(
+    `
+      INSERT INTO ada.approved_receipt_headers
+        (
+          doc_no,
+          branch_code,
+          doc_type,
+          doc_date,
+          doc_time,
+          supplier_code,
+          supplier_name,
+          ref_ext,
+          ref_ext_date,
+          warehouse_code,
+          total,
+          vat,
+          grand,
+          usr_code,
+          created_by,
+          created_at_ada,
+          sta_doc,
+          sta_prc_doc,
+          source_system,
+          source_table,
+          source_synced_at,
+          raw_payload,
+          updated_at
+        )
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb, now())
+      ON CONFLICT (doc_no) DO UPDATE SET
+        branch_code = EXCLUDED.branch_code,
+        doc_type = EXCLUDED.doc_type,
+        doc_date = EXCLUDED.doc_date,
+        doc_time = EXCLUDED.doc_time,
+        supplier_code = EXCLUDED.supplier_code,
+        supplier_name = EXCLUDED.supplier_name,
+        ref_ext = EXCLUDED.ref_ext,
+        ref_ext_date = EXCLUDED.ref_ext_date,
+        warehouse_code = EXCLUDED.warehouse_code,
+        total = EXCLUDED.total,
+        vat = EXCLUDED.vat,
+        grand = EXCLUDED.grand,
+        usr_code = EXCLUDED.usr_code,
+        created_by = EXCLUDED.created_by,
+        created_at_ada = EXCLUDED.created_at_ada,
+        sta_doc = EXCLUDED.sta_doc,
+        sta_prc_doc = EXCLUDED.sta_prc_doc,
+        source_system = EXCLUDED.source_system,
+        source_table = EXCLUDED.source_table,
+        source_synced_at = EXCLUDED.source_synced_at,
+        raw_payload = EXCLUDED.raw_payload,
+        updated_at = now()
+    `,
+    [
+      docNo,
+      branchCode,
+      normalizeNullableText(pick(record, ["FTXihDocType", "docType"])),
+      parseDate(pick(record, ["FDXihDocDate", "docDate"])),
+      normalizeNullableText(pick(record, ["FTXihDocTime", "docTime"])),
+      normalizeNullableText(pick(record, ["FTSplCode", "supplierCode"])),
+      normalizeNullableText(pick(record, ["FTXihCstName", "supplierName"])),
+      normalizeNullableText(pick(record, ["FTXihRefExt", "refExt"])),
+      parseDate(pick(record, ["FDXihRefExtDate", "refExtDate"])),
+      normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"])),
+      toNumber(pick(record, ["FCXihTotal", "total"]), 0),
+      toNumber(pick(record, ["FCXihVat", "vat"]), 0),
+      toNumber(pick(record, ["FCXihGrand", "grand"]), 0),
+      normalizeNullableText(pick(record, ["FTUsrCode", "usrCode"])),
+      normalizeNullableText(pick(record, ["FTWhoIns", "createdBy"])),
+      parseTimestamp(pick(record, ["FDDateIns", "createdAtAda"])),
+      normalizeNullableText(pick(record, ["FTXihStaDoc", "staDoc"])),
+      normalizeNullableText(pick(record, ["FTXihStaPrcDoc", "staPrcDoc"])),
+      getSourceSystem(body),
+      normalizeText(pick(record, ["sourceTable"], "TACTPiHD")),
+      getSourceSyncedAt(body),
+      getRawPayload(record),
+    ],
+  );
+
+  await client.query("DELETE FROM ada.approved_receipt_lines WHERE doc_no = $1", [docNo]);
+
+  for (const line of record.lines || []) {
+    const seqNo = Number(pick(line, ["FNXidSeqNo", "seqNo"], 0));
+    if (!Number.isInteger(seqNo) || seqNo <= 0) {
+      throw new Error("Each approved receipt line requires positive FNXidSeqNo/seqNo.");
+    }
+
+    await client.query(
+      `
+        INSERT INTO ada.approved_receipt_lines
+          (
+            doc_no,
+            seq_no,
+            product_code,
+            product_name,
+            barcode,
+            unit_code,
+            unit_name,
+            factor,
+            qty,
+            qty_base,
+            stock_factor,
+            set_price,
+            net,
+            vat,
+            cost_in,
+            lot_no,
+            expired_date,
+            warehouse_code,
+            source_system,
+            source_table,
+            source_synced_at,
+            raw_payload,
+            updated_at
+          )
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb, now())
+      `,
+      [
+        docNo,
+        seqNo,
+        normalizeNullableText(pick(line, ["FTPdtCode", "productCode"])),
+        normalizeNullableText(pick(line, ["FTPdtName", "productName"])),
+        normalizeNullableText(pick(line, ["FTXidBarCode", "barcode"])),
+        normalizeNullableText(pick(line, ["FTPunCode", "unitCode"])),
+        normalizeNullableText(pick(line, ["FTXidUnitName", "unitName"])),
+        toNumber(pick(line, ["FCXidFactor", "factor"]), 1),
+        toNumber(pick(line, ["FCXidQty", "qty"]), 0),
+        toNumber(pick(line, ["FCXidQtyAll", "qtyBase"]), 0),
+        toNumber(pick(line, ["FCXidStkFac", "stockFactor"]), 1),
+        toNumber(pick(line, ["FCXidSetPrice", "setPrice"]), 0),
+        toNumber(pick(line, ["FCXidNet", "net"]), 0),
+        toNumber(pick(line, ["FCXidVat", "vat"]), 0),
+        toNumber(pick(line, ["FCXidCostIn", "costIn"]), 0),
+        normalizeNullableText(pick(line, ["FTXidLotNo", "lotNo"])),
+        parseDate(pick(line, ["FDXidExpired", "expiredDate"])),
+        normalizeNullableText(pick(line, ["FTWahCode", "warehouseCode"])),
+        getSourceSystem(body),
+        normalizeText(pick(line, ["sourceTable"], "TACTPiDT")),
+        getSourceSyncedAt(body),
+        getRawPayload(line),
+      ],
+    );
+  }
+}
+
 const upsertStockAdjustmentHeader = createHeaderLineUpsert(
   "ada.stock_adjustment_headers",
   "Each stock adjustment header requires branch_code and doc_no.",
@@ -1087,6 +1405,49 @@ function createAdaSyncRouter(deps) {
       }
       await client.query("COMMIT");
       return res.json({ acceptedHeaders: req.body.headers.length, acceptedLines: req.body.lines.length });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  });
+  router.post("/pending-receipts", async (req, res, next) => {
+    const { error, headers, lines } = parsePendingReceiptPayload(req.body);
+    if (error) {
+      return res.status(400).json({ message: error });
+    }
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await replacePendingReceipts(client, req.body, headers, lines);
+      await client.query("COMMIT");
+      return res.json({
+        headersAccepted: result.headersAccepted,
+        linesAccepted: result.linesAccepted,
+        branchCode: result.branchCode,
+      });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  });
+  router.post("/approved-receipts", async (req, res, next) => {
+    const { error, branchCode, records } = parseApprovedReceiptPayload(req.body);
+    if (error) {
+      return res.status(400).json({ error });
+    }
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      for (const record of records) {
+        // eslint-disable-next-line no-await-in-loop
+        await upsertApprovedReceiptRecord(client, req.body, branchCode, record);
+      }
+      await client.query("COMMIT");
+      return res.json({ ok: true, upserted: records.length });
     } catch (e) {
       await client.query("ROLLBACK");
       return next(e);
