@@ -3,7 +3,7 @@
 const fs = require("fs/promises");
 const path = require("path");
 
-const DEFAULT_DATASETS = ["branches", "products", "transfers"];
+const DEFAULT_DATASETS = ["branches", "products", "transfers", "branch-stock"];
 const DEFAULT_WATERMARK_FILE = path.resolve(__dirname, "..", ".ada_sync_watermarks.json");
 const DEFAULT_FIXTURE_FILE = path.resolve(__dirname, "..", "fixtures", "ada_sync_simulation.json");
 const DEFAULT_AGENT_VERSION = "0.1.0";
@@ -231,6 +231,13 @@ async function createSimulationExtractor(fixturePath) {
           : [];
       }
 
+      if (datasetName === "branch-stock" && Array.isArray(clone.records)) {
+        clone.records = clone.records.map((record) => ({
+          ...record,
+          synced_at: record.synced_at || clone.sourceSyncedAt || new Date().toISOString(),
+        }));
+      }
+
       return {
         recordsRead:
           Array.isArray(clone.records) ? clone.records.length
@@ -340,6 +347,38 @@ function getDatasetSql(datasetName, branchCode = null) {
           ORDER BY FTPthDocNo ASC, FNPtdSeqNo ASC
         `,
       };
+    case "branch-stock":
+      return `
+        SELECT
+          p.FTPdtCode AS product_code,
+          p.FTPdtName AS product_name_thai,
+          p.FTPdtNameOth AS product_name_eng,
+          COALESCE(p.FTPdtBarCode1, p.FTPdtBarCode2, p.FTPdtBarCode3) AS barcode,
+          COALESCE(p.FTPdtSUnit, p.FTPdtMUnit, p.FTPdtLUnit) AS unit,
+          SUM(CASE WHEN b.FTBchCode = '000' THEN ISNULL(w.FCWahQty, 0) ELSE 0 END) AS qty_branch_000,
+          SUM(CASE WHEN b.FTBchCode = '001' THEN ISNULL(w.FCWahQty, 0) ELSE 0 END) AS qty_branch_001,
+          SUM(CASE WHEN b.FTBchCode = '002' THEN ISNULL(w.FCWahQty, 0) ELSE 0 END) AS qty_branch_002,
+          SUM(CASE WHEN b.FTBchCode = '003' THEN ISNULL(w.FCWahQty, 0) ELSE 0 END) AS qty_branch_003,
+          SUM(CASE WHEN b.FTBchCode = '004' THEN ISNULL(w.FCWahQty, 0) ELSE 0 END) AS qty_branch_004,
+          SUM(CASE WHEN b.FTBchCode = '005' THEN ISNULL(w.FCWahQty, 0) ELSE 0 END) AS qty_branch_005,
+          SUM(ISNULL(w.FCWahQty, 0)) AS qty_total_all_branches,
+          CONVERT(varchar(33), GETUTCDATE(), 127) AS synced_at,
+          CONVERT(varchar(33), GETUTCDATE(), 127) AS sourceSyncedAt
+        FROM dbo.TCNMPdt p
+        LEFT JOIN dbo.TCNTPdtInWha w
+          ON w.FTPdtCode = p.FTPdtCode
+        LEFT JOIN dbo.TCNMBranch b
+          ON b.FTBchWheStk = w.FTWahCode
+        WHERE p.FTPdtStaActive = 1
+          AND (b.FTBchCode IN ('000', '001', '002', '003', '004', '005') OR b.FTBchCode IS NULL)
+        GROUP BY
+          p.FTPdtCode,
+          p.FTPdtName,
+          p.FTPdtNameOth,
+          COALESCE(p.FTPdtBarCode1, p.FTPdtBarCode2, p.FTPdtBarCode3),
+          COALESCE(p.FTPdtSUnit, p.FTPdtMUnit, p.FTPdtLUnit)
+        ORDER BY p.FTPdtCode ASC
+      `;
     default:
       return null;
   }
@@ -441,7 +480,12 @@ async function createSqlServerExtractor(config, sqlLib = null) {
           records,
         } : null,
         watermarkTo: sourceSyncedAt,
-        sourceTable: datasetName === "branches" ? "TCNMBranch" : "TCNMPdt",
+        sourceTable:
+          datasetName === "branches"
+            ? "TCNMBranch"
+            : datasetName === "branch-stock"
+              ? "TCNTPdtInWha/TCNMBranch/TCNMPdt"
+              : "TCNMPdt",
       };
     },
     async close() {
@@ -477,6 +521,8 @@ function datasetEndpoint(datasetName) {
       return "/api/sync/ada/purchases";
     case "stock-snapshots":
       return "/api/sync/ada/stock-snapshots";
+    case "branch-stock":
+      return "/api/branch-stock/sync";
     default:
       throw new Error(`Unsupported dataset endpoint for ${datasetName}`);
   }

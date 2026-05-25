@@ -60,7 +60,7 @@ test("loadAgentConfig defaults to dry-run simulation mode", () => {
   const config = loadAgentConfig({}, []);
   assert.equal(config.dryRun, true);
   assert.equal(config.driver, "simulation");
-  assert.deepEqual(config.datasets, ["branches", "products", "transfers"]);
+  assert.deepEqual(config.datasets, ["branches", "products", "transfers", "branch-stock"]);
   assert.equal(config.branchCode, null);
 });
 
@@ -262,17 +262,80 @@ test("live SQL definitions remain read-only SELECT statements", () => {
   const branchSql = getDatasetSql("branches");
   const productSql = getDatasetSql("products");
   const transferSql = getDatasetSql("transfers", "005");
+  const branchStockSql = getDatasetSql("branch-stock");
 
   assert.match(branchSql.trim().toUpperCase(), /^(SELECT|WITH)/);
   assert.match(productSql.trim().toUpperCase(), /^(SELECT|WITH)/);
   assert.match(transferSql.headers.trim().toUpperCase(), /^(SELECT|WITH)/);
   assert.match(transferSql.lines.trim().toUpperCase(), /^(SELECT|WITH)/);
+  assert.match(branchStockSql.trim().toUpperCase(), /^(SELECT|WITH)/);
   assert.equal(/\b(INSERT|UPDATE|DELETE|MERGE|EXEC)\b/i.test(branchSql), false);
   assert.equal(/\b(INSERT|UPDATE|DELETE|MERGE|EXEC)\b/i.test(productSql), false);
   assert.equal(/\b(INSERT|UPDATE|DELETE|MERGE|EXEC)\b/i.test(transferSql.headers), false);
   assert.equal(/\b(INSERT|UPDATE|DELETE|MERGE|EXEC)\b/i.test(transferSql.lines), false);
+  assert.equal(/\b(INSERT|UPDATE|DELETE|MERGE|EXEC)\b/i.test(branchStockSql), false);
   assert.match(transferSql.headers, /@branchCode/);
   assert.match(transferSql.lines, /@branchCode/);
+  assert.match(branchStockSql, /TCNTPdtInWha/);
+  assert.match(branchStockSql, /TCNMBranch/);
+});
+
+test("runAdaSyncAgent execute mode posts branch-stock payload to the live endpoint", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ada-sync-branch-stock-"));
+  const watermarkFile = path.join(tmpDir, "watermarks.json");
+
+  const { calls, fetchImpl } = createFetchRecorder();
+  const result = await runAdaSyncAgent({
+    config: {
+      dryRun: false,
+      datasets: ["branch-stock"],
+      driver: "simulation",
+      fixturePath: "",
+      watermarkFile,
+      apiBaseUrl: "http://localhost:3001",
+      apiKey: "test-pos-key",
+      sourceLocation: "mother-pc",
+      agentName: "adapos-sync",
+      agentVersion: "0.1.0",
+      sqlserver: {},
+    },
+    extractor: createExtractor({
+      "branch-stock": {
+        recordsRead: 1,
+        watermarkTo: "2026-05-25T08:00:00.000Z",
+        payload: {
+          sourceSystem: "AdaAcc",
+          sourceSyncedAt: "2026-05-25T08:00:00.000Z",
+          records: [
+            {
+              product_code: "630010001",
+              product_name_thai: "Cetirizine",
+              product_name_eng: "Cetirizine",
+              barcode: "885000000001",
+              unit: "BOX",
+              qty_branch_000: 10,
+              qty_branch_001: 5,
+              qty_branch_002: 3,
+              qty_branch_003: 4,
+              qty_branch_004: 2,
+              qty_branch_005: 8,
+              qty_total_all_branches: 32,
+              synced_at: "2026-05-25T08:00:00.000Z",
+            },
+          ],
+        },
+      },
+    }),
+    fetchImpl,
+  });
+
+  assert.equal(result.status, "success");
+  assert.equal(result.recordsRead, 1);
+  assert.equal(result.recordsSent, 1);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].url.endsWith("/api/branch-stock/sync"));
+  assert.equal(calls[0].options.body.records[0].qty_total_all_branches, 32);
+  assert.ok(calls[1].url.endsWith("/api/sync/ada/run-log"));
 });
 
 test("createSqlServerExtractor applies the branch filter to live transfer queries", async () => {

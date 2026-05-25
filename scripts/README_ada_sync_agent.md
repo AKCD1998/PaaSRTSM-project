@@ -16,6 +16,7 @@ Local mother-PC sync agent scaffold for read-only AdaAcc extraction into the bac
 - `branches`
 - `products`
 - `transfers`
+- `branch-stock`
 
 The agent is intentionally narrow for the first connection step.
 
@@ -42,6 +43,10 @@ Current behavior:
 For the safest one-branch reconciliation pilot, prefer:
 
 - `--datasets=branches,transfers`
+
+For branch stock sync into the StockDay admin branch tab, use:
+
+- `--datasets=branch-stock`
 
 ## Run in simulation mode
 
@@ -100,6 +105,18 @@ Manual execute pass:
 npm run sync:ada-agent -- --execute --driver=sqlserver --branch=005 --datasets=branches,transfers
 ```
 
+Branch stock dry-run:
+
+```bash
+npm run sync:ada-agent -- --dry-run --driver=sqlserver --datasets=branch-stock
+```
+
+Branch stock execute:
+
+```bash
+npm run sync:ada-agent -- --execute --driver=sqlserver --datasets=branch-stock
+```
+
 Disable / revert:
 
 ```bash
@@ -116,7 +133,8 @@ Example:
 {
   "branches": "2026-05-21T08:00:00.000Z",
   "products": "2026-05-21T08:05:00.000Z",
-  "transfers": "2026-05-21T08:10:00.000Z"
+  "transfers": "2026-05-21T08:10:00.000Z",
+  "branch-stock": "2026-05-25T08:00:00.000Z"
 }
 ```
 
@@ -124,4 +142,5 @@ Example:
 
 - `branches` and `products` currently use full refresh-style extraction.
 - `transfers` currently uses a date watermark and posts source-shaped headers plus lines.
+- `branch-stock` posts flattened latest-per-product branch quantities to `/api/branch-stock/sync`.
 - Sales, purchases, stock snapshots, and other datasets can be added later without changing the safety model.

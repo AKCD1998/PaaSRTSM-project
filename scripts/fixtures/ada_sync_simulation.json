@@ -74,6 +74,31 @@
           }
         ]
       }
+    },
+    "branch-stock": {
+      "sourceTable": "TCNTPdtInWha/TCNMBranch/TCNMPdt",
+      "watermarkTo": "2026-05-25T08:00:00.000Z",
+      "payload": {
+        "sourceSystem": "AdaAcc",
+        "sourceSyncedAt": "2026-05-25T08:00:00.000Z",
+        "records": [
+          {
+            "product_code": "630010001",
+            "product_name_thai": "Cetirizine 10 mg",
+            "product_name_eng": "Cetirizine 10 mg",
+            "barcode": "885000000001",
+            "unit": "BOX",
+            "qty_branch_000": 10,
+            "qty_branch_001": 5,
+            "qty_branch_002": 3,
+            "qty_branch_003": 4,
+            "qty_branch_004": 2,
+            "qty_branch_005": 8,
+            "qty_total_all_branches": 32,
+            "synced_at": "2026-05-25T08:00:00.000Z"
+          }
+        ]
+      }
     }
   }
 }
