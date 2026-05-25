@@ -25,6 +25,7 @@ const { createOrderingRouter } = require("./routes/ordering");
 const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
+const { createBranchStockRouter } = require("./routes/branch-stock");
 
 function appendVaryHeader(res, value) {
   const existing = String(res.getHeader("Vary") || "")
@@ -191,6 +192,14 @@ function createApp(overrides = {}) {
       db,
       requireAuthMiddleware,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api",
+    createBranchStockRouter({
+      config,
+      db,
+      requireAuthMiddleware,
     }),
   );
   app.use(
