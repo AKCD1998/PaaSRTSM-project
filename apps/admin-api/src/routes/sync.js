@@ -450,6 +450,34 @@ function createSyncRouter(deps) {
     }
   });
 
+  // POST /api/sync/heartbeat
+  // Branch laptop's PS1 wrapper calls this when it wakes up at 22:00.
+  // Records a row in ingest.laptop_heartbeats so the dashboard can tell
+  // "sync failed" apart from "laptop was off".
+  router.post("/heartbeat", async (req, res, next) => {
+    try {
+      const branchCode = normalizeText(req.body?.branchCode);
+      if (!branchCode) {
+        return res.status(400).json({ message: "branchCode is required." });
+      }
+      const result = await db.query(
+        `
+          INSERT INTO ingest.laptop_heartbeats (branch_code, laptop_name, event)
+          VALUES ($1, $2, $3)
+          RETURNING heartbeat_id
+        `,
+        [
+          branchCode,
+          normalizeNullableText(req.body?.laptopName),
+          normalizeText(req.body?.event) || "startup",
+        ],
+      );
+      return res.json({ ok: true, heartbeatId: String(result.rows[0].heartbeat_id) });
+    } catch (e) {
+      return next(e);
+    }
+  });
+
   return router;
 }
 

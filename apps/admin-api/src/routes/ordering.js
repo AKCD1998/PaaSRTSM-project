@@ -716,6 +716,93 @@ function createOrderingRouter(deps) {
     }
   });
 
+  // GET /api/sync/nightly-log?days=14
+  // Admin UI's "ประวัติ Sync" calendar grid: per branch, per night, what happened.
+  // - "success"  - ingest.sync_runs has a success row for that branch/date
+  // - "failed"   - ingest.sync_runs has a failed/running row, OR heartbeat exists but no run
+  // - "running"  - ingest.sync_runs has only running rows
+  // - "offline"  - no heartbeat AND no sync_run for that branch/date (laptop was off)
+  // - "pending"  - the date is today and nothing has happened yet
+  //
+  // Branch is derived from sync_type pattern 'adapos_branch_XXX'.
+  // Lives under /api (not /api/sync) so it can use the admin cookie session
+  // instead of the api-key gate that fronts /api/sync/*.
+  router.get("/sync/nightly-log", requireAuthMiddleware, async (req, res, next) => {
+    try {
+      const rawDays = Number(req.query.days);
+      const days = Number.isFinite(rawDays) ? Math.min(Math.max(Math.floor(rawDays), 1), 90) : 14;
+
+      const knownBranches = ["000", "001", "003", "004", "005"];
+
+      const sql = `
+        WITH date_series AS (
+          SELECT (CURRENT_DATE - offs)::date AS d
+          FROM generate_series(0, $1::int - 1) AS offs
+        ),
+        known_branches AS (
+          SELECT unnest($2::text[]) AS branch_code
+        ),
+        runs_agg AS (
+          SELECT
+            substring(sync_type FROM 'adapos_branch_([0-9]+)') AS branch_code,
+            (started_at AT TIME ZONE 'Asia/Bangkok')::date     AS run_date,
+            bool_or(status = 'success')                        AS any_success,
+            bool_or(status = 'failed')                         AS any_failed,
+            bool_or(status = 'running')                        AS any_running
+          FROM ingest.sync_runs
+          WHERE sync_type LIKE 'adapos_branch_%'
+            AND started_at >= (CURRENT_DATE - ($1::int - 1)) - INTERVAL '1 day'
+          GROUP BY 1, 2
+        ),
+        heartbeats_agg AS (
+          SELECT
+            branch_code,
+            (created_at AT TIME ZONE 'Asia/Bangkok')::date AS hb_date,
+            COUNT(*) AS hb_count
+          FROM ingest.laptop_heartbeats
+          WHERE created_at >= (CURRENT_DATE - ($1::int - 1)) - INTERVAL '1 day'
+          GROUP BY 1, 2
+        )
+        SELECT
+          b.branch_code,
+          to_char(d.d, 'YYYY-MM-DD') AS iso_date,
+          CASE
+            WHEN d.d = CURRENT_DATE AND COALESCE(r.any_success, false) = false
+                                     AND COALESCE(r.any_failed,  false) = false
+                                     AND COALESCE(r.any_running, false) = false THEN 'pending'
+            WHEN COALESCE(r.any_success, false) THEN 'success'
+            WHEN COALESCE(r.any_failed,  false) THEN 'failed'
+            WHEN COALESCE(r.any_running, false) THEN 'running'
+            WHEN COALESCE(h.hb_count, 0) > 0     THEN 'failed'
+            ELSE 'offline'
+          END AS status
+        FROM date_series d
+        CROSS JOIN known_branches b
+        LEFT JOIN runs_agg       r ON r.branch_code = b.branch_code AND r.run_date = d.d
+        LEFT JOIN heartbeats_agg h ON h.branch_code = b.branch_code AND h.hb_date  = d.d
+        ORDER BY b.branch_code, d.d DESC
+      `;
+
+      const result = await db.query(sql, [days, knownBranches]);
+
+      const dates = [];
+      const seen = new Set();
+      const rows = {};
+      for (const r of result.rows) {
+        if (!seen.has(r.iso_date)) {
+          seen.add(r.iso_date);
+          dates.push(r.iso_date);
+        }
+        if (!rows[r.branch_code]) rows[r.branch_code] = {};
+        rows[r.branch_code][r.iso_date] = r.status;
+      }
+
+      return res.json({ dates, branches: knownBranches, rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   return router;
 }
 
