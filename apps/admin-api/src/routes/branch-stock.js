@@ -90,6 +90,9 @@ function parseBranchStockPayload(body) {
       productNameEng: normalizeNullableText(record.product_name_eng || record.productNameEng),
       barcode: normalizeNullableText(record.barcode),
       unit: normalizeNullableText(record.unit),
+      sourceBranchCode: normalizeNullableText(
+        record.branch_code || record.branchCode || record.sourceBranchCode,
+      ),
       qtyBranch000: toNumber(record.qty_branch_000 ?? record.qtyBranch000, 0),
       qtyBranch001: toNumber(record.qty_branch_001 ?? record.qtyBranch001, 0),
       qtyBranch002: toNumber(record.qty_branch_002 ?? record.qtyBranch002, 0),
@@ -106,6 +109,26 @@ function parseBranchStockPayload(body) {
   }
 
   return { records };
+}
+
+function applyBranchQty(record, branchCode, qty) {
+  if (branchCode === "000") record.qtyBranch000 = qty;
+  if (branchCode === "001") record.qtyBranch001 = qty;
+  if (branchCode === "002") record.qtyBranch002 = qty;
+  if (branchCode === "003") record.qtyBranch003 = qty;
+  if (branchCode === "004") record.qtyBranch004 = qty;
+  if (branchCode === "005") record.qtyBranch005 = qty;
+}
+
+function sumBranchQty(record) {
+  return (
+    Number(record.qtyBranch000 || 0) +
+    Number(record.qtyBranch001 || 0) +
+    Number(record.qtyBranch002 || 0) +
+    Number(record.qtyBranch003 || 0) +
+    Number(record.qtyBranch004 || 0) +
+    Number(record.qtyBranch005 || 0)
+  );
 }
 
 function parseBranchStockUploadPayload(body) {
@@ -198,6 +221,29 @@ function parseBranchStockUploadPayload(body) {
 }
 
 async function upsertBranchStockSnapshot(client, record) {
+  let recordToWrite = record;
+  if (record.sourceBranchCode && ALLOWED_BRANCH_CODES.has(record.sourceBranchCode)) {
+    const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
+    recordToWrite = existingSnapshot
+      ? mapExistingSnapshotRowToRecord(existingSnapshot)
+      : createEmptySnapshotRecord(record.productCode, record.syncedAt);
+
+    recordToWrite.productCode = record.productCode;
+    recordToWrite.productNameThai = record.productNameThai || recordToWrite.productNameThai;
+    recordToWrite.productNameEng = record.productNameEng || recordToWrite.productNameEng;
+    recordToWrite.barcode = record.barcode || recordToWrite.barcode;
+    recordToWrite.unit = record.unit || recordToWrite.unit;
+    recordToWrite.syncedAt = record.syncedAt;
+    recordToWrite.rawPayload = record.rawPayload || {};
+
+    applyBranchQty(
+      recordToWrite,
+      record.sourceBranchCode,
+      toNumber(record[`qtyBranch${record.sourceBranchCode}`], 0),
+    );
+    recordToWrite.qtyTotalAllBranches = sumBranchQty(recordToWrite);
+  }
+
   await client.query(
     `
       INSERT INTO ada.branch_stock_snapshots
@@ -241,20 +287,20 @@ async function upsertBranchStockSnapshot(client, record) {
         updated_at = now()
     `,
     [
-      record.productCode,
-      record.productNameThai,
-      record.productNameEng,
-      record.barcode,
-      record.unit,
-      record.qtyBranch000,
-      record.qtyBranch001,
-      record.qtyBranch002,
-      record.qtyBranch003,
-      record.qtyBranch004,
-      record.qtyBranch005,
-      record.qtyTotalAllBranches,
-      record.syncedAt,
-      JSON.stringify(record.rawPayload || {}),
+      recordToWrite.productCode,
+      recordToWrite.productNameThai,
+      recordToWrite.productNameEng,
+      recordToWrite.barcode,
+      recordToWrite.unit,
+      recordToWrite.qtyBranch000,
+      recordToWrite.qtyBranch001,
+      recordToWrite.qtyBranch002,
+      recordToWrite.qtyBranch003,
+      recordToWrite.qtyBranch004,
+      recordToWrite.qtyBranch005,
+      recordToWrite.qtyTotalAllBranches,
+      recordToWrite.syncedAt,
+      JSON.stringify(recordToWrite.rawPayload || {}),
     ],
   );
 }
@@ -331,20 +377,8 @@ function mergeBranchUploadRecord(branchCode, existingRecord, uploadedRecord, syn
     },
   };
 
-  if (branchCode === "000") merged.qtyBranch000 = uploadedRecord.qty;
-  if (branchCode === "001") merged.qtyBranch001 = uploadedRecord.qty;
-  if (branchCode === "002") merged.qtyBranch002 = uploadedRecord.qty;
-  if (branchCode === "003") merged.qtyBranch003 = uploadedRecord.qty;
-  if (branchCode === "004") merged.qtyBranch004 = uploadedRecord.qty;
-  if (branchCode === "005") merged.qtyBranch005 = uploadedRecord.qty;
-
-  merged.qtyTotalAllBranches =
-    Number(merged.qtyBranch000 || 0) +
-    Number(merged.qtyBranch001 || 0) +
-    Number(merged.qtyBranch002 || 0) +
-    Number(merged.qtyBranch003 || 0) +
-    Number(merged.qtyBranch004 || 0) +
-    Number(merged.qtyBranch005 || 0);
+  applyBranchQty(merged, branchCode, uploadedRecord.qty);
+  merged.qtyTotalAllBranches = sumBranchQty(merged);
 
   return merged;
 }
