@@ -803,6 +803,91 @@ function createOrderingRouter(deps) {
     }
   });
 
+  // GET /api/sync/hourly-log?hours=24
+  // Admin UI's "รายชั่วโมง" tab: per branch, per Bangkok hour slot, what happened.
+  // Slots are Bangkok-timezone hour boundaries so the grid aligns with Thai wall-clock.
+  // Status values mirror nightly-log: success / failed / running / offline / pending.
+  // "pending" = current hour slot with no run yet (Task Scheduler hasn't fired yet).
+  router.get("/sync/hourly-log", requireAuthMiddleware, async (req, res, next) => {
+    try {
+      const rawHours = Number(req.query.hours);
+      const hours = Number.isFinite(rawHours) ? Math.min(Math.max(Math.floor(rawHours), 1), 168) : 24;
+
+      const knownBranches = ["000", "001", "003", "004", "005"];
+
+      const sql = `
+        WITH hour_series AS (
+          SELECT
+            date_trunc('hour', NOW() AT TIME ZONE 'Asia/Bangkok')
+              - (offs * INTERVAL '1 hour') AS hour_slot
+          FROM generate_series(0, $1::int - 1) AS offs
+        ),
+        known_branches AS (
+          SELECT unnest($2::text[]) AS branch_code
+        ),
+        runs_agg AS (
+          SELECT
+            substring(sync_type FROM 'adapos_branch_([0-9]+)')    AS branch_code,
+            date_trunc('hour', started_at AT TIME ZONE 'Asia/Bangkok') AS hour_slot,
+            bool_or(status = 'success')                            AS any_success,
+            bool_or(status = 'failed')                             AS any_failed,
+            bool_or(status = 'running')                            AS any_running
+          FROM ingest.sync_runs
+          WHERE sync_type LIKE 'adapos_branch_%'
+            AND started_at >= NOW() - $1::int * INTERVAL '1 hour'
+          GROUP BY 1, 2
+        )
+        SELECT
+          b.branch_code,
+          to_char(h.hour_slot, 'YYYY-MM-DD HH24:00') AS hour_key,
+          CASE
+            WHEN h.hour_slot = date_trunc('hour', NOW() AT TIME ZONE 'Asia/Bangkok')
+                 AND COALESCE(r.any_success, false) = false
+                 AND COALESCE(r.any_failed,  false) = false
+                 AND COALESCE(r.any_running, false) = false THEN 'pending'
+            WHEN COALESCE(r.any_success, false) THEN 'success'
+            WHEN COALESCE(r.any_failed,  false) THEN 'failed'
+            WHEN COALESCE(r.any_running, false) THEN 'running'
+            ELSE 'offline'
+          END AS status,
+          COALESCE(
+            (SELECT SUM(records_sent)::int
+             FROM ingest.sync_runs
+             WHERE sync_type LIKE 'adapos_branch_%'
+               AND substring(sync_type FROM 'adapos_branch_([0-9]+)') = b.branch_code
+               AND date_trunc('hour', started_at AT TIME ZONE 'Asia/Bangkok') = h.hour_slot
+            ), 0
+          ) AS total_sent
+        FROM hour_series h
+        CROSS JOIN known_branches b
+        LEFT JOIN runs_agg r
+          ON r.branch_code = b.branch_code AND r.hour_slot = h.hour_slot
+        ORDER BY b.branch_code, h.hour_slot ASC
+      `;
+
+      const result = await db.query(sql, [hours, knownBranches]);
+
+      const hourKeys = [];
+      const seen = new Set();
+      const rows = {};
+      for (const r of result.rows) {
+        if (!seen.has(r.hour_key)) {
+          seen.add(r.hour_key);
+          hourKeys.push(r.hour_key);
+        }
+        if (!rows[r.branch_code]) rows[r.branch_code] = {};
+        rows[r.branch_code][r.hour_key] = {
+          status:    r.status,
+          totalSent: Number(r.total_sent ?? 0),
+        };
+      }
+
+      return res.json({ hours: hourKeys, branches: knownBranches, rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   return router;
 }
 
