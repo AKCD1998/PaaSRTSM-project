@@ -75,136 +75,197 @@ async function runCategorizationBatch(db, options = {}) {
     return buildMetrics(startedAt, products.length, tier0Results, tier1Results, [], []);
   }
 
-  // ── 4. Write results ─────────────────────────────────────────────────────
-  const written0 = [];
-  const written1 = [];
+  // ── 4. Write results — bulk UNNEST in chunks of 500 ─────────────────────
+  // Pre-fetch existing states once so we can preserve previous_* audit columns.
+  const allWriteCodes = [
+    ...tier0Results.filter((r) => !r.conflict && r.clean_category).map((r) => r.product_code),
+    ...tier1Results.map((r) => r.product_code),
+  ];
+  const { rows: existingRows } = await db.query(
+    `SELECT product_code, category_name, review_status
+     FROM ada.product_category_states
+     WHERE product_code = ANY($1)`,
+    [allWriteCodes],
+  );
+  const existingByCode = new Map(existingRows.map((r) => [r.product_code, r]));
+
+  // Build Tier 0 rows to write
   const skipped = [];
-
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-
-    for (const r of tier0Results) {
-      if (r.conflict) {
-        skipped.push(r);
-        continue;
-      }
-      const categoryName = formatDisplayCategory(r.shelf_no, r.clean_category);
-      if (!categoryName) {
-        skipped.push({ ...r, conflictReason: "empty_category" });
-        continue;
-      }
-      await upsertTier0(client, r.product_code, categoryName, r.raw_label, triggeredBy);
-      written0.push({ product_code: r.product_code, category_name: categoryName });
-    }
-
-    for (const r of tier1Results) {
-      const categoryName = formatDisplayCategory(r.shelf_no, r.clean_category);
-      await upsertTier1(
-        client,
-        r.product_code,
-        categoryName,
-        r.review_status,
-        r.reason,
-        triggeredBy,
-      );
-      written1.push({
-        product_code: r.product_code,
-        category_name: categoryName,
-        review_status: r.review_status,
-        reason: r.reason,
-      });
-    }
-
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
+  const written0 = [];
+  const tier0Rows = [];
+  for (const r of tier0Results) {
+    if (r.conflict) { skipped.push(r); continue; }
+    const categoryName = formatDisplayCategory(r.shelf_no, r.clean_category);
+    if (!categoryName) { skipped.push({ ...r, conflictReason: "empty_category" }); continue; }
+    const existing = existingByCode.get(r.product_code);
+    tier0Rows.push({
+      product_code: r.product_code,
+      category_name: categoryName,
+      rationale: `Tier 0 exact taxonomy match. Raw label: ${r.raw_label || ""}. By: ${triggeredBy}`,
+      prev_category_name: existing?.category_name || null,
+      prev_review_status: existing?.review_status || null,
+    });
+    written0.push({ product_code: r.product_code, category_name: categoryName });
   }
+
+  // Build Tier 1 rows to write
+  const written1 = [];
+  const tier1Rows = [];
+  for (const r of tier1Results) {
+    const categoryName = formatDisplayCategory(r.shelf_no, r.clean_category);
+    const existing = existingByCode.get(r.product_code);
+    tier1Rows.push({
+      product_code: r.product_code,
+      category_name: categoryName || "",
+      review_status: r.review_status,
+      rationale: `Tier 1 rules batch. Reason: ${r.reason}. By: ${triggeredBy}`,
+      source_match_level: r.reason || null,
+      prev_category_name: existing?.category_name || null,
+      prev_review_status: existing?.review_status || null,
+    });
+    written1.push({
+      product_code: r.product_code,
+      category_name: categoryName,
+      review_status: r.review_status,
+      reason: r.reason,
+    });
+  }
+
+  // Write in chunks — each chunk is its own transaction so a dropped connection
+  // only needs to retry the remaining chunks, not the whole run.
+  await bulkUpsertTier0(db, tier0Rows, triggeredBy);
+  await bulkUpsertTier1(db, tier1Rows, triggeredBy);
 
   return buildMetrics(startedAt, products.length, tier0Results, tier1Results, written0, written1, skipped);
 }
 
-// ── Upsert helpers ────────────────────────────────────────────────────────────
+// ── Bulk upsert helpers (UNNEST, chunked at 500 rows) ─────────────────────────
 
-async function upsertTier0(client, productCode, categoryName, rawLabel, triggeredBy) {
-  await client.query(
-    `
-    INSERT INTO ada.product_category_states
-      (product_code, category_name, review_status, rationale,
-       source_kind, source_reference, source_match_level,
-       previous_category_name, previous_review_status,
-       imported_at, imported_by, updated_at)
-    VALUES
-      ($1, $2, 'imported_exact_match',
-       $3,
-       'taxonomy_workbook', 'taxonomy_batch/tier0', 'exact_code',
-       (SELECT category_name   FROM ada.product_category_states WHERE product_code = $1),
-       (SELECT review_status   FROM ada.product_category_states WHERE product_code = $1),
-       now(), $4, now())
-    ON CONFLICT (product_code) DO UPDATE SET
-      category_name          = EXCLUDED.category_name,
-      review_status          = EXCLUDED.review_status,
-      rationale              = EXCLUDED.rationale,
-      source_kind            = EXCLUDED.source_kind,
-      source_reference       = EXCLUDED.source_reference,
-      source_match_level     = EXCLUDED.source_match_level,
-      previous_category_name = EXCLUDED.previous_category_name,
-      previous_review_status = EXCLUDED.previous_review_status,
-      imported_at            = EXCLUDED.imported_at,
-      imported_by            = EXCLUDED.imported_by,
-      updated_at             = now()
-    WHERE ada.product_category_states.review_status <> 'confirmed'
-    `,
-    [
-      productCode,
-      categoryName,
-      `Tier 0 exact taxonomy match. Raw label: ${rawLabel || ""}. Triggered by: ${triggeredBy}`,
-      triggeredBy,
-    ],
-  );
+const CHUNK_SIZE = 500;
+
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
 }
 
-async function upsertTier1(client, productCode, categoryName, reviewStatus, reason, triggeredBy) {
-  await client.query(
-    `
-    INSERT INTO ada.product_category_states
-      (product_code, category_name, review_status, rationale,
-       source_kind, source_reference, source_match_level,
-       previous_category_name, previous_review_status,
-       imported_at, imported_by, updated_at)
-    VALUES
-      ($1, $2, $3,
-       $4,
-       'rules_batch', 'taxonomy_batch/tier1', $5,
-       (SELECT category_name  FROM ada.product_category_states WHERE product_code = $1),
-       (SELECT review_status  FROM ada.product_category_states WHERE product_code = $1),
-       now(), $6, now())
-    ON CONFLICT (product_code) DO UPDATE SET
-      category_name          = EXCLUDED.category_name,
-      review_status          = EXCLUDED.review_status,
-      rationale              = EXCLUDED.rationale,
-      source_kind            = EXCLUDED.source_kind,
-      source_reference       = EXCLUDED.source_reference,
-      source_match_level     = EXCLUDED.source_match_level,
-      previous_category_name = EXCLUDED.previous_category_name,
-      previous_review_status = EXCLUDED.previous_review_status,
-      imported_at            = EXCLUDED.imported_at,
-      imported_by            = EXCLUDED.imported_by,
-      updated_at             = now()
-    WHERE ada.product_category_states.review_status NOT IN ('confirmed', 'imported_exact_match')
-    `,
-    [
-      productCode,
-      categoryName || "",
-      reviewStatus,
-      `Tier 1 rules batch. Reason: ${reason}. Triggered by: ${triggeredBy}`,
-      reason || null,
-      triggeredBy,
-    ],
-  );
+async function bulkUpsertTier0(db, rows, triggeredBy) {
+  for (const chunk of chunkArray(rows, CHUNK_SIZE)) {
+    const productCodes      = chunk.map((r) => r.product_code);
+    const categoryNames     = chunk.map((r) => r.category_name);
+    const rationales        = chunk.map((r) => r.rationale);
+    const prevCategoryNames = chunk.map((r) => r.prev_category_name);
+    const prevStatuses      = chunk.map((r) => r.prev_review_status);
+    const importedBys       = chunk.map(() => triggeredBy);
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `
+        INSERT INTO ada.product_category_states
+          (product_code, category_name, review_status, rationale,
+           source_kind, source_reference, source_match_level,
+           previous_category_name, previous_review_status,
+           imported_at, imported_by, updated_at)
+        SELECT
+          unnest($1::text[]),
+          unnest($2::text[]),
+          'imported_exact_match',
+          unnest($3::text[]),
+          'taxonomy_workbook',
+          'taxonomy_batch/tier0',
+          'exact_code',
+          unnest($4::text[]),
+          unnest($5::text[]),
+          now(),
+          unnest($6::text[]),
+          now()
+        ON CONFLICT (product_code) DO UPDATE SET
+          category_name          = EXCLUDED.category_name,
+          review_status          = EXCLUDED.review_status,
+          rationale              = EXCLUDED.rationale,
+          source_kind            = EXCLUDED.source_kind,
+          source_reference       = EXCLUDED.source_reference,
+          source_match_level     = EXCLUDED.source_match_level,
+          previous_category_name = EXCLUDED.previous_category_name,
+          previous_review_status = EXCLUDED.previous_review_status,
+          imported_at            = EXCLUDED.imported_at,
+          imported_by            = EXCLUDED.imported_by,
+          updated_at             = now()
+        WHERE ada.product_category_states.review_status <> 'confirmed'
+        `,
+        [productCodes, categoryNames, rationales, prevCategoryNames, prevStatuses, importedBys],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+async function bulkUpsertTier1(db, rows, triggeredBy) {
+  for (const chunk of chunkArray(rows, CHUNK_SIZE)) {
+    const productCodes      = chunk.map((r) => r.product_code);
+    const categoryNames     = chunk.map((r) => r.category_name);
+    const reviewStatuses    = chunk.map((r) => r.review_status);
+    const rationales        = chunk.map((r) => r.rationale);
+    const matchLevels       = chunk.map((r) => r.source_match_level);
+    const prevCategoryNames = chunk.map((r) => r.prev_category_name);
+    const prevStatuses      = chunk.map((r) => r.prev_review_status);
+    const importedBys       = chunk.map(() => triggeredBy);
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `
+        INSERT INTO ada.product_category_states
+          (product_code, category_name, review_status, rationale,
+           source_kind, source_reference, source_match_level,
+           previous_category_name, previous_review_status,
+           imported_at, imported_by, updated_at)
+        SELECT
+          unnest($1::text[]),
+          unnest($2::text[]),
+          unnest($3::text[]),
+          unnest($4::text[]),
+          'rules_batch',
+          'taxonomy_batch/tier1',
+          unnest($5::text[]),
+          unnest($6::text[]),
+          unnest($7::text[]),
+          now(),
+          unnest($8::text[]),
+          now()
+        ON CONFLICT (product_code) DO UPDATE SET
+          category_name          = EXCLUDED.category_name,
+          review_status          = EXCLUDED.review_status,
+          rationale              = EXCLUDED.rationale,
+          source_kind            = EXCLUDED.source_kind,
+          source_reference       = EXCLUDED.source_reference,
+          source_match_level     = EXCLUDED.source_match_level,
+          previous_category_name = EXCLUDED.previous_category_name,
+          previous_review_status = EXCLUDED.previous_review_status,
+          imported_at            = EXCLUDED.imported_at,
+          imported_by            = EXCLUDED.imported_by,
+          updated_at             = now()
+        WHERE ada.product_category_states.review_status NOT IN ('confirmed', 'imported_exact_match')
+        `,
+        [productCodes, categoryNames, reviewStatuses, rationales, matchLevels,
+         prevCategoryNames, prevStatuses, importedBys],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
 
 // ── Metrics builder ───────────────────────────────────────────────────────────
