@@ -3,6 +3,7 @@
 const { formatDisplayCategory } = require("./format");
 const { runTier0 } = require("./tier0");
 const { runTier1 } = require("./tier1");
+const { runTier2 } = require("./tier2");
 
 const EXAMPLE_LIMIT = 5;
 
@@ -19,14 +20,22 @@ const EXAMPLE_LIMIT = 5;
  *  - dryRun = true skips all writes and returns metrics only.
  *
  * Options:
- *  productCodes  string[]  optional — limit run to these product codes
- *  dryRun        boolean   default false
- *  triggeredBy   string    optional label recorded in rationale (e.g. 'sync_hook', 'manual')
+ *  productCodes        string[]  optional — limit run to these product codes
+ *  dryRun              boolean   default false
+ *  skipTier2           boolean   default false — skip pgvector similarity step
+ *  tier2Threshold      number    default 0.60 — cosine similarity min for Tier 2 match
+ *  triggeredBy         string    optional label recorded in rationale (e.g. 'sync_hook', 'manual')
  *
  * Returns a metrics object.
  */
 async function runCategorizationBatch(db, options = {}) {
-  const { productCodes = null, dryRun = false, triggeredBy = "batch" } = options;
+  const {
+    productCodes = null,
+    dryRun = false,
+    skipTier2 = false,
+    tier2Threshold = 0.60,
+    triggeredBy = "batch",
+  } = options;
   const startedAt = new Date();
 
   // ── 1. Fetch all products to consider ────────────────────────────────────
@@ -72,7 +81,7 @@ async function runCategorizationBatch(db, options = {}) {
   const tier1Results = await runTier1(db, tier1Input);
 
   if (dryRun) {
-    return buildMetrics(startedAt, products.length, tier0Results, tier1Results, [], []);
+    return buildMetrics(startedAt, products.length, tier0Results, tier1Results, [], [], [], []);
   }
 
   // ── 4. Write results — bulk UNNEST in chunks of 500 ─────────────────────
@@ -131,12 +140,42 @@ async function runCategorizationBatch(db, options = {}) {
     });
   }
 
-  // Write in chunks — each chunk is its own transaction so a dropped connection
-  // only needs to retry the remaining chunks, not the whole run.
+  // ── 4a. Write Tier 0 first so it's available as the reference set for Tier 2 ─
   await bulkUpsertTier0(db, tier0Rows, triggeredBy);
+
+  // ── 4b. Tier 2: pgvector similarity on needs_review candidates ───────────
+  // Runs after Tier 0 is committed so newly categorized products are in the DB.
+  const tier2ByCode = new Map();
+  if (!skipTier2) {
+    const needsReviewCodes = tier1Results
+      .filter((r) => r.review_status === "needs_review")
+      .map((r) => r.product_code);
+
+    if (needsReviewCodes.length > 0) {
+      const tier2Results = await runTier2(db, needsReviewCodes, {
+        similarityThreshold: tier2Threshold,
+      });
+      for (const r of tier2Results) tier2ByCode.set(r.product_code, r);
+    }
+  }
+
+  // Upgrade needs_review tier1Rows that got a Tier 2 match to proposed.
+  const written2 = [];
+  for (const row of tier1Rows) {
+    const t2 = tier2ByCode.get(row.product_code);
+    if (t2) {
+      row.category_name = t2.clean_category || "";
+      row.review_status = "proposed";
+      row.rationale = `Tier 2 similarity ${t2.reason}. Matched: ${t2.matched_product_code}. By: ${triggeredBy}`;
+      row.source_match_level = t2.reason;
+      written2.push({ product_code: row.product_code, category_name: row.category_name, reason: t2.reason });
+    }
+  }
+
+  // ── 4c. Write Tier 1 + Tier 2 upgrades together ──────────────────────────
   await bulkUpsertTier1(db, tier1Rows, triggeredBy);
 
-  return buildMetrics(startedAt, products.length, tier0Results, tier1Results, written0, written1, skipped);
+  return buildMetrics(startedAt, products.length, tier0Results, tier1Results, written0, written1, written2, skipped);
 }
 
 // ── Bulk upsert helpers (UNNEST, chunked at 500 rows) ─────────────────────────
@@ -269,20 +308,17 @@ async function bulkUpsertTier1(db, rows, triggeredBy) {
 }
 
 // ── Metrics builder ───────────────────────────────────────────────────────────
-// Always computed from tier0Results/tier1Results so dry-run and live-run agree.
-// written0/written1 are only used for per-row examples in live runs.
+// Counts are always derived from tier*Results so dry-run and live-run agree.
+// written* arrays are used for per-row examples when available.
 
-function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, written0 = [], written1 = [], skipped = []) {
+function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, written0 = [], written1 = [], written2 = [], skipped = []) {
   const finishedAt = new Date();
 
-  const conflicts = tier0Results.filter((r) => r.conflict);
-  const tier0Matched = tier0Results.filter((r) => !r.conflict && r.clean_category);
-
+  const conflicts     = tier0Results.filter((r) => r.conflict);
+  const tier0Matched  = tier0Results.filter((r) => !r.conflict && r.clean_category);
   const tier1Proposed = tier1Results.filter((r) => r.review_status === "proposed");
   const tier1NeedsReview = tier1Results.filter((r) => r.review_status === "needs_review");
 
-  // Examples: prefer the written arrays (have formatted category_name) but fall back
-  // to computing from result objects so dry-run still shows real examples.
   const tier0Examples = written0.length > 0
     ? written0.slice(0, EXAMPLE_LIMIT)
     : tier0Matched.slice(0, EXAMPLE_LIMIT).map((r) => ({
@@ -290,7 +326,7 @@ function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, wri
         category_name: formatDisplayCategory(r.shelf_no, r.clean_category),
       }));
 
-  const tier1ProposedExamples = written1.filter((r) => r.review_status === "proposed").length > 0
+  const tier1Examples = written1.filter((r) => r.review_status === "proposed").slice(0, EXAMPLE_LIMIT).length > 0
     ? written1.filter((r) => r.review_status === "proposed").slice(0, EXAMPLE_LIMIT)
     : tier1Proposed.slice(0, EXAMPLE_LIMIT).map((r) => ({
         product_code: r.product_code,
@@ -298,7 +334,9 @@ function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, wri
         reason: r.reason,
       }));
 
-  const needsReviewExamples = written1.filter((r) => r.review_status === "needs_review").length > 0
+  const tier2Examples = written2.slice(0, EXAMPLE_LIMIT);
+
+  const needsReviewExamples = written1.filter((r) => r.review_status === "needs_review").slice(0, EXAMPLE_LIMIT).length > 0
     ? written1.filter((r) => r.review_status === "needs_review").slice(0, EXAMPLE_LIMIT)
     : tier1NeedsReview.slice(0, EXAMPLE_LIMIT).map((r) => ({
         product_code: r.product_code,
@@ -306,6 +344,7 @@ function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, wri
         reason: r.reason,
       }));
 
+  // Tier 2 count: written2 always populated from live runs; dry-run shows 0 (Tier 2 not run in dry-run)
   return {
     startedAt: startedAt.toISOString(),
     finishedAt: finishedAt.toISOString(),
@@ -313,11 +352,13 @@ function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, wri
     totalProcessed,
     tier0Exact: tier0Matched.length,
     tier1Rules: tier1Proposed.length,
-    needsReview: tier1NeedsReview.length,
+    tier2Similarity: written2.length,
+    needsReview: tier1NeedsReview.length - written2.length,
     conflictsSkipped: conflicts.length,
     examples: {
       tier0: tier0Examples,
-      tier1Proposed: tier1ProposedExamples,
+      tier1Proposed: tier1Examples,
+      tier2Similarity: tier2Examples,
       needsReview: needsReviewExamples,
       conflicts: conflicts.slice(0, EXAMPLE_LIMIT).map((r) => ({
         product_code: r.product_code,
