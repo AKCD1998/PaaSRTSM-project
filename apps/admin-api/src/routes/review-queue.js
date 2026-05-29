@@ -10,8 +10,10 @@ function toInt(value, fallback) {
 }
 
 /**
- * For each product_code, find the top-K most similar CONFIRMED categories
+ * For each product_code, find the top-K most similar categorized products
  * using cosine similarity on ada.product_category_embeddings.
+ * Reference set: confirmed OR imported_exact_match (so it works before anyone
+ * has manually confirmed anything).
  * Returns a Map<product_code, [{category_name, similarity, matched_code}]>
  */
 async function fetchSimilarityOptions(db, productCodes, topK = 5) {
@@ -39,7 +41,7 @@ async function fetchSimilarityOptions(db, productCodes, topK = 5) {
       FROM ada.product_category_states pcs2
       JOIN ada.product_category_embeddings pce2
              ON pce2.product_code = pcs2.product_code
-      WHERE pcs2.review_status = 'confirmed'
+      WHERE pcs2.review_status IN ('confirmed', 'imported_exact_match')
         AND pcs2.category_name IS NOT NULL
         AND pcs2.category_name <> ''
         AND pce2.embedding IS NOT NULL
@@ -48,7 +50,7 @@ async function fetchSimilarityOptions(db, productCodes, topK = 5) {
     ) r
     ORDER BY q.product_code, r.category_name, similarity DESC
     `,
-    [productCodes, topK * 3], // over-fetch then deduplicate by category below
+    [productCodes, topK * 3],
   );
 
   // Deduplicate: keep best similarity per (product_code, category_name), then top-K
@@ -130,7 +132,7 @@ function createReviewQueueRouter(deps) {
             COALESCE(
               (SELECT pb.barcode FROM ada.product_barcodes pb
                WHERE pb.product_code = pcs.product_code
-               ORDER BY pb.id LIMIT 1),
+               LIMIT 1),
               bs.barcode
             ) AS barcode
           FROM ada.product_category_states pcs
