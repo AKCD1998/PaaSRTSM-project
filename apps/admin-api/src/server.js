@@ -200,6 +200,8 @@ function createApp(overrides = {}) {
       config,
       db,
       requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
     }),
   );
   app.use(

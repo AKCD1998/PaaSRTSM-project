@@ -3,6 +3,8 @@
 const express = require("express");
 const fs = require("node:fs");
 const path = require("node:path");
+const { auditLog } = require("../audit");
+const { auditBase } = require("../utils/audit-payload");
 
 const docsDir = path.resolve(__dirname, "../../../../docs");
 
@@ -42,7 +44,16 @@ function parseNonNegativeInt(value, fallback) {
   return n;
 }
 
+function parseBooleanFlag(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+}
+
 function normalizeQuery(value = "") {
+  return normalizeText(value).toLowerCase();
+}
+
+function normalizeCategoryValue(value) {
   return normalizeText(value).toLowerCase();
 }
 
@@ -316,6 +327,9 @@ function mapBranchStockRow(row) {
     productNameEng: row.product_name_eng || "",
     barcode: row.barcode || "",
     unit: row.unit || "",
+    category: row.category_name || "",
+    categoryStatus: row.category_status || "needs_review",
+    categoryRationale: row.category_rationale || "",
     qtyBranch000: Number(row.qty_branch_000 || 0),
     qtyBranch001: Number(row.qty_branch_001 || 0),
     qtyBranch002: Number(row.qty_branch_002 || 0),
@@ -547,8 +561,280 @@ function readLatestTaxonomyReport() {
   };
 }
 
+function readLatestTaxonomyReportPayload() {
+  const fileEntry = locateLatestTaxonomyReport();
+  if (!fileEntry) return null;
+
+  const payload = JSON.parse(fs.readFileSync(fileEntry.fullPath, "utf8"));
+  return {
+    fileName: fileEntry.name,
+    generatedAt: fileEntry.generatedAt,
+    payload,
+  };
+}
+
+function buildExactCodeMatchIndex(exactCodeMatches) {
+  const grouped = new Map();
+  for (const row of exactCodeMatches) {
+    const productCode = normalizeText(row.liveProductCode || row.workbookProductCode);
+    if (!productCode) continue;
+    const bucket = grouped.get(productCode) || [];
+    bucket.push(row);
+    grouped.set(productCode, bucket);
+  }
+  return grouped;
+}
+
+async function loadCategoryStateMap(db, productCodes) {
+  if (!productCodes.length) {
+    return new Map();
+  }
+
+  const sql = `
+    SELECT
+      codes.product_code,
+      COALESCE(pcs.category_name, s.category_name, p.category_name) AS effective_category_name,
+      COALESCE(pcs.review_status, 'needs_review') AS review_status,
+      pcs.rationale,
+      pcs.source_kind,
+      pcs.source_reference,
+      pcs.source_report_file,
+      pcs.imported_at,
+      pcs.imported_by,
+      s.category_name AS sku_category_name,
+      p.category_name AS source_category_name
+    FROM UNNEST($1::text[]) AS codes(product_code)
+    LEFT JOIN public.skus s
+      ON s.company_code = codes.product_code
+    LEFT JOIN ada.products p
+      ON p.product_code = codes.product_code
+    LEFT JOIN ada.product_category_states pcs
+      ON pcs.product_code = codes.product_code
+  `;
+
+  let rows = [];
+  try {
+    const result = await db.query(sql, [productCodes]);
+    rows = result.rows || [];
+  } catch (error) {
+    if (error?.code !== "42P01") {
+      throw error;
+    }
+    const fallbackResult = await db.query(
+      `
+        SELECT
+          codes.product_code,
+          COALESCE(s.category_name, p.category_name) AS effective_category_name,
+          'needs_review'::text AS review_status,
+          NULL::text AS rationale,
+          NULL::text AS source_kind,
+          NULL::text AS source_reference,
+          NULL::text AS source_report_file,
+          NULL::timestamptz AS imported_at,
+          NULL::text AS imported_by,
+          s.category_name AS sku_category_name,
+          p.category_name AS source_category_name
+        FROM UNNEST($1::text[]) AS codes(product_code)
+        LEFT JOIN public.skus s
+          ON s.company_code = codes.product_code
+        LEFT JOIN ada.products p
+          ON p.product_code = codes.product_code
+      `,
+      [productCodes],
+    );
+    rows = fallbackResult.rows || [];
+  }
+
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.product_code, row);
+  }
+  return map;
+}
+
+function determinePreviewReason(matchRows, stateRow) {
+  const workbookLabel = normalizeNullableText(matchRows[0]?.workbookLabel);
+  const currentCategory = normalizeNullableText(stateRow?.effective_category_name);
+  const currentStatus = normalizeText(stateRow?.review_status || "needs_review");
+  const duplicateMatch = matchRows.length > 1;
+
+  if (duplicateMatch) {
+    return { safeToApply: false, reason: "needs_review" };
+  }
+  if (!workbookLabel) {
+    return { safeToApply: false, reason: "missing_category" };
+  }
+  if (currentStatus === "confirmed" || currentStatus === "imported_exact_match") {
+    return { safeToApply: false, reason: "already_confirmed" };
+  }
+  if (currentCategory && normalizeCategoryValue(currentCategory) !== normalizeCategoryValue(workbookLabel)) {
+    return { safeToApply: false, reason: "category_conflict" };
+  }
+  return { safeToApply: true, reason: "exact_code_match" };
+}
+
+function buildPreviewRow(productCode, matchRows, stateRow, reportFileName) {
+  const primary = matchRows[0] || {};
+  const workbookLabel = normalizeNullableText(primary.workbookLabel);
+  const currentCategory = normalizeNullableText(stateRow?.effective_category_name);
+  const currentCategoryStatus = normalizeText(stateRow?.review_status || "needs_review") || "needs_review";
+  const decision = determinePreviewReason(matchRows, stateRow);
+
+  return {
+    productCode,
+    productNameThai: primary.liveProductNameThai || primary.workbookProductNameThai || "",
+    barcode: primary.liveBarcode || primary.workbookBarcode || "",
+    workbookRowNumber: primary.workbookRowNumber || null,
+    liveRowNumber: primary.liveRowNumber || null,
+    currentCategory: currentCategory || "",
+    currentCategoryStatus,
+    currentCategoryRationale: stateRow?.rationale || "",
+    proposedCategory: workbookLabel || "",
+    proposedReviewStatus: "imported_exact_match",
+    safeToApply: decision.safeToApply,
+    reason: decision.reason,
+    matchLevel: "exact_code",
+    matchCountForProductCode: matchRows.length,
+    reportFileName,
+  };
+}
+
+async function buildTaxonomyPreview(db, options = {}) {
+  const reportEntry = readLatestTaxonomyReportPayload();
+  if (!reportEntry) {
+    return null;
+  }
+
+  const payload = reportEntry.payload || {};
+  const results = payload.results || {};
+  const exactCodeMatches = Array.isArray(results.exactCodeMatches) ? results.exactCodeMatches : [];
+  const grouped = buildExactCodeMatchIndex(exactCodeMatches);
+  const productCodes = [...grouped.keys()];
+  const categoryStateMap = await loadCategoryStateMap(db, productCodes);
+
+  let rows = productCodes.map((productCode) =>
+    buildPreviewRow(productCode, grouped.get(productCode) || [], categoryStateMap.get(productCode) || null, reportEntry.fileName),
+  );
+
+  const search = normalizeQuery(options.search || "");
+  if (search) {
+    rows = rows.filter((row) =>
+      [
+        row.productCode,
+        row.productNameThai,
+        row.currentCategory,
+        row.proposedCategory,
+        row.reason,
+      ]
+        .filter(Boolean)
+        .some((field) => String(field).toLowerCase().includes(search)),
+    );
+  }
+
+  if (options.safeOnly) {
+    rows = rows.filter((row) => row.safeToApply);
+  }
+
+  rows.sort((left, right) => left.productCode.localeCompare(right.productCode));
+
+  const reasonCounts = rows.reduce((acc, row) => {
+    acc[row.reason] = (acc[row.reason] || 0) + 1;
+    return acc;
+  }, {});
+
+  const total = rows.length;
+  const limit = options.limit;
+  const offset = options.offset;
+  const pagedRows = rows.slice(offset, offset + limit);
+
+  return {
+    fileName: reportEntry.fileName,
+    generatedAt: reportEntry.generatedAt,
+    args: payload.args || null,
+    summary: {
+      totalExactCodeRows: productCodes.length,
+      filteredRows: total,
+      safeToApply: rows.filter((row) => row.safeToApply).length,
+      exact_code_match: reasonCounts.exact_code_match || 0,
+      missing_category: reasonCounts.missing_category || 0,
+      category_conflict: reasonCounts.category_conflict || 0,
+      already_confirmed: reasonCounts.already_confirmed || 0,
+      needs_review: reasonCounts.needs_review || 0,
+    },
+    pagination: {
+      limit,
+      offset,
+      total,
+    },
+    records: pagedRows,
+  };
+}
+
+async function upsertProductCategoryState(client, row, req, sourceArgs) {
+  await client.query(
+    `
+      INSERT INTO ada.product_category_states
+        (
+          product_code,
+          category_name,
+          review_status,
+          rationale,
+          source_kind,
+          source_reference,
+          source_report_file,
+          source_workbook_file,
+          source_workbook_sheet,
+          source_workbook_row,
+          source_match_level,
+          source_barcode,
+          previous_category_name,
+          previous_review_status,
+          imported_at,
+          imported_by,
+          updated_at
+        )
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now(), $15, now())
+      ON CONFLICT (product_code) DO UPDATE SET
+        category_name = EXCLUDED.category_name,
+        review_status = EXCLUDED.review_status,
+        rationale = EXCLUDED.rationale,
+        source_kind = EXCLUDED.source_kind,
+        source_reference = EXCLUDED.source_reference,
+        source_report_file = EXCLUDED.source_report_file,
+        source_workbook_file = EXCLUDED.source_workbook_file,
+        source_workbook_sheet = EXCLUDED.source_workbook_sheet,
+        source_workbook_row = EXCLUDED.source_workbook_row,
+        source_match_level = EXCLUDED.source_match_level,
+        source_barcode = EXCLUDED.source_barcode,
+        previous_category_name = EXCLUDED.previous_category_name,
+        previous_review_status = EXCLUDED.previous_review_status,
+        imported_at = EXCLUDED.imported_at,
+        imported_by = EXCLUDED.imported_by,
+        updated_at = now()
+    `,
+    [
+      row.productCode,
+      row.proposedCategory,
+      row.proposedReviewStatus,
+      "taxonomy exact-code preview/apply",
+      "taxonomy_workbook",
+      "workbook/taxonomy import",
+      row.reportFileName,
+      sourceArgs?.workbookFile || null,
+      sourceArgs?.workbookSheet || null,
+      row.workbookRowNumber,
+      "exact_code",
+      row.barcode || null,
+      row.currentCategory || null,
+      row.currentCategoryStatus || null,
+      req.auth?.userId || null,
+    ],
+  );
+}
+
 function createBranchStockRouter(deps) {
-  const { config, db, requireAuthMiddleware } = deps;
+  const { config, db, requireAuthMiddleware, requireRoleMiddleware, requireCsrfMiddleware } = deps;
   const router = express.Router();
 
   router.post("/branch-stock/sync", async (req, res, next) => {
@@ -728,6 +1014,9 @@ function createBranchStockRouter(deps) {
             COALESCE(bs.product_name_eng, p.product_name) AS product_name_eng,
             COALESCE(bs.barcode, pb.barcode) AS barcode,
             COALESCE(bs.unit, p.unit_small, p.unit_medium, p.unit_large) AS unit,
+            COALESCE(pcs.category_name, s.category_name, p.category_name) AS category_name,
+            COALESCE(pcs.review_status, 'needs_review') AS category_status,
+            pcs.rationale AS category_rationale,
             bs.qty_branch_000,
             bs.qty_branch_001,
             bs.qty_branch_002,
@@ -739,6 +1028,10 @@ function createBranchStockRouter(deps) {
           FROM ada.branch_stock_snapshots bs
           LEFT JOIN ada.products p
             ON p.product_code = bs.product_code
+          LEFT JOIN public.skus s
+            ON s.company_code = bs.product_code
+          LEFT JOIN ada.product_category_states pcs
+            ON pcs.product_code = bs.product_code
           LEFT JOIN LATERAL (
             SELECT barcode
             FROM ada.product_barcodes pb
@@ -779,6 +1072,117 @@ function createBranchStockRouter(deps) {
     }
     return res.json(report);
   });
+
+  router.get("/admin/taxonomy-match-preview", requireAuthMiddleware, async (req, res, next) => {
+    const limit = parsePositiveInt(req.query.limit, 25);
+    const offset = parseNonNegativeInt(req.query.offset, 0);
+    if (limit == null) {
+      return res.status(400).json({ message: "limit must be a positive integer." });
+    }
+    if (offset == null) {
+      return res.status(400).json({ message: "offset must be a non-negative integer." });
+    }
+
+    try {
+      const preview = await buildTaxonomyPreview(db, {
+        limit: Math.min(limit, 200),
+        offset,
+        search: req.query.search || "",
+        safeOnly: parseBooleanFlag(req.query.safe_only),
+      });
+      if (!preview) {
+        return res.status(404).json({ message: "No taxonomy match report found under docs/." });
+      }
+      return res.json(preview);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post(
+    "/admin/taxonomy-match-apply",
+    requireAuthMiddleware,
+    requireRoleMiddleware("admin"),
+    requireCsrfMiddleware,
+    async (req, res, next) => {
+      const requestedCodes = Array.isArray(req.body?.productCodes)
+        ? req.body.productCodes.map((value) => normalizeText(value)).filter(Boolean)
+        : [];
+      const requestedCodeSet = requestedCodes.length > 0 ? new Set(requestedCodes) : null;
+
+      try {
+        const preview = await buildTaxonomyPreview(db, {
+          limit: Number.MAX_SAFE_INTEGER,
+          offset: 0,
+          search: "",
+          safeOnly: false,
+        });
+        if (!preview) {
+          return res.status(404).json({ message: "No taxonomy match report found under docs/." });
+        }
+
+        const candidateRows = preview.records.filter((row) =>
+          requestedCodeSet ? requestedCodeSet.has(row.productCode) : true,
+        );
+        const safeRows = candidateRows.filter((row) => row.safeToApply);
+        const skippedRows = candidateRows.filter((row) => !row.safeToApply);
+
+        const client = await db.connect();
+        try {
+          await client.query("BEGIN");
+          for (const row of safeRows) {
+            // eslint-disable-next-line no-await-in-loop
+            await upsertProductCategoryState(client, row, req, preview.args || null);
+          }
+
+          await auditLog(
+            client,
+            auditBase(req, {
+              action: "taxonomy_match.apply_exact_code",
+              target_type: "taxonomy_category_state",
+              target_id: preview.fileName,
+              success: true,
+              meta: {
+                report_file: preview.fileName,
+                requested_codes: requestedCodes,
+                applied_count: safeRows.length,
+                skipped_count: skippedRows.length,
+                applied_samples: safeRows.slice(0, 20).map((row) => ({
+                  product_code: row.productCode,
+                  proposed_category: row.proposedCategory,
+                  workbook_row_number: row.workbookRowNumber,
+                })),
+                skipped_samples: skippedRows.slice(0, 20).map((row) => ({
+                  product_code: row.productCode,
+                  current_category: row.currentCategory,
+                  proposed_category: row.proposedCategory,
+                  reason: row.reason,
+                })),
+              },
+            }),
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+
+        return res.json({
+          ok: true,
+          reportFileName: preview.fileName,
+          requestedCount: candidateRows.length,
+          appliedCount: safeRows.length,
+          skippedCount: skippedRows.length,
+          applied: safeRows.slice(0, 20),
+          skipped: skippedRows.slice(0, 20),
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
 
   return router;
 }

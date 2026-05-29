@@ -38,9 +38,12 @@ function createBranchStockMockDb() {
   const state = {
     snapshots: new Map(),
     products: new Map(),
+    skuCategories: new Map(),
+    categoryStates: new Map(),
     productBarcodes: new Map(),
     uploads: new Map(),
     txLog: [],
+    auditActions: [],
   };
 
   const db = {
@@ -60,6 +63,7 @@ function createBranchStockMockDb() {
       }
 
       if (normalized.startsWith("insert into public.audit_logs")) {
+        state.auditActions.push(params[2]);
         return {
           rowCount: 1,
           rows: [{ audit_id: 1, event_time: new Date().toISOString() }],
@@ -147,6 +151,53 @@ function createBranchStockMockDb() {
         return { rowCount: 1, rows: [{ total: matches.length }] };
       }
 
+      if (normalized.includes("from unnest($1::text[]) as codes(product_code)")) {
+        const productCodes = Array.isArray(params[0]) ? params[0] : [];
+        const rows = productCodes.map((productCode) => {
+          const stateRow = state.categoryStates.get(productCode) || null;
+          const skuCategory = state.skuCategories.get(productCode) || null;
+          const sourceProduct = state.products.get(productCode) || null;
+          const effectiveCategory =
+            stateRow?.category_name || skuCategory || sourceProduct?.category_name || null;
+          return {
+            product_code: productCode,
+            effective_category_name: effectiveCategory,
+            review_status: stateRow?.review_status || "needs_review",
+            rationale: stateRow?.rationale || null,
+            source_kind: stateRow?.source_kind || null,
+            source_reference: stateRow?.source_reference || null,
+            source_report_file: stateRow?.source_report_file || null,
+            imported_at: stateRow?.imported_at || null,
+            imported_by: stateRow?.imported_by || null,
+            sku_category_name: skuCategory,
+            source_category_name: sourceProduct?.category_name || null,
+          };
+        });
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.startsWith("insert into ada.product_category_states")) {
+        state.categoryStates.set(params[0], {
+          product_code: params[0],
+          category_name: params[1],
+          review_status: params[2],
+          rationale: params[3],
+          source_kind: params[4],
+          source_reference: params[5],
+          source_report_file: params[6],
+          source_workbook_file: params[7],
+          source_workbook_sheet: params[8],
+          source_workbook_row: params[9],
+          source_match_level: params[10],
+          source_barcode: params[11],
+          previous_category_name: params[12],
+          previous_review_status: params[13],
+          imported_by: params[14],
+          imported_at: new Date().toISOString(),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
       if (normalized.startsWith("select bs.product_code,")) {
         const search = String(params[0] || "").toLowerCase();
         const limit = Number(params[1]);
@@ -168,12 +219,17 @@ function createBranchStockMockDb() {
           .sort((left, right) => left.product_code.localeCompare(right.product_code))
           .map((row) => {
             const product = state.products.get(row.product_code) || null;
+            const stateRow = state.categoryStates.get(row.product_code) || null;
+            const skuCategory = state.skuCategories.get(row.product_code) || null;
             return {
               ...row,
               product_name_thai: row.product_name_thai || product?.product_name_th || null,
               product_name_eng: row.product_name_eng || product?.product_name || null,
               barcode: row.barcode || state.productBarcodes.get(row.product_code) || null,
               unit: row.unit || product?.unit_small || product?.unit_medium || product?.unit_large || null,
+              category_name: stateRow?.category_name || skuCategory || product?.category_name || null,
+              category_status: stateRow?.review_status || "needs_review",
+              category_rationale: stateRow?.rationale || null,
             };
           })
           .slice(offset, offset + limit);
@@ -206,6 +262,7 @@ async function loginAsAdmin(agent) {
     password: "admin-pass-123",
   });
   assert.equal(response.status, 200);
+  return response.body.csrf_token;
 }
 
 test("branch stock sync and listing routes work on the shared backend", async () => {
@@ -331,6 +388,95 @@ test("taxonomy match report route returns latest committed report artifact for a
   assert.match(response.body.fileName, /^taxonomy-match-report-.*\.json$/);
   assert.equal(typeof response.body.summary, "object");
   assert.equal(Array.isArray(response.body.samples.exactCodeMatches), true);
+});
+
+test("taxonomy match preview marks exact-code rows safe only when current state is clear", async () => {
+  const { app, db } = createTestApp();
+  db.state.skuCategories.set("630010003", null);
+  db.state.skuCategories.set("630010004", "ผิวหนัง");
+  db.state.categoryStates.set("630010005", {
+    product_code: "630010005",
+    category_name: "สมุนไพร",
+    review_status: "confirmed",
+    rationale: "manual confirm",
+  });
+
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const safeResponse = await agent.get("/api/admin/taxonomy-match-preview?search=630010003&limit=10&offset=0");
+  assert.equal(safeResponse.status, 200);
+  assert.equal(safeResponse.body.records.length, 1);
+  assert.equal(safeResponse.body.records[0].productCode, "630010003");
+  assert.equal(safeResponse.body.records[0].proposedCategory, "ลบรอย");
+  assert.equal(safeResponse.body.records[0].safeToApply, true);
+  assert.equal(safeResponse.body.records[0].reason, "exact_code_match");
+
+  const conflictResponse = await agent.get("/api/admin/taxonomy-match-preview?search=630010004&limit=10&offset=0");
+  assert.equal(conflictResponse.status, 200);
+  assert.equal(conflictResponse.body.records[0].safeToApply, false);
+  assert.equal(conflictResponse.body.records[0].reason, "category_conflict");
+
+  const confirmedResponse = await agent.get("/api/admin/taxonomy-match-preview?search=630010005&limit=10&offset=0");
+  assert.equal(confirmedResponse.status, 200);
+  assert.equal(confirmedResponse.body.records[0].safeToApply, false);
+  assert.equal(confirmedResponse.body.records[0].reason, "already_confirmed");
+});
+
+test("taxonomy match apply writes only safe exact-code rows into category state overlay", async () => {
+  const { app, db } = createTestApp();
+  db.state.skuCategories.set("630010004", "ผิวหนัง");
+
+  const agent = request.agent(app);
+  const csrfToken = await loginAsAdmin(agent);
+
+  const response = await agent
+    .post("/api/admin/taxonomy-match-apply")
+    .set("X-CSRF-Token", csrfToken)
+    .send({
+      productCodes: ["630010003", "630010004"],
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.appliedCount, 1);
+  assert.equal(response.body.skippedCount, 1);
+  assert.equal(db.state.categoryStates.get("630010003")?.category_name, "ลบรอย");
+  assert.equal(db.state.categoryStates.get("630010003")?.review_status, "imported_exact_match");
+  assert.equal(db.state.categoryStates.has("630010004"), false);
+  assert.ok(db.state.auditActions.includes("taxonomy_match.apply_exact_code"));
+});
+
+test("branch stock listing returns overlay category state when taxonomy apply has populated it", async () => {
+  const { app, db } = createTestApp();
+  db.state.snapshots.set("630010003", {
+    product_code: "630010003",
+    product_name_thai: "สามัญ ฮีรูสการ์โพสแอคเน่ 5 กรัม",
+    product_name_eng: "Hiruscar Postacne 5 G",
+    barcode: "8851743001241",
+    unit: "หลอด",
+    qty_branch_000: 2,
+    qty_branch_001: 1,
+    qty_branch_002: 0,
+    qty_branch_003: 0,
+    qty_branch_004: 0,
+    qty_branch_005: 0,
+    qty_total_all_branches: 3,
+    synced_at: "2026-05-25T08:10:00.000Z",
+  });
+  db.state.categoryStates.set("630010003", {
+    product_code: "630010003",
+    category_name: "ลบรอย",
+    review_status: "imported_exact_match",
+    rationale: "taxonomy exact-code preview/apply",
+  });
+
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const listResponse = await agent.get("/api/branch-stock?search=630010003&limit=25&offset=0");
+  assert.equal(listResponse.status, 200);
+  assert.equal(listResponse.body.records[0].category, "ลบรอย");
+  assert.equal(listResponse.body.records[0].categoryStatus, "imported_exact_match");
 });
 
 test("branch stock upload stores raw payload and merges one branch quantity into the shared snapshot", async () => {
