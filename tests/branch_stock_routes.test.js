@@ -319,6 +319,20 @@ test("branch stock listing falls back to synced product metadata when snapshot f
   assert.equal(listResponse.body.records[0].qtyBranch000, 7);
 });
 
+test("taxonomy match report route returns latest committed report artifact for authenticated admins", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent.get("/api/admin/taxonomy-match-report");
+
+  assert.equal(response.status, 200);
+  assert.equal(typeof response.body.fileName, "string");
+  assert.match(response.body.fileName, /^taxonomy-match-report-.*\.json$/);
+  assert.equal(typeof response.body.summary, "object");
+  assert.equal(Array.isArray(response.body.samples.exactCodeMatches), true);
+});
+
 test("branch stock upload stores raw payload and merges one branch quantity into the shared snapshot", async () => {
   const { app, db } = createTestApp();
   db.state.snapshots.set("630010001", {

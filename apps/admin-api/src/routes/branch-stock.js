@@ -1,6 +1,10 @@
 "use strict";
 
 const express = require("express");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const docsDir = path.resolve(__dirname, "../../../../docs");
 
 function normalizeText(value) {
   return String(value == null ? "" : value).trim();
@@ -500,6 +504,49 @@ function branchStockSearchCondition() {
   `;
 }
 
+function locateLatestTaxonomyReport() {
+  if (!fs.existsSync(docsDir)) return null;
+
+  return fs.readdirSync(docsDir)
+    .filter((name) => /^taxonomy-match-report-.*\.json$/i.test(name))
+    .map((name) => {
+      const fullPath = path.join(docsDir, name);
+      const stats = fs.statSync(fullPath);
+      return {
+        name,
+        fullPath,
+        mtimeMs: stats.mtimeMs,
+        generatedAt: stats.mtime.toISOString(),
+      };
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)[0] || null;
+}
+
+function readLatestTaxonomyReport() {
+  const fileEntry = locateLatestTaxonomyReport();
+  if (!fileEntry) return null;
+
+  const payload = JSON.parse(fs.readFileSync(fileEntry.fullPath, "utf8"));
+  const results = payload.results || {};
+
+  return {
+    fileName: fileEntry.name,
+    generatedAt: fileEntry.generatedAt,
+    args: payload.args || null,
+    liveMeta: payload.liveMeta || null,
+    backendEvidence: payload.backendEvidence || null,
+    stats: payload.stats || null,
+    summary: results.summary || null,
+    samples: {
+      exactCodeMatches: (results.exactCodeMatches || []).slice(0, 10),
+      barcodeMatches: (results.barcodeMatches || []).slice(0, 10),
+      unmatchedLiveRows: (results.unmatchedLiveRows || []).slice(0, 10),
+      unmatchedWorkbookRows: (results.unmatchedWorkbookRows || []).slice(0, 10),
+      conflicts: (results.conflicts || []).slice(0, 10),
+    },
+  };
+}
+
 function createBranchStockRouter(deps) {
   const { config, db, requireAuthMiddleware } = deps;
   const router = express.Router();
@@ -723,6 +770,14 @@ function createBranchStockRouter(deps) {
     } catch (routeError) {
       return next(routeError);
     }
+  });
+
+  router.get("/admin/taxonomy-match-report", requireAuthMiddleware, async (_req, res) => {
+    const report = readLatestTaxonomyReport();
+    if (!report) {
+      return res.status(404).json({ message: "No taxonomy match report found under docs/." });
+    }
+    return res.json(report);
   });
 
   return router;
