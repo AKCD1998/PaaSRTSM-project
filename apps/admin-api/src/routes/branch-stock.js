@@ -8,6 +8,18 @@ const { auditBase } = require("../utils/audit-payload");
 
 const docsDir = path.resolve(__dirname, "../../../../docs");
 
+const { runCategorizationBatch } = require("../categorization");
+
+function fireCategorizationBatch(db, productCodes) {
+  setImmediate(() => {
+    runCategorizationBatch(db, { productCodes: productCodes || null, triggeredBy: "sync_hook" }).catch(
+      (err) => {
+        console.error("[categorization] post-sync batch failed:", err.message);
+      },
+    );
+  });
+}
+
 function normalizeText(value) {
   return String(value == null ? "" : value).trim();
 }
@@ -856,6 +868,7 @@ function createBranchStockRouter(deps) {
         await upsertBranchStockSnapshot(client, record);
       }
       await client.query("COMMIT");
+      fireCategorizationBatch(db, records.map((r) => r.productCode));
       return res.json({ accepted: records.length, insertedOrUpdated: records.length });
     } catch (routeError) {
       await client.query("ROLLBACK");
@@ -884,6 +897,7 @@ function createBranchStockRouter(deps) {
         await upsertBranchStockSnapshot(client, record);
       }
       await client.query("COMMIT");
+      fireCategorizationBatch(db, records.map((r) => r.productCode));
       return res.json({ accepted: records.length, insertedOrUpdated: records.length });
     } catch (routeError) {
       await client.query("ROLLBACK");
@@ -1180,6 +1194,30 @@ function createBranchStockRouter(deps) {
         });
       } catch (error) {
         return next(error);
+      }
+    },
+  );
+
+  // ── Manual categorization trigger ───────────────────────────────────────
+  router.post(
+    "/admin/categorization/run",
+    requireAuthMiddleware,
+    requireRoleMiddleware("admin"),
+    async (req, res, next) => {
+      try {
+        const productCodes =
+          Array.isArray(req.body?.productCodes) && req.body.productCodes.length > 0
+            ? req.body.productCodes
+            : null;
+        const dryRun = req.body?.dryRun === true;
+        const metrics = await runCategorizationBatch(db, {
+          productCodes,
+          dryRun,
+          triggeredBy: req.auth?.userId || "manual",
+        });
+        return res.json({ ok: true, metrics });
+      } catch (err) {
+        return next(err);
       }
     },
   );
