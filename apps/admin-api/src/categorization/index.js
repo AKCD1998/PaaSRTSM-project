@@ -208,29 +208,56 @@ async function upsertTier1(client, productCode, categoryName, reviewStatus, reas
 }
 
 // ── Metrics builder ───────────────────────────────────────────────────────────
+// Always computed from tier0Results/tier1Results so dry-run and live-run agree.
+// written0/written1 are only used for per-row examples in live runs.
 
-function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, written0, written1, skipped = []) {
+function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, written0 = [], written1 = [], skipped = []) {
   const finishedAt = new Date();
 
   const conflicts = tier0Results.filter((r) => r.conflict);
-  const tier0Exact = written0.length;
+  const tier0Matched = tier0Results.filter((r) => !r.conflict && r.clean_category);
 
-  const tier1Proposed = written1.filter((r) => r.review_status === "proposed");
-  const tier1NeedsReview = written1.filter((r) => r.review_status === "needs_review");
+  const tier1Proposed = tier1Results.filter((r) => r.review_status === "proposed");
+  const tier1NeedsReview = tier1Results.filter((r) => r.review_status === "needs_review");
+
+  // Examples: prefer the written arrays (have formatted category_name) but fall back
+  // to computing from result objects so dry-run still shows real examples.
+  const tier0Examples = written0.length > 0
+    ? written0.slice(0, EXAMPLE_LIMIT)
+    : tier0Matched.slice(0, EXAMPLE_LIMIT).map((r) => ({
+        product_code: r.product_code,
+        category_name: formatDisplayCategory(r.shelf_no, r.clean_category),
+      }));
+
+  const tier1ProposedExamples = written1.filter((r) => r.review_status === "proposed").length > 0
+    ? written1.filter((r) => r.review_status === "proposed").slice(0, EXAMPLE_LIMIT)
+    : tier1Proposed.slice(0, EXAMPLE_LIMIT).map((r) => ({
+        product_code: r.product_code,
+        category_name: formatDisplayCategory(r.shelf_no, r.clean_category),
+        reason: r.reason,
+      }));
+
+  const needsReviewExamples = written1.filter((r) => r.review_status === "needs_review").length > 0
+    ? written1.filter((r) => r.review_status === "needs_review").slice(0, EXAMPLE_LIMIT)
+    : tier1NeedsReview.slice(0, EXAMPLE_LIMIT).map((r) => ({
+        product_code: r.product_code,
+        category_name: r.clean_category,
+        reason: r.reason,
+      }));
 
   return {
     startedAt: startedAt.toISOString(),
     finishedAt: finishedAt.toISOString(),
     durationMs: finishedAt - startedAt,
     totalProcessed,
-    tier0Exact,
+    tier0Exact: tier0Matched.length,
     tier1Rules: tier1Proposed.length,
     needsReview: tier1NeedsReview.length,
     conflictsSkipped: conflicts.length,
     examples: {
-      tier0: written0.slice(0, EXAMPLE_LIMIT),
-      tier1Proposed: tier1Proposed.slice(0, EXAMPLE_LIMIT),
-      needsReview: tier1NeedsReview.slice(0, EXAMPLE_LIMIT),
+      tier0: tier0Examples,
+      tier1Proposed: tier1ProposedExamples,
+      needsReview: needsReviewExamples,
       conflicts: conflicts.slice(0, EXAMPLE_LIMIT).map((r) => ({
         product_code: r.product_code,
         reason: r.conflictReason,
