@@ -3,10 +3,18 @@
 const express = require("express");
 const fs = require("node:fs");
 const path = require("node:path");
+const XLSX = require("xlsx");
 const { auditLog } = require("../audit");
 const { auditBase } = require("../utils/audit-payload");
 
 const docsDir = path.resolve(__dirname, "../../../../docs");
+const BRANCH_EXPORT_CONFIG = {
+  "000": { label: "สาขา 000 (HQ)", qtyKey: "qtyBranch000", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 000" },
+  "001": { label: "สาขา 001", qtyKey: "qtyBranch001", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 001" },
+  "003": { label: "สาขา 003", qtyKey: "qtyBranch003", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 003" },
+  "004": { label: "สาขา 004", qtyKey: "qtyBranch004", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 004" },
+  "005": { label: "สาขา 005", qtyKey: "qtyBranch005", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 005" },
+};
 
 const { runCategorizationBatch } = require("../categorization");
 
@@ -351,6 +359,46 @@ function mapBranchStockRow(row) {
     qtyTotalAllBranches: Number(row.qty_total_all_branches || 0),
     syncedAt: row.synced_at,
   };
+}
+
+function buildBranchStockExportWorkbook(rows, branchCode) {
+  const branchConfig = BRANCH_EXPORT_CONFIG[branchCode];
+  const sheetRows = [
+    [branchConfig.title],
+    ["ลำดับ", "รหัส", "ชื่อสินค้า", "BARCODE", "หน่วย", "จำนวน", "ประเภท", "รวมเงินช่องนี้", "นับ1", "นับ2", "นับ3"],
+    ...rows.map((row, index) => ([
+      index + 1,
+      row.productCode || "",
+      row.productNameThai || "",
+      row.barcode || "",
+      row.unit || "",
+      Number(row[branchConfig.qtyKey] || 0),
+      row.category || "",
+      "",
+      "",
+      "",
+      "",
+    ])),
+  ];
+
+  const workbook = XLSX.utils.book_new();
+  const worksheet = XLSX.utils.aoa_to_sheet(sheetRows);
+  worksheet["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 10 } }];
+  worksheet["!cols"] = [
+    { wch: 8 },
+    { wch: 14 },
+    { wch: 72 },
+    { wch: 18 },
+    { wch: 12 },
+    { wch: 12 },
+    { wch: 18 },
+    { wch: 20 },
+    { wch: 10 },
+    { wch: 10 },
+    { wch: 10 },
+  ];
+  XLSX.utils.book_append_sheet(workbook, worksheet, `Stock ${branchCode}`);
+  return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 }
 
 function createEmptySnapshotRecord(productCode, syncedAt) {
@@ -1074,6 +1122,71 @@ function createBranchStockRouter(deps) {
           total: Number(countResult.rows[0]?.total || 0),
         },
       });
+    } catch (routeError) {
+      return next(routeError);
+    }
+  });
+
+  router.get("/branch-stock/export.xlsx", requireAuthMiddleware, async (req, res, next) => {
+    const branchCode = normalizeText(req.query.branchCode);
+    if (!BRANCH_EXPORT_CONFIG[branchCode]) {
+      return res.status(400).json({ message: "branchCode must be one of 000, 001, 003, 004, 005." });
+    }
+
+    const search = normalizeQuery(req.query.search || "");
+
+    try {
+      const rowsResult = await db.query(
+        `
+          SELECT
+            bs.product_code,
+            COALESCE(bs.product_name_thai, p.product_name_th) AS product_name_thai,
+            COALESCE(bs.product_name_eng, p.product_name) AS product_name_eng,
+            COALESCE(bs.barcode, pb.barcode) AS barcode,
+            COALESCE(bs.unit, p.unit_small, p.unit_medium, p.unit_large) AS unit,
+            COALESCE(pcs.category_name, s.category_name, p.category_name) AS category_name,
+            COALESCE(pcs.review_status, 'needs_review') AS category_status,
+            pcs.rationale AS category_rationale,
+            bs.qty_branch_000,
+            bs.qty_branch_001,
+            bs.qty_branch_002,
+            bs.qty_branch_003,
+            bs.qty_branch_004,
+            bs.qty_branch_005,
+            bs.qty_total_all_branches,
+            bs.synced_at
+          FROM ada.branch_stock_snapshots bs
+          LEFT JOIN ada.products p
+            ON p.product_code = bs.product_code
+          LEFT JOIN public.skus s
+            ON s.company_code = bs.product_code
+          LEFT JOIN ada.product_category_states pcs
+            ON pcs.product_code = bs.product_code
+          LEFT JOIN LATERAL (
+            SELECT barcode
+            FROM ada.product_barcodes pb
+            WHERE pb.product_code = bs.product_code
+            ORDER BY
+              CASE pb.barcode_role
+                WHEN 'primary' THEN 0
+                ELSE 1
+              END,
+              pb.updated_at DESC,
+              pb.barcode ASC
+            LIMIT 1
+          ) pb ON TRUE
+          WHERE ${branchStockSearchCondition()}
+          ORDER BY bs.product_code ASC
+        `,
+        [search],
+      );
+
+      const buffer = buildBranchStockExportWorkbook(rowsResult.rows.map(mapBranchStockRow), branchCode);
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      const fileName = `branch-stock-${branchCode}-${dateStamp}.xlsx`;
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+      return res.send(buffer);
     } catch (routeError) {
       return next(routeError);
     }

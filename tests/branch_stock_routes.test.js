@@ -4,8 +4,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const request = require("supertest");
+const XLSX = require("xlsx");
 
 const { createApp } = require("../apps/admin-api/src/server");
+
+function binaryParser(res, callback) {
+  const chunks = [];
+  res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+  res.on("end", () => callback(null, Buffer.concat(chunks)));
+}
 
 function buildConfig() {
   return {
@@ -200,8 +207,9 @@ function createBranchStockMockDb() {
 
       if (normalized.startsWith("select bs.product_code,")) {
         const search = String(params[0] || "").toLowerCase();
-        const limit = Number(params[1]);
-        const offset = Number(params[2]);
+        const hasPaging = Number.isFinite(Number(params[1])) && Number.isFinite(Number(params[2]));
+        const limit = hasPaging ? Number(params[1]) : null;
+        const offset = hasPaging ? Number(params[2]) : 0;
         const rows = [...state.snapshots.values()]
           .filter((row) => {
             const product = state.products.get(row.product_code) || null;
@@ -231,9 +239,9 @@ function createBranchStockMockDb() {
               category_status: stateRow?.review_status || "needs_review",
               category_rationale: stateRow?.rationale || null,
             };
-          })
-          .slice(offset, offset + limit);
-        return { rowCount: rows.length, rows };
+          });
+        const pagedRows = hasPaging ? rows.slice(offset, offset + limit) : rows;
+        return { rowCount: pagedRows.length, rows: pagedRows };
       }
 
       throw new Error(`Unhandled mock query: ${normalized}`);
@@ -374,6 +382,48 @@ test("branch stock listing falls back to synced product metadata when snapshot f
   assert.equal(listResponse.body.records[0].barcode, "885000009999");
   assert.equal(listResponse.body.records[0].unit, "BOX");
   assert.equal(listResponse.body.records[0].qtyBranch000, 7);
+});
+
+test("branch stock export returns branch-specific xlsx rows for authenticated admins", async () => {
+  const { app, db } = createTestApp();
+  db.state.snapshots.set("630010002", {
+    product_code: "630010002",
+    product_name_thai: "ลอราทาดีน",
+    product_name_eng: "Loratadine",
+    barcode: "885000000002",
+    unit: "BOX",
+    qty_branch_000: 1,
+    qty_branch_001: 2,
+    qty_branch_002: 0,
+    qty_branch_003: 3,
+    qty_branch_004: 4,
+    qty_branch_005: 5,
+    qty_total_all_branches: 15,
+    synced_at: "2026-05-25T08:05:00.000Z",
+  });
+
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent
+    .get("/api/branch-stock/export.xlsx?branchCode=001&search=loratadine")
+    .buffer(true)
+    .parse(binaryParser);
+  assert.equal(response.status, 200);
+  assert.match(String(response.headers["content-type"] || ""), /application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/i);
+  assert.match(String(response.headers["content-disposition"] || ""), /branch-stock-001-/i);
+
+  const workbook = XLSX.read(response.body, { type: "buffer" });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  assert.equal(sheet.A1.v, "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 001");
+  assert.equal(sheet.A2.v, "ลำดับ");
+  assert.equal(sheet.B2.v, "รหัส");
+  assert.equal(sheet.C2.v, "ชื่อสินค้า");
+  assert.equal(sheet.F2.v, "จำนวน");
+  assert.equal(sheet.B3.v, "630010002");
+  assert.equal(sheet.C3.v, "ลอราทาดีน");
+  assert.equal(sheet.F3.v, 2);
+  assert.equal(sheet.G3.v, "");
 });
 
 test("taxonomy match report route returns latest committed report artifact for authenticated admins", async () => {
