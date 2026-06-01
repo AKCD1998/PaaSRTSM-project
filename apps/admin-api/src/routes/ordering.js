@@ -293,10 +293,47 @@ async function getOrderRequestById(db, orderRequestId) {
   };
 }
 
-async function getPendingReceipts(db, branchCode = null) {
-  const params = [branchCode];
+async function getPendingReceipts(db, { branchCode = null, search = "", page = 1, pageSize = 10 } = {}) {
+  const normalizedSearch = String(search || "").trim().toLowerCase() || null;
+  const safePage = Math.max(1, Number(page) || 1);
+  const safePageSize = Math.min(100, Math.max(1, Number(pageSize) || 10));
+  const offset = (safePage - 1) * safePageSize;
+
+  const branchWhere = `($1::text IS NULL OR (
+    h.branch_code = $1
+    OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
+  ))`;
+  const searchWhere = `($2::text IS NULL
+    OR LOWER(COALESCE(h.doc_no, '')) LIKE '%' || $2 || '%'
+    OR LOWER(COALESCE(h.supplier_name, '')) LIKE '%' || $2 || '%'
+    OR LOWER(COALESCE(h.supplier_code, '')) LIKE '%' || $2 || '%'
+    OR LOWER(COALESCE(h.ref_ext, '')) LIKE '%' || $2 || '%'
+    OR EXISTS (
+      SELECT 1 FROM ada.pending_receipt_lines lx
+      WHERE lx.doc_no = h.doc_no
+        AND (
+          LOWER(COALESCE(lx.product_code, '')) LIKE '%' || $2 || '%'
+          OR LOWER(COALESCE(lx.product_name, '')) LIKE '%' || $2 || '%'
+          OR LOWER(COALESCE(lx.barcode, '')) LIKE '%' || $2 || '%'
+        )
+    )
+  )`;
+
+  const countResult = await db.query(
+    `SELECT COUNT(*)::int AS total FROM ada.pending_receipt_headers h WHERE ${branchWhere} AND ${searchWhere}`,
+    [branchCode, normalizedSearch],
+  );
+  const total = Number(countResult.rows[0]?.total || 0);
+
   const result = await db.query(
     `
+      WITH paged_docs AS (
+        SELECT h.doc_no
+        FROM ada.pending_receipt_headers h
+        WHERE ${branchWhere} AND ${searchWhere}
+        ORDER BY h.doc_date DESC, h.doc_time DESC, h.doc_no DESC
+        LIMIT $3 OFFSET $4
+      )
       SELECT
         h.doc_no, h.branch_code, h.doc_type, h.doc_date, h.doc_time,
         h.supplier_code, h.supplier_name, h.ref_ext, h.ref_ext_date,
@@ -306,28 +343,72 @@ async function getPendingReceipts(db, branchCode = null) {
         l.unit_code, l.unit_name, l.factor, l.qty, l.qty_base, l.stock_factor,
         l.set_price, l.net, l.vat AS line_vat, l.cost_in, l.lot_no, l.expired_date,
         l.warehouse_code AS line_warehouse_code
-      FROM ada.pending_receipt_headers h
-      LEFT JOIN ada.pending_receipt_lines l
-        ON l.doc_no = h.doc_no
-      WHERE ($1::text IS NULL OR (
-        h.branch_code = $1
-        OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
-      ))
-      ORDER BY h.doc_date DESC, h.doc_time DESC, l.seq_no ASC
+      FROM paged_docs d
+      JOIN ada.pending_receipt_headers h ON h.doc_no = d.doc_no
+      LEFT JOIN ada.pending_receipt_lines l ON l.doc_no = h.doc_no
+      ORDER BY h.doc_date DESC, h.doc_time DESC, h.doc_no DESC, l.seq_no ASC
     `,
-    params,
+    [branchCode, normalizedSearch, safePageSize, offset],
   );
 
-  return groupReceiptRows(result.rows, {
-    includeStaPrcDoc: false,
-    lineWarehouseField: "line_warehouse_code",
-    lineVatField: "line_vat",
-  });
+  return {
+    records: groupReceiptRows(result.rows, {
+      includeStaPrcDoc: false,
+      lineWarehouseField: "line_warehouse_code",
+      lineVatField: "line_vat",
+    }),
+    pagination: {
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / safePageSize)),
+    },
+  };
 }
 
-async function getApprovedReceipts(db, branchCode, date = null) {
+async function getApprovedReceipts(db, { branchCode, date = null, search = "", sort = "desc", page = 1, pageSize = 10 } = {}) {
+  const normalizedSearch = String(search || "").trim().toLowerCase() || null;
+  const normalizedSort = String(sort || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+  const safePage = Math.max(1, Number(page) || 1);
+  const safePageSize = Math.min(100, Math.max(1, Number(pageSize) || 10));
+  const offset = (safePage - 1) * safePageSize;
+
+  const branchWhere = `(
+    h.branch_code = $1
+    OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
+  )`;
+  const dateWhere = `($2::text IS NULL OR CAST(h.doc_date AS DATE) = $2::date)`;
+  const searchWhere = `($3::text IS NULL
+    OR LOWER(COALESCE(h.doc_no, '')) LIKE '%' || $3 || '%'
+    OR LOWER(COALESCE(h.supplier_name, '')) LIKE '%' || $3 || '%'
+    OR LOWER(COALESCE(h.supplier_code, '')) LIKE '%' || $3 || '%'
+    OR LOWER(COALESCE(h.ref_ext, '')) LIKE '%' || $3 || '%'
+    OR EXISTS (
+      SELECT 1 FROM ada.approved_receipt_lines lx
+      WHERE lx.doc_no = h.doc_no
+        AND (
+          LOWER(COALESCE(lx.product_code, '')) LIKE '%' || $3 || '%'
+          OR LOWER(COALESCE(lx.product_name, '')) LIKE '%' || $3 || '%'
+          OR LOWER(COALESCE(lx.barcode, '')) LIKE '%' || $3 || '%'
+        )
+    )
+  )`;
+
+  const countResult = await db.query(
+    `SELECT COUNT(*)::int AS total FROM ada.approved_receipt_headers h WHERE ${branchWhere} AND ${dateWhere} AND ${searchWhere}`,
+    [branchCode, date, normalizedSearch],
+  );
+  const total = Number(countResult.rows[0]?.total || 0);
+
   const result = await db.query(
     `
+      WITH paged_docs AS (
+        SELECT h.doc_no
+        FROM ada.approved_receipt_headers h
+        WHERE ${branchWhere} AND ${dateWhere} AND ${searchWhere}
+        ORDER BY h.doc_date ${normalizedSort}, h.doc_time ${normalizedSort}, h.doc_no ${normalizedSort}
+        LIMIT $4 OFFSET $5
+      )
       SELECT
         h.doc_no, h.branch_code, h.doc_type, h.doc_date, h.doc_time,
         h.supplier_code, h.supplier_name, h.ref_ext, h.ref_ext_date,
@@ -337,24 +418,27 @@ async function getApprovedReceipts(db, branchCode, date = null) {
         l.unit_code, l.unit_name, l.factor, l.qty, l.qty_base, l.stock_factor,
         l.set_price, l.net, l.vat AS line_vat, l.cost_in, l.lot_no, l.expired_date,
         l.warehouse_code AS line_warehouse_code
-      FROM ada.approved_receipt_headers h
-      LEFT JOIN ada.approved_receipt_lines l
-        ON l.doc_no = h.doc_no
-      WHERE (
-        h.branch_code = $1
-        OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
-      )
-        AND ($2::text IS NULL OR CAST(h.doc_date AS DATE) = $2::date)
-      ORDER BY h.doc_date DESC, h.doc_time DESC, l.seq_no ASC
+      FROM paged_docs d
+      JOIN ada.approved_receipt_headers h ON h.doc_no = d.doc_no
+      LEFT JOIN ada.approved_receipt_lines l ON l.doc_no = h.doc_no
+      ORDER BY h.doc_date ${normalizedSort}, h.doc_time ${normalizedSort}, h.doc_no ${normalizedSort}, l.seq_no ASC
     `,
-    [branchCode, date],
+    [branchCode, date, normalizedSearch, safePageSize, offset],
   );
 
-  return groupReceiptRows(result.rows, {
-    includeStaPrcDoc: true,
-    lineWarehouseField: "line_warehouse_code",
-    lineVatField: "line_vat",
-  });
+  return {
+    records: groupReceiptRows(result.rows, {
+      includeStaPrcDoc: true,
+      lineWarehouseField: "line_warehouse_code",
+      lineVatField: "line_vat",
+    }),
+    pagination: {
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / safePageSize)),
+    },
+  };
 }
 
 function createOrderingRouter(deps) {
@@ -694,7 +778,13 @@ function createOrderingRouter(deps) {
 
   router.get("/admin/pending-receipts", requireAuthMiddleware, async (req, res, next) => {
     try {
-      return res.json({ records: await getPendingReceipts(db, req.query.branchCode || null) });
+      const result = await getPendingReceipts(db, {
+        branchCode: req.query.branchCode || null,
+        search: req.query.search || "",
+        page: req.query.page,
+        pageSize: req.query.pageSize,
+      });
+      return res.json(result);
     } catch (error) {
       return next(error);
     }
@@ -707,10 +797,15 @@ function createOrderingRouter(deps) {
     }
 
     try {
-      return res.json({
-        ok: true,
-        records: await getApprovedReceipts(db, branchCode, req.query.date ? String(req.query.date) : null),
+      const result = await getApprovedReceipts(db, {
+        branchCode,
+        date: req.query.date ? String(req.query.date) : null,
+        search: req.query.search || "",
+        sort: req.query.sort || "desc",
+        page: req.query.page,
+        pageSize: req.query.pageSize,
       });
+      return res.json({ ok: true, ...result });
     } catch (error) {
       return next(error);
     }
