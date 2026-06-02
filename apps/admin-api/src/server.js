@@ -27,6 +27,7 @@ const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
 const { createReviewQueueRouter } = require("./routes/review-queue");
+const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
   const existing = String(res.getHeader("Vary") || "")
@@ -96,6 +97,8 @@ function createApp(overrides = {}) {
     overrides.runRuleApplication || require("../../../scripts/apply_enrichment_rules").runRuleApplication;
   const searchEmbeddingProvider = overrides.searchEmbeddingProvider || null;
   const searchEmbeddingSyncJobRunner = overrides.searchEmbeddingSyncJobRunner || null;
+  const crmMirrorClient =
+    overrides.crmMirrorClient || createCrmMirrorClient(config, overrides.fetchImpl || global.fetch);
 
   const requireAuthMiddleware = requireAuth(config);
   const loginRateLimitMiddleware =
@@ -227,6 +230,7 @@ function createApp(overrides = {}) {
     createAdaSyncRouter({
       config,
       db,
+      crmMirrorClient,
     }),
   );
   app.use(

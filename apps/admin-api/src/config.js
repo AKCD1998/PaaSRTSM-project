@@ -121,6 +121,8 @@ function loadConfig(env = process.env) {
     adminPasswordHash: env.ADMIN_PASSWORD_HASH || "",
     staffPasswordHash: env.STAFF_PASSWORD_HASH || "",
     posApiKeys: parseCsvSet(env.POS_API_KEYS || ""),
+    crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
+    crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",
   };
 }
 

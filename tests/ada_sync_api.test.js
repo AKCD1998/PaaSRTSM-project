@@ -39,6 +39,8 @@ function createAdaMockDb() {
     branches: new Map(),
     products: new Map(),
     productBarcodes: new Map(),
+    salesHeaders: new Map(),
+    salesLines: new Map(),
     transferHeaders: new Map(),
     transferLines: new Map(),
     syncRuns: [],
@@ -59,6 +61,10 @@ function createAdaMockDb() {
 
       if (normalized === "begin" || normalized === "commit" || normalized === "rollback") {
         state.txLog.push(normalized);
+        return { rowCount: 0, rows: [] };
+      }
+
+      if (normalized === "select * from ada.refresh_foundations()") {
         return { rowCount: 0, rows: [] };
       }
 
@@ -142,6 +148,43 @@ function createAdaMockDb() {
         return { rowCount: 1, rows: [] };
       }
 
+      if (normalized.startsWith("insert into ada.sales_headers")) {
+        state.salesHeaders.set(`${params[0]}|${params[1]}`, {
+          branch_code: params[0],
+          doc_no: params[1],
+          doc_date: params[2],
+          doc_time: params[3],
+          customer_code: params[4],
+          paid_status: params[5],
+          grand_amount: params[6],
+          net_amount: params[7],
+          vat_amount: params[8],
+          cashier_code: params[9],
+          terminal_code: params[10],
+          reference_doc_no: params[11],
+          source_synced_at: params[14],
+          raw_payload: JSON.parse(params[15]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.sales_lines")) {
+        state.salesLines.set(`${params[0]}|${params[1]}|${params[2]}|${params[3]}`, {
+          branch_code: params[0],
+          doc_no: params[1],
+          line_no: params[2],
+          product_code: params[3],
+          barcode: params[4],
+          qty: params[5],
+          qty_base: params[10],
+          stock_factor: params[9],
+          net_amount: params[8],
+          source_synced_at: params[15],
+          raw_payload: JSON.parse(params[16]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
       if (normalized.startsWith("insert into ada.transfer_lines")) {
         state.transferLines.set(`${params[0]}|${params[1]}|${params[2]}|${params[3]}|${params[4]}`, {
           doc_no: params[0],
@@ -206,14 +249,28 @@ function createAdaMockDb() {
 
 function createTestApp(configOverrides = {}) {
   const db = createAdaMockDb();
+  const crmMirrorClient = {
+    enabled: true,
+    sales: [],
+    refunds: [],
+    async mirrorSales(records) {
+      this.sales.push(...records);
+      return { ok: true };
+    },
+    async mirrorRefunds(records) {
+      this.refunds.push(...records);
+      return { ok: true };
+    },
+  };
   const { app } = createApp({
     config: buildConfig(configOverrides),
     db,
+    crmMirrorClient,
     runImporter: async () => ({}),
     runExcelPriceImporter: async () => ({}),
     runRuleApplication: async () => ({}),
   });
-  return { app, db };
+  return { app, db, crmMirrorClient };
 }
 
 test("ADA sync routes enforce API key and allow valid requests", async () => {
@@ -460,6 +517,70 @@ test("ADA transfers route accepts the real mother-PC camelCase payload shape", a
   assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").qty_base, 2);
   assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").stock_factor, 1);
   assert.equal(db.state.transferLines.get("TRF-002|7|001|1|630010001").warehouse_code, "WH-A");
+});
+
+test("ADA sales route mirrors committed sale and refund documents to the CRM backend", async () => {
+  const { app, crmMirrorClient } = createTestApp();
+
+  const response = await request(app)
+    .post("/api/sync/ada/sales")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSystem: "AdaAcc",
+      sourceSyncedAt: "2026-06-02T13:30:00.000Z",
+      headers: [
+        {
+          FTBchCode: "005",
+          FTShdDocNo: "S2606005002-0001688",
+          FTShdDocType: "1",
+          FDShdDocDate: "2026-06-02",
+          FTShdDocTime: "13:24:32",
+          FTUsrCode: "dao1",
+          FTPosCode: "002",
+          FCShdTotal: 775,
+          FCShdGrand: 775,
+          FCShdPaid: 775,
+          FTCstCode: "0",
+        },
+        {
+          FTBchCode: "005",
+          FTShdDocNo: "R2606005002-0000009",
+          FTShdDocType: "9",
+          FDShdDocDate: "2026-06-02",
+          FTShdDocTime: "13:40:00",
+          FTUsrCode: "dao1",
+          FTPosCode: "002",
+          FCShdGrand: 550,
+          FTShdPosCN: "S2606005002-0001588",
+          FTCstCode: "0",
+        },
+      ],
+      lines: [
+        {
+          FTBchCode: "005",
+          FTShdDocNo: "S2606005002-0001688",
+          FNSdtSeqNo: 1,
+          FTPdtCode: "IC-001572",
+          FCSdtQty: 1,
+          FCSdtNet: 775,
+        },
+        {
+          FTBchCode: "005",
+          FTShdDocNo: "R2606005002-0000009",
+          FNSdtSeqNo: 1,
+          FTPdtCode: "IC-001572",
+          FCSdtQty: 1,
+          FCSdtNet: 550,
+        },
+      ],
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(crmMirrorClient.sales.length, 1);
+  assert.equal(crmMirrorClient.refunds.length, 1);
+  assert.equal(crmMirrorClient.sales[0].doc_no, "S2606005002-0001688");
+  assert.equal(crmMirrorClient.refunds[0].refund_doc_no, "R2606005002-0000009");
+  assert.equal(crmMirrorClient.refunds[0].original_doc_no, "S2606005002-0001588");
 });
 
 test("ADA run-log route records sync runs and writes sync_errors for failed runs", async () => {

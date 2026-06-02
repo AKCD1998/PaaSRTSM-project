@@ -124,6 +124,84 @@ function getRawPayload(record) {
   return JSON.stringify(record?.__rawPayload || record || {});
 }
 
+function buildMirrorEventKey(kind, branchCode, docNo) {
+  return `${kind}:${normalizeText(branchCode || "").toUpperCase()}:${normalizeText(docNo || "").toUpperCase()}`;
+}
+
+function groupSalesLinesByDoc(lines) {
+  const grouped = new Map();
+  for (const line of lines || []) {
+    const branchCode = normalizeText(pick(line, ["FTBchCode", "branchCode"]));
+    const docNo = normalizeText(pick(line, ["FTShdDocNo", "docNo"]));
+    const key = `${branchCode}|${docNo}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(line);
+  }
+  return grouped;
+}
+
+function buildMirroredSalesPayload(body) {
+  const headers = Array.isArray(body?.headers) ? body.headers : [];
+  const lines = Array.isArray(body?.lines) ? body.lines : [];
+  const groupedLines = groupSalesLinesByDoc(lines);
+  const sales = [];
+  const refunds = [];
+
+  for (const header of headers) {
+    const branchCode = normalizeText(pick(header, ["FTBchCode", "branchCode"])).toUpperCase();
+    const docNo = normalizeText(pick(header, ["FTShdDocNo", "docNo"])).toUpperCase();
+    const docType = normalizeText(pick(header, ["FTShdDocType", "docType"]));
+    const key = `${branchCode}|${docNo}`;
+    const shared = {
+      source_system: getSourceSystem(body),
+      branch_code: branchCode,
+      pos_code: normalizeNullableText(pick(header, ["FTPosCode", "posCode"])),
+      doc_no: docNo,
+      doc_type: docType,
+      doc_date: parseDate(pick(header, ["FDShdDocDate", "docDate"])),
+      doc_time: normalizeNullableText(pick(header, ["FTShdDocTime", "docTime"])),
+      cashier_code: normalizeNullableText(pick(header, ["FTUsrCode", "cashierCode"])),
+      customer_code: normalizeNullableText(pick(header, ["FTCstCode", "customerCode"])),
+      sale_grand_total: toNumber(pick(header, ["FCShdGrand", "saleGrandTotal"]), 0),
+      source_synced_at: getSourceSyncedAt(body),
+      tender_rows: Array.isArray(header.tender_rows) ? header.tender_rows : [],
+      line_rows: (groupedLines.get(key) || []).map((line) => ({
+        line_no: toNumber(pick(line, ["FNSdtSeqNo", "lineNo", "seqNo"]), 0),
+        product_code: normalizeNullableText(pick(line, ["FTPdtCode", "productCode"])),
+        barcode: normalizeNullableText(pick(line, ["FTSdtBarCode", "barcode"])),
+        qty: toNumber(pick(line, ["FCSdtQty", "qty"]), 0),
+        unit_code: normalizeNullableText(pick(line, ["FTPunCode", "unitCode"])),
+        unit_name: normalizeNullableText(pick(line, ["FTSdtUnitName", "unitName"])),
+        net_amount: toNumber(pick(line, ["FCSdtNet", "netAmount"]), 0),
+        discount_amount: toNumber(pick(line, ["FCSdtDis", "discountAmount"]), 0),
+        lot_no: normalizeNullableText(pick(line, ["FTSdtLotNo", "lotNo"])),
+        expiry_date: parseDate(pick(line, ["FDSdtExpired", "expiryDate"])),
+      })),
+      raw_payload: header,
+    };
+
+    if (docType === "9") {
+      refunds.push({
+        ...shared,
+        refund_doc_no: docNo,
+        original_doc_no: normalizeText(pick(header, ["FTShdPosCN", "originalDocNo"])).toUpperCase(),
+        refund_total: toNumber(pick(header, ["FCShdGrand", "refundTotal"]), 0),
+        source_event_key: buildMirrorEventKey("refund", branchCode, docNo),
+      });
+    } else if (docType === "1") {
+      sales.push({
+        ...shared,
+        paid_total: toNumber(pick(header, ["FCShdPaid", "FCShdGrand", "paidTotal"]), 0),
+        gross_total: toNumber(pick(header, ["FCShdTotal", "grossTotal"]), 0),
+        net_total: toNumber(pick(header, ["FCShdGrand", "netTotal"]), 0),
+        source_event_key: buildMirrorEventKey("sale", branchCode, docNo),
+      });
+    }
+  }
+
+  return { sales, refunds };
+}
+
 function buildStockSnapshotKey(snapshotAt, branchCode, warehouseCode, productCode, lotNo, expiryDate) {
   return [
     snapshotAt || "",
@@ -1326,7 +1404,7 @@ async function insertRunLog(db, body) {
 }
 
 function createAdaSyncRouter(deps) {
-  const { config, db } = deps;
+  const { config, db, crmMirrorClient } = deps;
   const router = express.Router();
 
   router.use((req, res, next) => {
@@ -1406,6 +1484,15 @@ function createAdaSyncRouter(deps) {
         await upsertSalesLine(client, req.body, record);
       }
       await client.query("COMMIT");
+      const { sales, refunds } = buildMirroredSalesPayload(req.body);
+      if (crmMirrorClient?.enabled) {
+        if (sales.length > 0) {
+          await crmMirrorClient.mirrorSales(sales);
+        }
+        if (refunds.length > 0) {
+          await crmMirrorClient.mirrorRefunds(refunds);
+        }
+      }
       return res.json({ acceptedHeaders: req.body.headers.length, acceptedLines: req.body.lines.length });
     } catch (e) {
       await client.query("ROLLBACK");
