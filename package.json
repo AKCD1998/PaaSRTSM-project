@@ -26,6 +26,7 @@
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
     "csv-parse": "^5.5.6",
+    "expo": "^56.0.8",
     "express": "^4.21.2",
     "iconv-lite": "^0.6.3",
     "jsonwebtoken": "^9.0.2",
