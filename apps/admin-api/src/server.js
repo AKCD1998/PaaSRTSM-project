@@ -21,6 +21,7 @@ const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
 const { createSearchRouter } = require("./routes/search");
 const { createLoyaltyRouter } = require("./routes/loyalty");
+const { createMembersRouter } = require("./routes/members");
 const { createOrderingRouter } = require("./routes/ordering");
 const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
@@ -169,6 +170,13 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/members",
+    createMembersRouter({
+      config,
+      db,
     }),
   );
   app.use(

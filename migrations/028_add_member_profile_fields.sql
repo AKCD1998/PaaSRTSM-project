@@ -1,0 +1,8 @@
+BEGIN;
+
+ALTER TABLE public.members
+  ADD COLUMN IF NOT EXISTS sex text,
+  ADD COLUMN IF NOT EXISTS dob date,
+  ADD COLUMN IF NOT EXISTS remark text;
+
+COMMIT;
