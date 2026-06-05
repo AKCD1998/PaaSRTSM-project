@@ -2,6 +2,14 @@
 
 const express = require("express");
 
+const PRODUCT_MOVEMENT_TYPES = new Set([
+  "transfer_in",
+  "transfer_out",
+  "supplier_receipt",
+  "sales_summary",
+]);
+const PRODUCT_MOVEMENT_TRACE_LIMIT = 200;
+
 function parsePositiveNumber(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
@@ -130,6 +138,497 @@ function groupReceiptRows(rows, options = {}) {
   }
 
   return [...grouped.values()];
+}
+
+function normalizeProductCodeList(values) {
+  const input = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const productCodes = [];
+  const duplicateCodes = [];
+  const skippedValues = [];
+
+  for (const value of input) {
+    const code = String(value || "").trim();
+    if (!code || code.toUpperCase() === "#N/A") {
+      if (code) skippedValues.push(code);
+      continue;
+    }
+
+    if (seen.has(code)) {
+      duplicateCodes.push(code);
+      continue;
+    }
+
+    seen.add(code);
+    productCodes.push(code);
+  }
+
+  return { productCodes, duplicateCodes, skippedValues };
+}
+
+function normalizeIdList(values) {
+  if (!Array.isArray(values)) return [];
+  const seen = new Set();
+  return values
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .filter((value) => {
+      if (seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+}
+
+function normalizeTextList(values) {
+  if (!Array.isArray(values)) return [];
+  const seen = new Set();
+  return values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function normalizeMovementTypes(values) {
+  if (!Array.isArray(values) || values.length === 0 || values.includes("all")) {
+    return [...PRODUCT_MOVEMENT_TYPES];
+  }
+
+  const types = normalizeTextList(values).filter((value) => PRODUCT_MOVEMENT_TYPES.has(value));
+  return types.length ? types : [...PRODUCT_MOVEMENT_TYPES];
+}
+
+function isIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+}
+
+function normalizeTraceRequestBody(body) {
+  const source = body || {};
+  const productCodeNormalization = normalizeProductCodeList(source.product_codes || source.productCodes || []);
+  const dateFrom = String(source.date_from || source.dateFrom || "").trim();
+  const dateTo = String(source.date_to || source.dateTo || "").trim();
+
+  if (dateFrom && !isIsoDate(dateFrom)) {
+    throw Object.assign(new Error("date_from must be YYYY-MM-DD."), { statusCode: 400 });
+  }
+
+  if (dateTo && !isIsoDate(dateTo)) {
+    throw Object.assign(new Error("date_to must be YYYY-MM-DD."), { statusCode: 400 });
+  }
+
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    throw Object.assign(new Error("date_from must be before or equal to date_to."), { statusCode: 400 });
+  }
+
+  return {
+    productCodes: productCodeNormalization.productCodes,
+    duplicateCodes: productCodeNormalization.duplicateCodes,
+    skippedValues: productCodeNormalization.skippedValues,
+    savedGroupIds: normalizeIdList(source.saved_group_ids || source.savedGroupIds || []),
+    categoryNames: normalizeTextList(source.category_names || source.categoryNames || source.category_ids || source.categoryIds || []),
+    brandNames: normalizeTextList(source.brand_names || source.brandNames || source.brand_ids || source.brandIds || []),
+    branchCode: String(source.branch_code || source.branchCode || "").trim() || null,
+    dateFrom: dateFrom || null,
+    dateTo: dateTo || null,
+    movementTypes: normalizeMovementTypes(source.movement_types || source.movementTypes || []),
+  };
+}
+
+function buildMovementWarnings({ duplicateCodes = [], skippedValues = [] } = {}) {
+  const warnings = ["Sales data is summary only, not bill-level transaction data."];
+  if (duplicateCodes.length) {
+    warnings.push(`Duplicate product codes were searched once: ${duplicateCodes.join(", ")}`);
+  }
+  if (skippedValues.length) {
+    warnings.push(`Ignored invalid pasted values: ${skippedValues.join(", ")}`);
+  }
+  return warnings;
+}
+
+function toNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function toDateKey(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.slice(0, 10);
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+async function loadProductMovementGroups(db) {
+  const result = await db.query(
+    `
+      SELECT
+        g.group_id,
+        g.group_name,
+        g.description,
+        g.created_by,
+        g.created_at,
+        g.updated_at,
+        COALESCE(
+          json_agg(i.product_code ORDER BY i.product_code) FILTER (WHERE i.product_code IS NOT NULL),
+          '[]'::json
+        ) AS product_codes
+      FROM admin.product_movement_groups g
+      LEFT JOIN admin.product_movement_group_items i
+        ON i.group_id = g.group_id
+      GROUP BY g.group_id
+      ORDER BY g.group_name ASC
+    `,
+  );
+
+  return result.rows.map((row) => ({
+    id: Number(row.group_id),
+    name: row.group_name,
+    description: row.description || "",
+    createdBy: row.created_by || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    productCodes: Array.isArray(row.product_codes) ? row.product_codes : [],
+  }));
+}
+
+async function saveProductMovementGroup(db, { groupId = null, name, description = "", productCodes = [], actor = "" }) {
+  const groupName = String(name || "").trim();
+  if (!groupName) {
+    throw Object.assign(new Error("group name is required."), { statusCode: 400 });
+  }
+
+  const normalized = normalizeProductCodeList(productCodes).productCodes;
+  if (!normalized.length) {
+    throw Object.assign(new Error("at least one product code is required."), { statusCode: 400 });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const groupResult = groupId
+      ? await client.query(
+          `
+            UPDATE admin.product_movement_groups
+            SET group_name = $2,
+                description = $3,
+                updated_at = now()
+            WHERE group_id = $1
+            RETURNING group_id
+          `,
+          [groupId, groupName, description || null],
+        )
+      : await client.query(
+          `
+            INSERT INTO admin.product_movement_groups (group_name, description, created_by)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (group_name) DO UPDATE
+            SET description = EXCLUDED.description,
+                updated_at = now()
+            RETURNING group_id
+          `,
+          [groupName, description || null, actor || null],
+        );
+
+    if (!groupResult.rowCount) {
+      throw Object.assign(new Error("product movement group not found."), { statusCode: 404 });
+    }
+
+    const savedGroupId = Number(groupResult.rows[0].group_id);
+    await client.query("DELETE FROM admin.product_movement_group_items WHERE group_id = $1", [savedGroupId]);
+    await client.query(
+      `
+        INSERT INTO admin.product_movement_group_items (group_id, product_code)
+        SELECT $1::bigint, unnest($2::text[])
+        ON CONFLICT DO NOTHING
+      `,
+      [savedGroupId, normalized],
+    );
+    await client.query("COMMIT");
+    return savedGroupId;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function resolveProductMovementScope(db, request) {
+  const codeSet = new Set(request.productCodes);
+
+  if (request.savedGroupIds.length) {
+    const result = await db.query(
+      `
+        SELECT DISTINCT product_code
+        FROM admin.product_movement_group_items
+        WHERE group_id = ANY($1::bigint[])
+        ORDER BY product_code
+      `,
+      [request.savedGroupIds],
+    );
+    result.rows.forEach((row) => codeSet.add(row.product_code));
+  }
+
+  if (request.categoryNames.length || request.brandNames.length) {
+    const params = [request.categoryNames, request.brandNames];
+    const result = await db.query(
+      `
+        SELECT DISTINCT s.company_code AS product_code
+        FROM public.skus s
+        LEFT JOIN public.items i
+          ON i.item_id = s.item_id
+        LEFT JOIN ada.product_category_states pcs
+          ON pcs.product_code = s.company_code
+        WHERE s.company_code IS NOT NULL
+          AND (
+            cardinality($1::text[]) = 0
+            OR COALESCE(pcs.category_name, s.category_name, i.category_name, '') = ANY($1::text[])
+          )
+          AND (
+            cardinality($2::text[]) = 0
+            OR COALESCE(s.supplier_code, i.supplier_code, '') = ANY($2::text[])
+          )
+        ORDER BY s.company_code
+      `,
+      params,
+    );
+    result.rows.forEach((row) => codeSet.add(row.product_code));
+  }
+
+  const productCodes = [...codeSet].slice(0, PRODUCT_MOVEMENT_TRACE_LIMIT);
+  return {
+    productCodes,
+    truncated: codeSet.size > PRODUCT_MOVEMENT_TRACE_LIMIT,
+    totalRequestedProducts: codeSet.size,
+  };
+}
+
+async function loadProductMovementMeta(db, productCodes) {
+  if (!productCodes.length) return new Map();
+  const result = await db.query(
+    `
+      SELECT
+        codes.product_code,
+        COALESCE(s.display_name, i.display_name, i.generic_name, p.product_name, codes.product_code) AS product_name,
+        COALESCE(b.barcode, pb.barcode, '') AS barcode,
+        COALESCE(s.uom, '') AS unit,
+        COALESCE(pcs.category_name, s.category_name, i.category_name, p.category_name, '') AS category_name,
+        COALESCE(s.supplier_code, i.supplier_code, p.supplier_code, '') AS supplier_code
+      FROM unnest($1::text[]) WITH ORDINALITY AS codes(product_code, ord)
+      LEFT JOIN public.skus s
+        ON s.company_code = codes.product_code
+      LEFT JOIN public.items i
+        ON i.item_id = s.item_id
+      LEFT JOIN ada.products p
+        ON p.product_code = codes.product_code
+      LEFT JOIN ada.product_category_states pcs
+        ON pcs.product_code = codes.product_code
+      LEFT JOIN LATERAL (
+        SELECT barcode
+        FROM public.barcodes
+        WHERE sku_id = s.sku_id
+        ORDER BY is_primary DESC, updated_at DESC NULLS LAST, barcode ASC
+        LIMIT 1
+      ) b ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT barcode
+        FROM ada.product_barcodes
+        WHERE product_code = codes.product_code
+        ORDER BY source_synced_at DESC NULLS LAST, barcode ASC
+        LIMIT 1
+      ) pb ON TRUE
+      ORDER BY codes.ord
+    `,
+    [productCodes],
+  );
+
+  return new Map(result.rows.map((row) => [row.product_code, row]));
+}
+
+async function loadTransferMovements(db, { productCodes, branchCode, dateFrom, dateTo }) {
+  if (!productCodes.length) return [];
+  const result = await db.query(
+    `
+      SELECT
+        l.product_code,
+        h.doc_date,
+        h.doc_time,
+        h.doc_no,
+        h.doc_type,
+        h.branch_code AS from_branch,
+        h.branch_code_to AS to_branch,
+        COALESCE(l.qty_base, l.qty, 0) AS qty
+      FROM ada.transfer_lines l
+      JOIN ada.transfer_headers h
+        ON h.doc_no = l.doc_no
+       AND h.doc_type = l.doc_type
+       AND h.branch_code = l.branch_code
+      WHERE l.product_code = ANY($1::text[])
+        AND ($2::text IS NULL OR h.branch_code = $2 OR h.branch_code_to = $2)
+        AND ($3::date IS NULL OR h.doc_date >= $3::date)
+        AND ($4::date IS NULL OR h.doc_date <= $4::date)
+      ORDER BY h.doc_date DESC NULLS LAST, h.doc_time DESC NULLS LAST, h.doc_no DESC, l.line_no ASC
+    `,
+    [productCodes, branchCode, dateFrom, dateTo],
+  );
+
+  return result.rows.map((row) => {
+    const isOut = branchCode && row.from_branch === branchCode;
+    return {
+      product_code: row.product_code,
+      date: toDateKey(row.doc_date),
+      type: isOut ? "transfer_out" : "transfer_in",
+      from_branch: row.from_branch || "",
+      to_branch: row.to_branch || "",
+      document_no: row.doc_no,
+      qty: toNumber(row.qty),
+      unit_cost: null,
+      source: "ada.transfer",
+    };
+  });
+}
+
+async function loadSupplierReceiptMovements(db, { productCodes, branchCode, dateFrom, dateTo }) {
+  if (!productCodes.length) return [];
+  const result = await db.query(
+    `
+      SELECT
+        l.product_code,
+        h.doc_date,
+        h.doc_time,
+        h.doc_no,
+        h.branch_code,
+        h.supplier_code,
+        h.supplier_name,
+        COALESCE(l.qty_base, l.qty, 0) AS qty,
+        l.cost_in
+      FROM ada.approved_receipt_lines l
+      JOIN ada.approved_receipt_headers h
+        ON h.doc_no = l.doc_no
+      WHERE l.product_code = ANY($1::text[])
+        AND ($2::text IS NULL OR h.branch_code = $2)
+        AND ($3::date IS NULL OR h.doc_date >= $3::date)
+        AND ($4::date IS NULL OR h.doc_date <= $4::date)
+      ORDER BY h.doc_date DESC NULLS LAST, h.doc_time DESC NULLS LAST, h.doc_no DESC, l.seq_no ASC
+    `,
+    [productCodes, branchCode, dateFrom, dateTo],
+  );
+
+  return result.rows.map((row) => ({
+    product_code: row.product_code,
+    date: toDateKey(row.doc_date),
+    type: "supplier_receipt",
+    from_branch: row.supplier_name || row.supplier_code || "Supplier",
+    to_branch: row.branch_code || "",
+    document_no: row.doc_no,
+    qty: toNumber(row.qty),
+    unit_cost: row.cost_in == null ? null : toNumber(row.cost_in),
+    source: "ada.approved_receipt",
+  }));
+}
+
+async function loadSalesSummaries(db, { productCodes, branchCode, dateFrom, dateTo }) {
+  if (!productCodes.length) return [];
+  const result = await db.query(
+    `
+      SELECT
+        product_code,
+        branch_code,
+        period_start,
+        period_end,
+        SUM(sold_qty_base) AS sold_qty_base,
+        CASE
+          WHEN SUM(period_days) > 0 THEN SUM(sold_qty_base) / SUM(period_days)
+          ELSE 0
+        END AS avg_daily_usage
+      FROM analytics.product_sales_summary_periods
+      WHERE product_code = ANY($1::text[])
+        AND ($2::text IS NULL OR branch_code = $2)
+        AND ($3::date IS NULL OR period_end >= $3::date)
+        AND ($4::date IS NULL OR period_start <= $4::date)
+      GROUP BY product_code, branch_code, period_start, period_end
+      ORDER BY period_end DESC, period_start DESC, branch_code ASC
+    `,
+    [productCodes, branchCode, dateFrom, dateTo],
+  );
+
+  return result.rows.map((row) => ({
+    product_code: row.product_code,
+    date_from: toDateKey(row.period_start),
+    date_to: toDateKey(row.period_end),
+    branch_code: row.branch_code || "",
+    sold_qty_base: toNumber(row.sold_qty_base),
+    avg_daily_usage: toNumber(row.avg_daily_usage),
+  }));
+}
+
+function buildProductMovementTraceResponse({ productCodes, metaMap, movements, salesSummaries, movementTypes, warnings }) {
+  const movementsByProduct = new Map();
+  const salesByProduct = new Map();
+  for (const code of productCodes) {
+    movementsByProduct.set(code, []);
+    salesByProduct.set(code, []);
+  }
+
+  movements
+    .filter((movement) => movementTypes.includes(movement.type))
+    .forEach((movement) => {
+      if (!movementsByProduct.has(movement.product_code)) return;
+      movementsByProduct.get(movement.product_code).push(movement);
+    });
+
+  if (movementTypes.includes("sales_summary")) {
+    salesSummaries.forEach((item) => {
+      if (!salesByProduct.has(item.product_code)) return;
+      salesByProduct.get(item.product_code).push(item);
+    });
+  }
+
+  const products = productCodes.map((productCode) => {
+    const meta = metaMap.get(productCode) || {};
+    const productMovements = movementsByProduct.get(productCode) || [];
+    const productSales = salesByProduct.get(productCode) || [];
+    const summary = {
+      transfer_in_qty: 0,
+      transfer_out_qty: 0,
+      supplier_receipt_qty: 0,
+      sold_qty_base: 0,
+      net_movement_qty: 0,
+    };
+
+    productMovements.forEach((movement) => {
+      if (movement.type === "transfer_in") summary.transfer_in_qty += movement.qty;
+      if (movement.type === "transfer_out") summary.transfer_out_qty += movement.qty;
+      if (movement.type === "supplier_receipt") summary.supplier_receipt_qty += movement.qty;
+    });
+    productSales.forEach((item) => {
+      summary.sold_qty_base += item.sold_qty_base;
+    });
+    summary.net_movement_qty =
+      summary.transfer_in_qty + summary.supplier_receipt_qty - summary.transfer_out_qty - summary.sold_qty_base;
+
+    const lastMovementDate = [
+      ...productMovements.map((movement) => movement.date),
+      ...productSales.map((item) => item.date_to),
+    ].filter(Boolean).sort().pop() || null;
+
+    return {
+      product_code: productCode,
+      product_name: meta.product_name || productCode,
+      barcode: meta.barcode || "",
+      unit: meta.unit || "",
+      category_name: meta.category_name || "",
+      supplier_code: meta.supplier_code || "",
+      summary,
+      last_movement_date: lastMovementDate,
+      movements: productMovements.map(({ product_code: _code, ...movement }) => movement),
+      sales_summary: productSales.map(({ product_code: _code, ...item }) => item),
+    };
+  });
+
+  return { products, warnings };
 }
 
 function validateOrderRequestBody(body) {
@@ -442,7 +941,7 @@ async function getApprovedReceipts(db, { branchCode, date = null, search = "", s
 }
 
 function createOrderingRouter(deps) {
-  const { config, db, requireAuthMiddleware } = deps;
+  const { config, db, requireAuthMiddleware, requireCsrfMiddleware = (_req, _res, next) => next() } = deps;
   const router = express.Router();
 
   router.get("/branches", async (req, res, next) => {
@@ -811,6 +1310,185 @@ function createOrderingRouter(deps) {
     }
   });
 
+  router.get("/admin/product-movement-options", requireAuthMiddleware, async (_req, res, next) => {
+    try {
+      const [categoryResult, brandResult, branchResult] = await Promise.all([
+        db.query(
+          `
+            SELECT category_name, COUNT(*)::int AS product_count
+            FROM (
+              SELECT COALESCE(pcs.category_name, s.category_name, i.category_name) AS category_name
+              FROM public.skus s
+              LEFT JOIN public.items i ON i.item_id = s.item_id
+              LEFT JOIN ada.product_category_states pcs ON pcs.product_code = s.company_code
+              WHERE s.company_code IS NOT NULL
+            ) x
+            WHERE category_name IS NOT NULL AND category_name <> ''
+            GROUP BY category_name
+            ORDER BY category_name ASC
+            LIMIT 500
+          `,
+        ),
+        db.query(
+          `
+            SELECT supplier_code, COUNT(*)::int AS product_count
+            FROM (
+              SELECT COALESCE(s.supplier_code, i.supplier_code) AS supplier_code
+              FROM public.skus s
+              LEFT JOIN public.items i ON i.item_id = s.item_id
+              WHERE s.company_code IS NOT NULL
+            ) x
+            WHERE supplier_code IS NOT NULL AND supplier_code <> ''
+            GROUP BY supplier_code
+            ORDER BY supplier_code ASC
+            LIMIT 500
+          `,
+        ),
+        db.query(
+          `
+            SELECT branch_code, branch_name, is_hq
+            FROM core.branches
+            WHERE is_active = TRUE
+            ORDER BY branch_code ASC
+          `,
+        ),
+      ]);
+
+      return res.json({
+        categories: categoryResult.rows.map((row) => ({
+          name: row.category_name,
+          productCount: Number(row.product_count || 0),
+        })),
+        brands: brandResult.rows.map((row) => ({
+          name: row.supplier_code,
+          productCount: Number(row.product_count || 0),
+        })),
+        branches: branchResult.rows.map((row) => ({
+          branchCode: row.branch_code,
+          branchName: row.branch_name,
+          isHq: row.is_hq,
+        })),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.get("/admin/product-movement-groups", requireAuthMiddleware, async (_req, res, next) => {
+    try {
+      return res.json({ groups: await loadProductMovementGroups(db) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post(
+    "/admin/product-movement-groups",
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    async (req, res, next) => {
+      try {
+        const groupId = await saveProductMovementGroup(db, {
+          name: req.body?.name || req.body?.group_name,
+          description: req.body?.description || "",
+          productCodes: req.body?.product_codes || req.body?.productCodes || [],
+          actor: req.auth?.userId || req.auth?.sub || "",
+        });
+        const groups = await loadProductMovementGroups(db);
+        return res.status(201).json({ group: groups.find((group) => group.id === groupId) || null });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.put(
+    "/admin/product-movement-groups/:groupId",
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    async (req, res, next) => {
+      const groupId = parsePositiveInt(req.params.groupId, null);
+      if (groupId == null) {
+        return res.status(400).json({ error: "group id must be a positive integer." });
+      }
+      try {
+        const savedGroupId = await saveProductMovementGroup(db, {
+          groupId,
+          name: req.body?.name || req.body?.group_name,
+          description: req.body?.description || "",
+          productCodes: req.body?.product_codes || req.body?.productCodes || [],
+          actor: req.auth?.userId || req.auth?.sub || "",
+        });
+        const groups = await loadProductMovementGroups(db);
+        return res.json({ group: groups.find((group) => group.id === savedGroupId) || null });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.delete(
+    "/admin/product-movement-groups/:groupId",
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    async (req, res, next) => {
+      const groupId = parsePositiveInt(req.params.groupId, null);
+      if (groupId == null) {
+        return res.status(400).json({ error: "group id must be a positive integer." });
+      }
+      try {
+        const result = await db.query("DELETE FROM admin.product_movement_groups WHERE group_id = $1", [groupId]);
+        if (!result.rowCount) {
+          return res.status(404).json({ error: "product movement group not found." });
+        }
+        return res.json({ ok: true });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post("/admin/product-movement-trace", requireAuthMiddleware, async (req, res, next) => {
+    try {
+      const traceRequest = normalizeTraceRequestBody(req.body || {});
+      const scope = await resolveProductMovementScope(db, traceRequest);
+      const warnings = buildMovementWarnings(traceRequest);
+      if (scope.truncated) {
+        warnings.push(`Product scope was limited to ${PRODUCT_MOVEMENT_TRACE_LIMIT} products.`);
+      }
+
+      if (!scope.productCodes.length) {
+        return res.json({ products: [], warnings });
+      }
+
+      const [metaMap, transferMovements, supplierMovements, salesSummaries] = await Promise.all([
+        loadProductMovementMeta(db, scope.productCodes),
+        traceRequest.movementTypes.includes("transfer_in") || traceRequest.movementTypes.includes("transfer_out")
+          ? loadTransferMovements(db, { ...traceRequest, productCodes: scope.productCodes })
+          : Promise.resolve([]),
+        traceRequest.movementTypes.includes("supplier_receipt")
+          ? loadSupplierReceiptMovements(db, { ...traceRequest, productCodes: scope.productCodes })
+          : Promise.resolve([]),
+        traceRequest.movementTypes.includes("sales_summary")
+          ? loadSalesSummaries(db, { ...traceRequest, productCodes: scope.productCodes })
+          : Promise.resolve([]),
+      ]);
+
+      return res.json(
+        buildProductMovementTraceResponse({
+          productCodes: scope.productCodes,
+          metaMap,
+          movements: [...transferMovements, ...supplierMovements],
+          salesSummaries,
+          movementTypes: traceRequest.movementTypes,
+          warnings,
+        }),
+      );
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   // GET /api/sync/nightly-log?days=14
   // Admin UI's "ประวัติ Sync" calendar grid: per branch, per night, what happened.
   // - "success"  - ingest.sync_runs has a success row for that branch/date
@@ -989,6 +1667,9 @@ function createOrderingRouter(deps) {
 module.exports = {
   createOrderingRouter,
   buildStockDayRow,
+  buildProductMovementTraceResponse,
+  normalizeProductCodeList,
+  normalizeTraceRequestBody,
   getApprovedReceipts,
   getPendingReceipts,
   groupReceiptRows,

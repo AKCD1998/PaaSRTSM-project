@@ -231,6 +231,7 @@ function createApp(overrides = {}) {
       config,
       db,
       requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
     }),
   );
   app.use(
