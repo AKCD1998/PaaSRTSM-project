@@ -30,6 +30,7 @@ const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
 const { createReviewQueueRouter } = require("./routes/review-queue");
 const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowledge");
+const { createIngredientAdminRouter } = require("./routes/ingredient-admin");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -233,6 +234,15 @@ function createApp(overrides = {}) {
       db,
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
+    }),
+  );
+  app.use(
+    "/api/admin/ingredient-dictionary",
+    createIngredientAdminRouter({
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
     }),
   );
   app.use(

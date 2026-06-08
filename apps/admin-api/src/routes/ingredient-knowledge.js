@@ -68,8 +68,8 @@ async function loadProductMetadata(db, productCode) {
     `
       SELECT
         input.product_code,
-        COALESCE(bs.product_name_thai, s.display_name, p.display_name, input.product_code) AS product_name_thai,
-        COALESCE(bs.product_name_eng, '') AS product_name_eng,
+        COALESCE(bs.product_name_thai, s.display_name, p.product_name_th, p.product_name, input.product_code) AS product_name_thai,
+        COALESCE(bs.product_name_eng, p.product_name, '') AS product_name_eng,
         COALESCE(
           (SELECT pb.barcode
            FROM ada.product_barcodes pb
