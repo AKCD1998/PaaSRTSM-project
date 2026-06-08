@@ -23,6 +23,7 @@ const { createSearchRouter } = require("./routes/search");
 const { createLoyaltyRouter } = require("./routes/loyalty");
 const { createMembersRouter } = require("./routes/members");
 const { createOrderingRouter } = require("./routes/ordering");
+const { createSupplierLogosRouter } = require("./routes/supplier-logos");
 const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
@@ -229,6 +230,22 @@ function createApp(overrides = {}) {
     "/api",
     createOrderingRouter({
       config,
+      db,
+      requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/admin/supplier-logos",
+    createSupplierLogosRouter({
+      db,
+      requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/supplier-logos",
+    createSupplierLogosRouter({
       db,
       requireAuthMiddleware,
       requireCsrfMiddleware: requireCsrf,
