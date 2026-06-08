@@ -788,11 +788,19 @@ function createIngredientAdminRouter(deps) {
   router.get("/matched-products", auth, async (req, res, next) => {
     try {
       const search = text(req.query.search).slice(0, 120);
+      const status = text(req.query.status);
       const limit = clampLimit(req.query.limit, 50, 200);
       const offset = Math.max(0, toIntOrNull(req.query.offset) || 0);
 
       const params = [];
-      const where = ["pi.status <> 'rejected'"];
+      const where = [];
+      if (status) {
+        if (!MAPPING_STATUSES.has(status)) return badRequest(res, req, "Invalid status");
+        params.push(status);
+        where.push(`pi.status = $${params.length}`);
+      } else {
+        where.push("pi.status <> 'rejected'");
+      }
       if (search) {
         params.push(`%${search}%`);
         const p = `$${params.length}`;
