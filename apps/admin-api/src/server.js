@@ -29,6 +29,7 @@ const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
 const { createReviewQueueRouter } = require("./routes/review-queue");
+const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowledge");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -224,6 +225,14 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/admin",
+    createIngredientKnowledgeRouter({
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
     }),
   );
   app.use(
