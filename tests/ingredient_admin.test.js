@@ -48,6 +48,10 @@ function createMockDb() {
       { synonym_id: 10, synonym_text: "paracetamol", language: "en", source: "seed", status: "active", updated_at: "2026-06-01T00:00:00.000Z" },
     ],
     insertedSynonyms: [],
+    productIngredients: new Map([
+      ["IC-001624|1", { product_code: "IC-001624", ingredient_id: 1, status: "proposed", source: "dictionary_backfill", confirmed_by: null }],
+    ]),
+    resolvedAudits: [],
   };
 
   const db = {
@@ -114,6 +118,24 @@ function createMockDb() {
       // detail: category rules
       if (q.includes("from knowledge.ingredient_category_rules r")) {
         return { rowCount: 1, rows: [{ rule_id: 3, category_name: "3ยาแก้ปวด", drug_class_id: null, drug_class_name: null, indication_id: null, indication_name: null, priority: 20, rule_status: "active", note: null, updated_at: state.ingredient.updated_at }] };
+      }
+
+      // product-ingredient: fetch before update
+      if (q.startsWith("select status, source, confirmed_by from knowledge.product_ingredients")) {
+        const row = state.productIngredients.get(`${params[0]}|${params[1]}`);
+        return row ? { rowCount: 1, rows: [row] } : { rowCount: 0, rows: [] };
+      }
+      // product-ingredient: update status
+      if (q.startsWith("update knowledge.product_ingredients")) {
+        const key = `${params[0]}|${params[1]}`;
+        const row = state.productIngredients.get(key);
+        if (row) row.status = params[2];
+        return { rowCount: row ? 1 : 0, rows: [] };
+      }
+      // suggestion-audit resolution update
+      if (q.startsWith("update knowledge.ingredient_suggestion_audit")) {
+        state.resolvedAudits.push({ productCode: params[0], ingredientId: params[1], status: params[2] });
+        return { rowCount: 1, rows: [] };
       }
 
       throw new Error(`Unhandled mock query: ${q}`);
@@ -209,4 +231,63 @@ test("ingredient detail 404s for unknown id", async () => {
 
   const res = await agent.get("/api/admin/ingredient-dictionary/ingredients/999");
   assert.equal(res.status, 404);
+});
+
+test("confirming a product-ingredient requires CSRF, updates status, resolves audit", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+  const csrf = await loginAs(agent);
+
+  // missing CSRF
+  const noCsrf = await agent
+    .patch("/api/admin/ingredient-dictionary/product-ingredients/IC-001624/1")
+    .send({ status: "confirmed" });
+  assert.equal(noCsrf.status, 403);
+
+  // confirm
+  const ok = await agent
+    .patch("/api/admin/ingredient-dictionary/product-ingredients/IC-001624/1")
+    .set("x-csrf-token", csrf)
+    .send({ status: "confirmed" });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.status, "confirmed");
+  assert.equal(db.state.productIngredients.get("IC-001624|1").status, "confirmed");
+  assert.ok(db.state.auditActions.includes("ingredient_dictionary.product_ingredient.status"));
+  assert.equal(db.state.resolvedAudits[0].status, "accepted");
+});
+
+test("invalid status and unknown product-ingredient are handled", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  const csrf = await loginAs(agent);
+
+  const bad = await agent
+    .patch("/api/admin/ingredient-dictionary/product-ingredients/IC-001624/1")
+    .set("x-csrf-token", csrf)
+    .send({ status: "banana" });
+  assert.equal(bad.status, 400);
+
+  const missing = await agent
+    .patch("/api/admin/ingredient-dictionary/product-ingredients/NOPE/1")
+    .set("x-csrf-token", csrf)
+    .send({ status: "confirmed" });
+  assert.equal(missing.status, 404);
+});
+
+test("confirm-batch processes multiple decisions", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+  const csrf = await loginAs(agent);
+
+  const res = await agent
+    .post("/api/admin/ingredient-dictionary/product-ingredients/confirm-batch")
+    .set("x-csrf-token", csrf)
+    .send({ decisions: [
+      { productCode: "IC-001624", ingredientId: 1, status: "rejected" },
+      { productCode: "NOPE", ingredientId: 9, status: "confirmed" },
+    ] });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.updated, 1);
+  assert.equal(res.body.notFound, 1);
+  assert.equal(db.state.productIngredients.get("IC-001624|1").status, "rejected");
 });

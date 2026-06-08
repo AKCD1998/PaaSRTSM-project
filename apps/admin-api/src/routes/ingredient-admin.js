@@ -812,7 +812,7 @@ function createIngredientAdminRouter(deps) {
       const listParams = params.slice();
       listParams.push(limit, offset);
       const rows = await db.query(
-        `SELECT pi.product_code, i.display_name AS ingredient, pi.source AS match_source, pi.status,
+        `SELECT pi.product_code, pi.ingredient_id, i.display_name AS ingredient, pi.source AS match_source, pi.status,
                 pi.strength_value, pi.strength_unit,
                 COALESCE(bs.product_name_thai, bs.product_name_eng, pi.product_code) AS product_name
          FROM knowledge.product_ingredients pi
@@ -831,6 +831,7 @@ function createIngredientAdminRouter(deps) {
         offset,
         records: rows.rows.map((r) => ({
           productCode: r.product_code,
+          ingredientId: Number(r.ingredient_id),
           productName: r.product_name,
           matchedIngredient: r.ingredient,
           matchSource: r.match_source,
@@ -839,6 +840,92 @@ function createIngredientAdminRouter(deps) {
           strengthUnit: r.strength_unit || null,
         })),
       });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // ── PRODUCT-INGREDIENT confirmation (proposed -> confirmed/rejected) ──────────
+  // The human review action for backfilled / proposed product ingredients.
+  // Never auto-runs; always an explicit pharmacist click.
+  async function setProductIngredientStatus(req, productCode, ingredientId, nextStatus) {
+    const before = await db.query(
+      `SELECT status, source, confirmed_by FROM knowledge.product_ingredients
+       WHERE product_code = $1 AND ingredient_id = $2`,
+      [productCode, ingredientId],
+    );
+    if (!before.rows[0]) return { notFound: true };
+
+    const userId = req.auth?.userId || "admin";
+    const resolved = nextStatus === "confirmed" || nextStatus === "rejected";
+    await db.query(
+      `UPDATE knowledge.product_ingredients
+       SET status = $3,
+           confirmed_by = CASE WHEN $4 THEN $5 ELSE confirmed_by END,
+           confirmed_at = CASE WHEN $4 THEN now() ELSE confirmed_at END,
+           updated_at = now()
+       WHERE product_code = $1 AND ingredient_id = $2`,
+      [productCode, ingredientId, nextStatus, resolved, userId],
+    );
+
+    // Resolve the open suggestion-audit entry (designed home for resolution).
+    const auditStatus = nextStatus === "confirmed" ? "accepted" : nextStatus === "rejected" ? "rejected" : "proposed";
+    if (auditStatus !== "proposed") {
+      await db.query(
+        `UPDATE knowledge.ingredient_suggestion_audit
+         SET status = $3, resolved_by = $4, resolved_at = now()
+         WHERE product_code = $1 AND suggestion_type = 'ingredient'
+           AND (suggested_payload->>'ingredientId')::bigint = $2 AND status = 'proposed'`,
+        [productCode, ingredientId, auditStatus, userId],
+      );
+    }
+
+    await audit(db, req, {
+      action: "ingredient_dictionary.product_ingredient.status",
+      targetType: "product_ingredient", targetId: `${productCode}:${ingredientId}`,
+      before: { status: before.rows[0].status, source: before.rows[0].source },
+      after: { status: nextStatus, confirmedBy: resolved ? userId : before.rows[0].confirmed_by },
+    });
+    return { ok: true };
+  }
+
+  router.patch("/product-ingredients/:productCode/:ingredientId", write, async (req, res, next) => {
+    try {
+      const productCode = text(req.params.productCode);
+      const ingredientId = toIntOrNull(req.params.ingredientId);
+      const nextStatus = text(req.body?.status);
+      if (!productCode || !ingredientId) return badRequest(res, req, "Invalid product/ingredient id");
+      if (!MAPPING_STATUSES.has(nextStatus)) return badRequest(res, req, "Invalid status (proposed|confirmed|rejected|needs_review)");
+
+      const result = await setProductIngredientStatus(req, productCode, ingredientId, nextStatus);
+      if (result.notFound) return notFound(res, req, "Product ingredient not found");
+      return res.json({ ok: true, productCode, ingredientId, status: nextStatus });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post("/product-ingredients/confirm-batch", write, async (req, res, next) => {
+    try {
+      const decisions = Array.isArray(req.body?.decisions) ? req.body.decisions : null;
+      if (!decisions || decisions.length === 0) return badRequest(res, req, "decisions[] is required");
+      if (decisions.length > 500) return badRequest(res, req, "Too many decisions (max 500)");
+
+      let updated = 0;
+      let notFound = 0;
+      const errors = [];
+      for (const d of decisions) {
+        const productCode = text(d?.productCode);
+        const ingredientId = toIntOrNull(d?.ingredientId);
+        const nextStatus = text(d?.status);
+        if (!productCode || !ingredientId || !MAPPING_STATUSES.has(nextStatus)) {
+          errors.push({ productCode, ingredientId, reason: "invalid" });
+          continue;
+        }
+        const result = await setProductIngredientStatus(req, productCode, ingredientId, nextStatus);
+        if (result.notFound) notFound += 1; else updated += 1;
+      }
+      return res.json({ ok: true, updated, notFound, errors });
     } catch (error) {
       return next(error);
     }
