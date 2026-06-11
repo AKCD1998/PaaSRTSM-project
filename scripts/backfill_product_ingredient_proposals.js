@@ -113,7 +113,10 @@ async function loadActiveSynonyms(db, ingredientFilter) {
       continue;
     }
     const normalized = coverage.normalizeLatin(row.synonym_text).trim();
-    if (!normalized) continue;
+    // Guard: skip synonyms that carry no Latin letter after normalization.
+    // e.g. Thai text with a trailing digit ("วิตามินเค 1") normalizes to just "1",
+    // which would otherwise match every product name containing that digit.
+    if (!normalized || !/[a-z]/.test(normalized)) continue;
     synonyms.push({
       ingredientId: Number(row.ingredient_id),
       displayName: row.display_name,

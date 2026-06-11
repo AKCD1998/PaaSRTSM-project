@@ -139,7 +139,9 @@ async function loadSynonyms(db) {
   const synonyms = [];
   for (const row of result.rows) {
     const norm = normalizeLatin(row.synonym_text).trim();
-    if (!norm) continue;
+    // Skip synonyms with no Latin letter after normalization (e.g. Thai text whose
+    // only surviving token is a digit) — they would match far too broadly.
+    if (!norm || !/[a-z]/.test(norm)) continue;
     synonyms.push({
       ingredientId: Number(row.ingredient_id),
       canonicalName: row.canonical_name,
