@@ -4,6 +4,7 @@ const { formatDisplayCategory } = require("./format");
 const { runTier0 } = require("./tier0");
 const { runTier1 } = require("./tier1");
 const { runTier2 } = require("./tier2");
+const { runTier3 } = require("./tier3");
 
 const EXAMPLE_LIMIT = 5;
 
@@ -23,6 +24,7 @@ const EXAMPLE_LIMIT = 5;
  *  productCodes        string[]  optional — limit run to these product codes
  *  dryRun              boolean   default false
  *  skipTier2           boolean   default false — skip pgvector similarity step
+ *  skipTier3           boolean   default false — skip ingredient-rule step
  *  tier2Threshold      number    default 0.60 — cosine similarity min for Tier 2 match
  *  triggeredBy         string    optional label recorded in rationale (e.g. 'sync_hook', 'manual')
  *
@@ -33,6 +35,7 @@ async function runCategorizationBatch(db, options = {}) {
     productCodes = null,
     dryRun = false,
     skipTier2 = false,
+    skipTier3 = false,
     tier2Threshold = 0.60,
     triggeredBy = "batch",
   } = options;
@@ -62,7 +65,7 @@ async function runCategorizationBatch(db, options = {}) {
   const { rows: products } = await db.query(baseQuery, queryParams);
 
   if (products.length === 0) {
-    return buildMetrics(startedAt, 0, [], [], [], []);
+    return buildMetrics(startedAt, 0, [], [], [], [], [], [], [], []);
   }
 
   const allCodes = products.map((p) => p.product_code);
@@ -81,7 +84,24 @@ async function runCategorizationBatch(db, options = {}) {
   const tier1Results = await runTier1(db, tier1Input);
 
   if (dryRun) {
-    return buildMetrics(startedAt, products.length, tier0Results, tier1Results, [], [], [], []);
+    return buildMetrics(
+      startedAt,
+      products.length,
+      tier0Results,
+      tier1Results,
+      [],
+      [],
+      [],
+      [],
+      [],
+      tier1Results
+        .filter((r) => r.review_status === "needs_review")
+        .map((r) => ({
+          product_code: r.product_code,
+          category_name: formatDisplayCategory(r.shelf_no, r.clean_category),
+          reason: r.reason,
+        })),
+    );
   }
 
   // ── 4. Write results — bulk UNNEST in chunks of 500 ─────────────────────
@@ -139,6 +159,7 @@ async function runCategorizationBatch(db, options = {}) {
       reason: r.reason,
     });
   }
+  const tier1RowsByCode = new Map(tier1Rows.map((row) => [row.product_code, row]));
 
   // ── 4a. Write Tier 0 first so it's available as the reference set for Tier 2 ─
   await bulkUpsertTier0(db, tier0Rows, triggeredBy);
@@ -175,7 +196,82 @@ async function runCategorizationBatch(db, options = {}) {
   // ── 4c. Write Tier 1 + Tier 2 upgrades together ──────────────────────────
   await bulkUpsertTier1(db, tier1Rows, triggeredBy);
 
-  return buildMetrics(startedAt, products.length, tier0Results, tier1Results, written0, written1, written2, skipped);
+  // ── 4d. Tier 3: ingredient rules for products still in needs_review ──────
+  const written3 = [];
+  if (!skipTier3) {
+    const stillNeedsReviewCodes = tier1Rows
+      .filter((row) => row.review_status === "needs_review")
+      .map((row) => row.product_code);
+
+    if (stillNeedsReviewCodes.length > 0) {
+      const tier3Results = await runTier3(db, stillNeedsReviewCodes, { dryRun });
+      if (tier3Results.length > 0) {
+        const tier3Codes = tier3Results.map((row) => row.product_code);
+        const { rows: tier3ExistingRows } = await db.query(
+          `SELECT product_code, category_name, review_status
+           FROM ada.product_category_states
+           WHERE product_code = ANY($1)`,
+          [tier3Codes],
+        );
+        const tier3ExistingByCode = new Map(
+          tier3ExistingRows.map((row) => [row.product_code, row]),
+        );
+        const tier3Rows = [];
+
+        for (const t3 of tier3Results) {
+          const row = tier1RowsByCode.get(t3.product_code);
+          if (!row) continue;
+
+          const existing = tier3ExistingByCode.get(t3.product_code);
+          row.category_name = t3.clean_category || "";
+          row.review_status = "proposed";
+          row.rationale = `Tier 3 ingredient rule: ${t3.matched_ingredients}. By: ${triggeredBy}`;
+          row.source_match_level = t3.reason;
+          row.source_kind = "ingredient_rules";
+
+          tier3Rows.push({
+            product_code: row.product_code,
+            category_name: row.category_name,
+            review_status: row.review_status,
+            rationale: row.rationale,
+            source_match_level: row.source_match_level,
+            source_kind: row.source_kind,
+            prev_category_name: existing?.category_name || null,
+            prev_review_status: existing?.review_status || null,
+          });
+          written3.push({
+            product_code: row.product_code,
+            category_name: row.category_name,
+            reason: t3.reason,
+            matched_ingredients: t3.matched_ingredients,
+          });
+        }
+
+        await bulkUpsertTier3(db, tier3Rows, triggeredBy);
+      }
+    }
+  }
+
+  const remainingNeedsReviewRows = tier1Rows
+    .filter((row) => row.review_status === "needs_review")
+    .map((row) => ({
+      product_code: row.product_code,
+      category_name: row.category_name || null,
+      reason: row.source_match_level || null,
+    }));
+
+  return buildMetrics(
+    startedAt,
+    products.length,
+    tier0Results,
+    tier1Results,
+    written0,
+    written1,
+    written2,
+    written3,
+    skipped,
+    remainingNeedsReviewRows,
+  );
 }
 
 // ── Bulk upsert helpers (UNNEST, chunked at 500 rows) ─────────────────────────
@@ -307,11 +403,82 @@ async function bulkUpsertTier1(db, rows, triggeredBy) {
   }
 }
 
-// ── Metrics builder ───────────────────────────────────────────────────────────
-// Counts are always derived from tier*Results so dry-run and live-run agree.
-// written* arrays are used for per-row examples when available.
+async function bulkUpsertTier3(db, rows, triggeredBy) {
+  for (const chunk of chunkArray(rows, CHUNK_SIZE)) {
+    const productCodes      = chunk.map((r) => r.product_code);
+    const categoryNames     = chunk.map((r) => r.category_name);
+    const reviewStatuses    = chunk.map((r) => r.review_status);
+    const rationales        = chunk.map((r) => r.rationale);
+    const matchLevels       = chunk.map((r) => r.source_match_level);
+    const prevCategoryNames = chunk.map((r) => r.prev_category_name);
+    const prevStatuses      = chunk.map((r) => r.prev_review_status);
+    const importedBys       = chunk.map(() => triggeredBy);
 
-function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, written0 = [], written1 = [], written2 = [], skipped = []) {
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `
+        INSERT INTO ada.product_category_states
+          (product_code, category_name, review_status, rationale,
+           source_kind, source_reference, source_match_level,
+           previous_category_name, previous_review_status,
+           imported_at, imported_by, updated_at)
+        SELECT
+          unnest($1::text[]),
+          unnest($2::text[]),
+          unnest($3::text[]),
+          unnest($4::text[]),
+          'ingredient_rules',
+          'taxonomy_batch/tier3',
+          unnest($5::text[]),
+          unnest($6::text[]),
+          unnest($7::text[]),
+          now(),
+          unnest($8::text[]),
+          now()
+        ON CONFLICT (product_code) DO UPDATE SET
+          category_name          = EXCLUDED.category_name,
+          review_status          = EXCLUDED.review_status,
+          rationale              = EXCLUDED.rationale,
+          source_kind            = EXCLUDED.source_kind,
+          source_reference       = EXCLUDED.source_reference,
+          source_match_level     = EXCLUDED.source_match_level,
+          previous_category_name = EXCLUDED.previous_category_name,
+          previous_review_status = EXCLUDED.previous_review_status,
+          imported_at            = EXCLUDED.imported_at,
+          imported_by            = EXCLUDED.imported_by,
+          updated_at             = now()
+        WHERE ada.product_category_states.review_status NOT IN ('confirmed', 'imported_exact_match')
+        `,
+        [productCodes, categoryNames, reviewStatuses, rationales, matchLevels,
+         prevCategoryNames, prevStatuses, importedBys],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+// ── Metrics builder ───────────────────────────────────────────────────────────
+// Counts come from tier outputs plus the live upgrade writes for later tiers.
+
+function buildMetrics(
+  startedAt,
+  totalProcessed,
+  tier0Results,
+  tier1Results,
+  written0 = [],
+  written1 = [],
+  written2 = [],
+  written3 = [],
+  skipped = [],
+  remainingNeedsReviewRows = null,
+) {
   const finishedAt = new Date();
 
   const conflicts     = tier0Results.filter((r) => r.conflict);
@@ -335,16 +502,16 @@ function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, wri
       }));
 
   const tier2Examples = written2.slice(0, EXAMPLE_LIMIT);
+  const tier3Examples = written3.slice(0, EXAMPLE_LIMIT);
 
-  const needsReviewExamples = written1.filter((r) => r.review_status === "needs_review").slice(0, EXAMPLE_LIMIT).length > 0
-    ? written1.filter((r) => r.review_status === "needs_review").slice(0, EXAMPLE_LIMIT)
+  const needsReviewExamples = Array.isArray(remainingNeedsReviewRows)
+    ? remainingNeedsReviewRows.slice(0, EXAMPLE_LIMIT)
     : tier1NeedsReview.slice(0, EXAMPLE_LIMIT).map((r) => ({
         product_code: r.product_code,
         category_name: r.clean_category,
         reason: r.reason,
       }));
 
-  // Tier 2 count: written2 always populated from live runs; dry-run shows 0 (Tier 2 not run in dry-run)
   return {
     startedAt: startedAt.toISOString(),
     finishedAt: finishedAt.toISOString(),
@@ -353,12 +520,14 @@ function buildMetrics(startedAt, totalProcessed, tier0Results, tier1Results, wri
     tier0Exact: tier0Matched.length,
     tier1Rules: tier1Proposed.length,
     tier2Similarity: written2.length,
-    needsReview: tier1NeedsReview.length - written2.length,
+    tier3Ingredients: written3.length,
+    needsReview: Math.max(0, tier1NeedsReview.length - written2.length - written3.length),
     conflictsSkipped: conflicts.length,
     examples: {
       tier0: tier0Examples,
       tier1Proposed: tier1Examples,
       tier2Similarity: tier2Examples,
+      tier3Ingredients: tier3Examples,
       needsReview: needsReviewExamples,
       conflicts: conflicts.slice(0, EXAMPLE_LIMIT).map((r) => ({
         product_code: r.product_code,
