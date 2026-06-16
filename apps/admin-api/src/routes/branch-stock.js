@@ -102,9 +102,55 @@ function parseRequiredApiKey(config, req) {
 
 const ALLOWED_BRANCH_CODES = new Set(["000", "001", "002", "003", "004", "005"]);
 
+function getBranchRecordKeys(branchCode) {
+  return {
+    qtySnakeKey: `qty_branch_${branchCode}`,
+    qtyCamelKey: `qtyBranch${branchCode}`,
+    costSnakeKey: `cost_avg_branch_${branchCode}`,
+    costCamelKey: `costAvgBranch${branchCode}`,
+  };
+}
+
+function getFirstDefinedValue(values) {
+  for (const value of values) {
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function parseRequiredNumber(value) {
+  if (value === undefined || value === null || value === "") {
+    return { ok: false, missing: true, value: null };
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return { ok: false, missing: false, value: null };
+  }
+  return { ok: true, missing: false, value: parsed };
+}
+
+function parseOptionalNumber(value) {
+  if (value === undefined || value === "") {
+    return { ok: true, present: false, value: null };
+  }
+  if (value === null) {
+    return { ok: true, present: true, value: null };
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return { ok: false, present: true, value: null };
+  }
+  return { ok: true, present: true, value: parsed };
+}
+
 function parseBranchStockPayload(body) {
   if (!body || !Array.isArray(body.records)) {
     return { error: "Payload must include a records array." };
+  }
+
+  const branchCode = normalizeText(body.branchCode || body.branch_code);
+  if (!ALLOWED_BRANCH_CODES.has(branchCode)) {
+    return { error: "branchCode must be one of 000, 001, 002, 003, 004, 005." };
   }
 
   const records = [];
@@ -119,31 +165,51 @@ function parseBranchStockPayload(body) {
       return { error: `records[${index}].synced_at is invalid.` };
     }
 
+    const branchKeys = getBranchRecordKeys(branchCode);
+    const qtyResult = parseRequiredNumber(
+      getFirstDefinedValue([
+        record.qty,
+        record.quantity,
+        record[branchKeys.qtySnakeKey],
+        record[branchKeys.qtyCamelKey],
+      ]),
+    );
+    if (!qtyResult.ok) {
+      return {
+        error: qtyResult.missing
+          ? `records[${index}].qty is required for branchCode ${branchCode}.`
+          : `records[${index}].qty is invalid for branchCode ${branchCode}.`,
+      };
+    }
+
+    const costAvgResult = parseOptionalNumber(
+      getFirstDefinedValue([
+        record.cost_avg,
+        record.costAvg,
+        record[branchKeys.costSnakeKey],
+        record[branchKeys.costCamelKey],
+      ]),
+    );
+    if (!costAvgResult.ok) {
+      return { error: `records[${index}].costAvg is invalid for branchCode ${branchCode}.` };
+    }
+
     records.push({
       productCode,
       productNameThai: normalizeNullableText(record.product_name_thai || record.productNameThai),
       productNameEng: normalizeNullableText(record.product_name_eng || record.productNameEng),
       barcode: normalizeNullableText(record.barcode),
       unit: normalizeNullableText(record.unit),
-      sourceBranchCode: normalizeNullableText(
-        record.branch_code || record.branchCode || record.sourceBranchCode,
-      ),
-      qtyBranch000: toNumber(record.qty_branch_000 ?? record.qtyBranch000, 0),
-      qtyBranch001: toNumber(record.qty_branch_001 ?? record.qtyBranch001, 0),
-      qtyBranch002: toNumber(record.qty_branch_002 ?? record.qtyBranch002, 0),
-      qtyBranch003: toNumber(record.qty_branch_003 ?? record.qtyBranch003, 0),
-      qtyBranch004: toNumber(record.qty_branch_004 ?? record.qtyBranch004, 0),
-      qtyBranch005: toNumber(record.qty_branch_005 ?? record.qtyBranch005, 0),
-      qtyTotalAllBranches: toNumber(
-        record.qty_total_all_branches ?? record.qtyTotalAllBranches,
-        0,
-      ),
+      branchCode,
+      qty: qtyResult.value,
+      costAvg: costAvgResult.value,
+      hasCostAvg: costAvgResult.present,
       syncedAt,
       rawPayload: record,
     });
   }
 
-  return { records };
+  return { branchCode, records };
 }
 
 function applyBranchQty(record, branchCode, qty) {
@@ -153,6 +219,15 @@ function applyBranchQty(record, branchCode, qty) {
   if (branchCode === "003") record.qtyBranch003 = qty;
   if (branchCode === "004") record.qtyBranch004 = qty;
   if (branchCode === "005") record.qtyBranch005 = qty;
+}
+
+function applyBranchCostAvg(record, branchCode, costAvg) {
+  if (branchCode === "000") record.costAvgBranch000 = costAvg;
+  if (branchCode === "001") record.costAvgBranch001 = costAvg;
+  if (branchCode === "002") record.costAvgBranch002 = costAvg;
+  if (branchCode === "003") record.costAvgBranch003 = costAvg;
+  if (branchCode === "004") record.costAvgBranch004 = costAvg;
+  if (branchCode === "005") record.costAvgBranch005 = costAvg;
 }
 
 function sumBranchQty(record) {
@@ -256,29 +331,6 @@ function parseBranchStockUploadPayload(body) {
 }
 
 async function upsertBranchStockSnapshot(client, record) {
-  let recordToWrite = record;
-  if (record.sourceBranchCode && ALLOWED_BRANCH_CODES.has(record.sourceBranchCode)) {
-    const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
-    recordToWrite = existingSnapshot
-      ? mapExistingSnapshotRowToRecord(existingSnapshot)
-      : createEmptySnapshotRecord(record.productCode, record.syncedAt);
-
-    recordToWrite.productCode = record.productCode;
-    recordToWrite.productNameThai = record.productNameThai || recordToWrite.productNameThai;
-    recordToWrite.productNameEng = record.productNameEng || recordToWrite.productNameEng;
-    recordToWrite.barcode = record.barcode || recordToWrite.barcode;
-    recordToWrite.unit = record.unit || recordToWrite.unit;
-    recordToWrite.syncedAt = record.syncedAt;
-    recordToWrite.rawPayload = record.rawPayload || {};
-
-    applyBranchQty(
-      recordToWrite,
-      record.sourceBranchCode,
-      toNumber(record[`qtyBranch${record.sourceBranchCode}`], 0),
-    );
-    recordToWrite.qtyTotalAllBranches = sumBranchQty(recordToWrite);
-  }
-
   await client.query(
     `
       INSERT INTO ada.branch_stock_snapshots
@@ -295,6 +347,12 @@ async function upsertBranchStockSnapshot(client, record) {
           qty_branch_004,
           qty_branch_005,
           qty_total_all_branches,
+          cost_avg_branch_000,
+          cost_avg_branch_001,
+          cost_avg_branch_002,
+          cost_avg_branch_003,
+          cost_avg_branch_004,
+          cost_avg_branch_005,
           synced_at,
           source_system,
           source_table,
@@ -303,7 +361,7 @@ async function upsertBranchStockSnapshot(client, record) {
           updated_at
         )
       VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'AdaAcc', 'TCNTPdtInWha', $13, $14::jsonb, now())
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'AdaAcc', 'TCNTPdtInWha', $19, $20::jsonb, now())
       ON CONFLICT (product_code) DO UPDATE SET
         product_name_thai = EXCLUDED.product_name_thai,
         product_name_eng = EXCLUDED.product_name_eng,
@@ -316,26 +374,38 @@ async function upsertBranchStockSnapshot(client, record) {
         qty_branch_004 = EXCLUDED.qty_branch_004,
         qty_branch_005 = EXCLUDED.qty_branch_005,
         qty_total_all_branches = EXCLUDED.qty_total_all_branches,
+        cost_avg_branch_000 = EXCLUDED.cost_avg_branch_000,
+        cost_avg_branch_001 = EXCLUDED.cost_avg_branch_001,
+        cost_avg_branch_002 = EXCLUDED.cost_avg_branch_002,
+        cost_avg_branch_003 = EXCLUDED.cost_avg_branch_003,
+        cost_avg_branch_004 = EXCLUDED.cost_avg_branch_004,
+        cost_avg_branch_005 = EXCLUDED.cost_avg_branch_005,
         synced_at = EXCLUDED.synced_at,
         source_synced_at = EXCLUDED.source_synced_at,
         raw_payload = EXCLUDED.raw_payload,
         updated_at = now()
     `,
     [
-      recordToWrite.productCode,
-      recordToWrite.productNameThai,
-      recordToWrite.productNameEng,
-      recordToWrite.barcode,
-      recordToWrite.unit,
-      recordToWrite.qtyBranch000,
-      recordToWrite.qtyBranch001,
-      recordToWrite.qtyBranch002,
-      recordToWrite.qtyBranch003,
-      recordToWrite.qtyBranch004,
-      recordToWrite.qtyBranch005,
-      recordToWrite.qtyTotalAllBranches,
-      recordToWrite.syncedAt,
-      JSON.stringify(recordToWrite.rawPayload || {}),
+      record.productCode,
+      record.productNameThai,
+      record.productNameEng,
+      record.barcode,
+      record.unit,
+      record.qtyBranch000,
+      record.qtyBranch001,
+      record.qtyBranch002,
+      record.qtyBranch003,
+      record.qtyBranch004,
+      record.qtyBranch005,
+      record.qtyTotalAllBranches,
+      record.costAvgBranch000,
+      record.costAvgBranch001,
+      record.costAvgBranch002,
+      record.costAvgBranch003,
+      record.costAvgBranch004,
+      record.costAvgBranch005,
+      record.syncedAt,
+      JSON.stringify(record.rawPayload || {}),
     ],
   );
 }
@@ -415,6 +485,12 @@ function createEmptySnapshotRecord(productCode, syncedAt) {
     qtyBranch004: 0,
     qtyBranch005: 0,
     qtyTotalAllBranches: 0,
+    costAvgBranch000: null,
+    costAvgBranch001: null,
+    costAvgBranch002: null,
+    costAvgBranch003: null,
+    costAvgBranch004: null,
+    costAvgBranch005: null,
     syncedAt,
     rawPayload: {},
   };
@@ -434,28 +510,33 @@ function mapExistingSnapshotRowToRecord(row) {
     qtyBranch004: Number(row.qty_branch_004 || 0),
     qtyBranch005: Number(row.qty_branch_005 || 0),
     qtyTotalAllBranches: Number(row.qty_total_all_branches || 0),
+    costAvgBranch000: row.cost_avg_branch_000 == null ? null : Number(row.cost_avg_branch_000),
+    costAvgBranch001: row.cost_avg_branch_001 == null ? null : Number(row.cost_avg_branch_001),
+    costAvgBranch002: row.cost_avg_branch_002 == null ? null : Number(row.cost_avg_branch_002),
+    costAvgBranch003: row.cost_avg_branch_003 == null ? null : Number(row.cost_avg_branch_003),
+    costAvgBranch004: row.cost_avg_branch_004 == null ? null : Number(row.cost_avg_branch_004),
+    costAvgBranch005: row.cost_avg_branch_005 == null ? null : Number(row.cost_avg_branch_005),
     syncedAt: row.synced_at,
     rawPayload: row.raw_payload || {},
   };
 }
 
-function mergeBranchUploadRecord(branchCode, existingRecord, uploadedRecord, syncedAt) {
+function mergeBranchStockRecord(branchCode, existingRecord, incomingRecord, syncedAt) {
   const merged = {
     ...existingRecord,
-    productCode: uploadedRecord.productCode,
-    productNameThai: uploadedRecord.productNameThai || existingRecord.productNameThai,
-    productNameEng: uploadedRecord.productNameEng || existingRecord.productNameEng,
-    barcode: uploadedRecord.barcode || existingRecord.barcode,
-    unit: uploadedRecord.unit || existingRecord.unit,
+    productCode: incomingRecord.productCode,
+    productNameThai: incomingRecord.productNameThai || existingRecord.productNameThai,
+    productNameEng: incomingRecord.productNameEng || existingRecord.productNameEng,
+    barcode: incomingRecord.barcode || existingRecord.barcode,
+    unit: incomingRecord.unit || existingRecord.unit,
     syncedAt,
-    rawPayload: {
-      branchCode,
-      sourceRowNumber: uploadedRecord.sourceRowNumber || null,
-      rawRecord: uploadedRecord.rawPayload || {},
-    },
+    rawPayload: incomingRecord.rawPayload || {},
   };
 
-  applyBranchQty(merged, branchCode, uploadedRecord.qty);
+  applyBranchQty(merged, branchCode, toNumber(incomingRecord.qty, 0));
+  if (incomingRecord.hasCostAvg) {
+    applyBranchCostAvg(merged, branchCode, incomingRecord.costAvg);
+  }
   merged.qtyTotalAllBranches = sumBranchQty(merged);
 
   return merged;
@@ -477,6 +558,12 @@ async function readExistingBranchStockSnapshot(client, productCode) {
         qty_branch_004,
         qty_branch_005,
         qty_total_all_branches,
+        cost_avg_branch_000,
+        cost_avg_branch_001,
+        cost_avg_branch_002,
+        cost_avg_branch_003,
+        cost_avg_branch_004,
+        cost_avg_branch_005,
         synced_at,
         raw_payload
       FROM ada.branch_stock_snapshots
@@ -903,7 +990,7 @@ function createBranchStockRouter(deps) {
       return res.status(401).json({ message: apiKeyError });
     }
 
-    const { error, records } = parseBranchStockPayload(req.body);
+    const { error, branchCode, records } = parseBranchStockPayload(req.body);
     if (error) {
       return res.status(400).json({ message: error });
     }
@@ -912,12 +999,21 @@ function createBranchStockRouter(deps) {
     try {
       await client.query("BEGIN");
       for (const record of records) {
+        const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
+        const mergedRecord = mergeBranchStockRecord(
+          branchCode,
+          existingSnapshot ? mapExistingSnapshotRowToRecord(existingSnapshot) : createEmptySnapshotRecord(record.productCode, record.syncedAt),
+          record,
+          record.syncedAt,
+        );
         // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, record);
+        await upsertBranchStockSnapshot(client, mergedRecord);
       }
       await client.query("COMMIT");
-      fireCategorizationBatch(db, records.map((r) => r.productCode));
-      return res.json({ accepted: records.length, insertedOrUpdated: records.length });
+      if (records.length > 0) {
+        fireCategorizationBatch(db, records.map((r) => r.productCode));
+      }
+      return res.json({ accepted: records.length, insertedOrUpdated: records.length, branchCode });
     } catch (routeError) {
       await client.query("ROLLBACK");
       return next(routeError);
@@ -932,7 +1028,7 @@ function createBranchStockRouter(deps) {
       return res.status(401).json({ message: apiKeyError });
     }
 
-    const { error, records } = parseBranchStockPayload(req.body);
+    const { error, branchCode, records } = parseBranchStockPayload(req.body);
     if (error) {
       return res.status(400).json({ message: error });
     }
@@ -941,12 +1037,21 @@ function createBranchStockRouter(deps) {
     try {
       await client.query("BEGIN");
       for (const record of records) {
+        const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
+        const mergedRecord = mergeBranchStockRecord(
+          branchCode,
+          existingSnapshot ? mapExistingSnapshotRowToRecord(existingSnapshot) : createEmptySnapshotRecord(record.productCode, record.syncedAt),
+          record,
+          record.syncedAt,
+        );
         // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, record);
+        await upsertBranchStockSnapshot(client, mergedRecord);
       }
       await client.query("COMMIT");
-      fireCategorizationBatch(db, records.map((r) => r.productCode));
-      return res.json({ accepted: records.length, insertedOrUpdated: records.length });
+      if (records.length > 0) {
+        fireCategorizationBatch(db, records.map((r) => r.productCode));
+      }
+      return res.json({ accepted: records.length, insertedOrUpdated: records.length, branchCode });
     } catch (routeError) {
       await client.query("ROLLBACK");
       return next(routeError);
@@ -990,10 +1095,18 @@ function createBranchStockRouter(deps) {
       for (const record of parsed.acceptedRecords) {
         // eslint-disable-next-line no-await-in-loop
         const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
-        const mergedRecord = mergeBranchUploadRecord(
+        const mergedRecord = mergeBranchStockRecord(
           parsed.branchCode,
           existingSnapshot ? mapExistingSnapshotRowToRecord(existingSnapshot) : createEmptySnapshotRecord(record.productCode, parsed.generatedAt),
-          record,
+          {
+            ...record,
+            hasCostAvg: false,
+            rawPayload: {
+              branchCode: parsed.branchCode,
+              sourceRowNumber: record.sourceRowNumber || null,
+              rawRecord: record.rawPayload || {},
+            },
+          },
           parsed.generatedAt,
         );
         // eslint-disable-next-line no-await-in-loop

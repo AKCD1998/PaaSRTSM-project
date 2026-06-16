@@ -91,7 +91,14 @@ function createBranchStockMockDb() {
           qty_branch_004: params[9],
           qty_branch_005: params[10],
           qty_total_all_branches: params[11],
-          synced_at: params[12],
+          cost_avg_branch_000: params[12],
+          cost_avg_branch_001: params[13],
+          cost_avg_branch_002: params[14],
+          cost_avg_branch_003: params[15],
+          cost_avg_branch_004: params[16],
+          cost_avg_branch_005: params[17],
+          synced_at: params[18],
+          raw_payload: JSON.parse(params[19]),
         });
         return { rowCount: 1, rows: [] };
       }
@@ -280,6 +287,7 @@ test("branch stock sync and listing routes work on the shared backend", async ()
     .post("/api/branch-stock/sync")
     .set("x-api-key", "test-pos-key")
     .send({
+      branchCode: "001",
       records: [
         {
           product_code: "630010001",
@@ -287,13 +295,8 @@ test("branch stock sync and listing routes work on the shared backend", async ()
           product_name_eng: "Cetirizine",
           barcode: "885000000001",
           unit: "BOX",
-          qty_branch_000: 10,
-          qty_branch_001: 5,
-          qty_branch_002: 3,
-          qty_branch_003: 4,
-          qty_branch_004: 2,
-          qty_branch_005: 8,
-          qty_total_all_branches: 32,
+          qty: 5,
+          costAvg: 12.5,
           synced_at: "2026-05-25T08:00:00.000Z",
         },
       ],
@@ -302,12 +305,16 @@ test("branch stock sync and listing routes work on the shared backend", async ()
   assert.equal(syncResponse.status, 200);
   assert.equal(syncResponse.body.accepted, 1);
   assert.equal(syncResponse.body.insertedOrUpdated, 1);
+  assert.equal(syncResponse.body.branchCode, "001");
   assert.equal(db.state.snapshots.size, 1);
+  assert.equal(db.state.snapshots.get("630010001").qty_branch_001, 5);
+  assert.equal(db.state.snapshots.get("630010001").cost_avg_branch_001, 12.5);
 
   const legacySyncResponse = await request(app)
     .post("/api/sync/ada/branch-stock")
     .set("x-api-key", "test-pos-key")
     .send({
+      branchCode: "001",
       records: [
         {
           product_code: "630010002",
@@ -315,13 +322,7 @@ test("branch stock sync and listing routes work on the shared backend", async ()
           product_name_eng: "Loratadine",
           barcode: "885000000002",
           unit: "BOX",
-          qty_branch_000: 1,
           qty_branch_001: 2,
-          qty_branch_002: 0,
-          qty_branch_003: 3,
-          qty_branch_004: 4,
-          qty_branch_005: 5,
-          qty_total_all_branches: 15,
           synced_at: "2026-05-25T08:05:00.000Z",
         },
       ],
@@ -329,6 +330,7 @@ test("branch stock sync and listing routes work on the shared backend", async ()
 
   assert.equal(legacySyncResponse.status, 200);
   assert.equal(legacySyncResponse.body.accepted, 1);
+  assert.equal(legacySyncResponse.body.branchCode, "001");
   assert.equal(db.state.snapshots.size, 2);
 
   const agent = request.agent(app);
@@ -342,6 +344,82 @@ test("branch stock sync and listing routes work on the shared backend", async ()
   assert.equal(listResponse.body.pagination.total, 1);
 
   assert.deepEqual(db.state.txLog, ["begin", "commit", "begin", "commit"]);
+});
+
+test("branch stock sync merges a single branch payload without wiping other branches", async () => {
+  const { app, db } = createTestApp();
+  db.state.snapshots.set("630010777", {
+    product_code: "630010777",
+    product_name_thai: "ตัวอย่าง",
+    product_name_eng: "Example",
+    barcode: "885000007777",
+    unit: "BOX",
+    qty_branch_000: 0,
+    qty_branch_001: 1,
+    qty_branch_002: 0,
+    qty_branch_003: 7,
+    qty_branch_004: 8,
+    qty_branch_005: 9,
+    qty_total_all_branches: 25,
+    cost_avg_branch_001: 10,
+    cost_avg_branch_003: 30,
+    cost_avg_branch_004: 40,
+    cost_avg_branch_005: 50,
+    synced_at: "2026-05-25T08:00:00.000Z",
+    raw_payload: {},
+  });
+
+  const response = await request(app)
+    .post("/api/branch-stock/sync")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "001",
+      records: [
+        {
+          productCode: "630010777",
+          qty: 4,
+          costAvg: 14.25,
+          syncedAt: "2026-05-26T01:00:00.000Z",
+        },
+      ],
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.accepted, 1);
+  assert.equal(response.body.insertedOrUpdated, 1);
+  assert.equal(response.body.branchCode, "001");
+
+  const snapshot = db.state.snapshots.get("630010777");
+  assert.equal(snapshot.qty_branch_001, 4);
+  assert.equal(snapshot.qty_branch_003, 7);
+  assert.equal(snapshot.qty_branch_004, 8);
+  assert.equal(snapshot.qty_branch_005, 9);
+  assert.equal(snapshot.cost_avg_branch_001, 14.25);
+  assert.equal(snapshot.cost_avg_branch_003, 30);
+  assert.equal(snapshot.cost_avg_branch_004, 40);
+  assert.equal(snapshot.cost_avg_branch_005, 50);
+  assert.equal(snapshot.qty_total_all_branches, 28);
+});
+
+test("branch stock sync accepts empty records and echoes branchCode", async () => {
+  const { app, db } = createTestApp();
+
+  const response = await request(app)
+    .post("/api/branch-stock/sync")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "001",
+      records: [],
+    });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, {
+    accepted: 0,
+    insertedOrUpdated: 0,
+    branchCode: "001",
+  });
+  assert.equal(db.state.snapshots.size, 0);
+  assert.deepEqual(db.state.txLog, ["begin", "commit"]);
 });
 
 test("branch stock listing falls back to synced product metadata when snapshot fields are blank", async () => {
