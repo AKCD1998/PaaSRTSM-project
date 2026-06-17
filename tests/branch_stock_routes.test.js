@@ -504,6 +504,110 @@ test("branch stock export returns branch-specific xlsx rows for authenticated ad
   assert.equal(sheet.G3.v, "");
 });
 
+test("branch stock export all returns 6-sheet workbook with comparison sheet and branch sheets", async () => {
+  const { app, db } = createTestApp();
+  db.state.snapshots.set("630010010", {
+    product_code: "630010010",
+    product_name_thai: "วิตามินซี",
+    product_name_eng: "Vitamin C",
+    barcode: "885000000010",
+    unit: "BOX",
+    qty_branch_000: 10,
+    qty_branch_001: 20,
+    qty_branch_002: 0,
+    qty_branch_003: 30,
+    qty_branch_004: 40,
+    qty_branch_005: 50,
+    qty_total_all_branches: 150,
+    synced_at: "2026-06-17T08:00:00.000Z",
+  });
+  db.state.snapshots.set("630010011", {
+    product_code: "630010011",
+    product_name_thai: "พาราเซตามอล",
+    product_name_eng: "Paracetamol",
+    barcode: "885000000011",
+    unit: "TAB",
+    qty_branch_000: 5,
+    qty_branch_001: 0,
+    qty_branch_002: 0,
+    qty_branch_003: 15,
+    qty_branch_004: 0,
+    qty_branch_005: 25,
+    qty_total_all_branches: 45,
+    synced_at: "2026-06-17T08:05:00.000Z",
+  });
+  db.state.categoryStates.set("630010010", {
+    product_code: "630010010",
+    category_name: "วิตามิน",
+    review_status: "confirmed",
+    rationale: "manual",
+  });
+
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent
+    .get("/api/branch-stock/export.xlsx?branchCode=all")
+    .buffer(true)
+    .parse(binaryParser);
+
+  assert.equal(response.status, 200);
+  assert.match(
+    String(response.headers["content-type"] || ""),
+    /application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/i,
+  );
+  assert.match(
+    String(response.headers["content-disposition"] || ""),
+    /branch-stock-all-/i,
+  );
+
+  const workbook = XLSX.read(response.body, { type: "buffer" });
+  assert.equal(workbook.SheetNames.length, 6, "workbook must have 6 sheets");
+  assert.equal(workbook.SheetNames[0], "ทุกสาขา");
+  assert.deepEqual(workbook.SheetNames.slice(1), ["000", "001", "003", "004", "005"]);
+
+  // ── Comparison sheet headers ──────────────────────────────────────────────
+  const comp = workbook.Sheets["ทุกสาขา"];
+  assert.equal(comp.A1.v, "รหัสสินค้า",     "A1 = รหัสสินค้า");
+  assert.equal(comp.B1.v, "ชื่อสินค้าไทย",  "B1 = ชื่อสินค้าไทย");
+  assert.equal(comp.C1.v, "ชื่ออังกฤษ",     "C1 = ชื่ออังกฤษ");
+  assert.equal(comp.D1.v, "Barcode",         "D1 = Barcode");
+  assert.equal(comp.E1.v, "หน่วย",           "E1 = หน่วย");
+  assert.equal(comp.F1.v, "หมวดหมู่",        "F1 = หมวดหมู่");
+  assert.equal(comp.G1.v, "สถานะหมวดหมู่",  "G1 = สถานะหมวดหมู่");
+  assert.equal(comp.H1.v, "สาขา 000",        "H1 = สาขา 000");
+  assert.equal(comp.I1.v, "สาขา 001",        "I1 = สาขา 001");
+  assert.equal(comp.J1.v, "สาขา 003",        "J1 = สาขา 003");
+  assert.equal(comp.K1.v, "สาขา 004",        "K1 = สาขา 004");
+  assert.equal(comp.L1.v, "สาขา 005",        "L1 = สาขา 005");
+  assert.equal(comp.M1.v, "รวมทุกสาขา",     "M1 = รวมทุกสาขา");
+  assert.equal(comp.N1.v, "synced_at",        "N1 = synced_at");
+
+  // ── Comparison sheet data row 1 (product 630010010, sorted first) ─────────
+  assert.equal(comp.A2.v, "630010010");
+  assert.equal(comp.B2.v, "วิตามินซี");
+  assert.equal(comp.H2.v, 10,   "qty sาขา 000");
+  assert.equal(comp.I2.v, 20,   "qty สาขา 001");
+  assert.equal(comp.J2.v, 30,   "qty สาขา 003");
+  assert.equal(comp.K2.v, 40,   "qty สาขา 004");
+  assert.equal(comp.L2.v, 50,   "qty สาขา 005");
+  assert.equal(comp.M2.v, 150,  "total qty");
+  assert.ok(comp.N2.v,          "synced_at is present");
+
+  // ── Branch sheet 000 uses qty_branch_000 ─────────────────────────────────
+  const sheet000 = workbook.Sheets["000"];
+  assert.equal(sheet000.A1.v, "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 000");
+  assert.equal(sheet000.F3.v, 10, "branch 000 qty for product 1");
+
+  // ── Branch sheet 001 uses qty_branch_001 ─────────────────────────────────
+  const sheet001 = workbook.Sheets["001"];
+  assert.equal(sheet001.F3.v, 20, "branch 001 qty for product 1");
+
+  // ── Branch sheet 005 uses qty_branch_005 ─────────────────────────────────
+  const sheet005 = workbook.Sheets["005"];
+  assert.equal(sheet005.F3.v, 50, "branch 005 qty for product 1");
+});
+
 test("taxonomy match report route returns latest committed report artifact for authenticated admins", async () => {
   const { app } = createTestApp();
   const agent = request.agent(app);
