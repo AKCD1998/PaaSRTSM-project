@@ -37,8 +37,48 @@ function buildConfig() {
   };
 }
 
+const DISPLAY_BRANCH_CODES = ["000", "001", "003", "004", "005"];
+
 function normalizeSql(sql) {
   return String(sql).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function buildInventoryBranchStats(row, branchCodes = DISPLAY_BRANCH_CODES) {
+  const branches = {};
+  let qtyTotal = 0;
+  let totalInventoryValue = 0;
+  let hasAnyStock = false;
+  let hasMissingCost = false;
+
+  for (const branchCode of branchCodes) {
+    const qty = Number(row[`qty_branch_${branchCode}`] || 0);
+    const rawCost = row[`cost_avg_branch_${branchCode}`];
+    const unitCostAvg = rawCost == null ? null : Number(rawCost);
+    const inventoryValue = Number((qty * Number(rawCost || 0)).toFixed(2));
+
+    branches[branchCode] = {
+      qty,
+      unitCostAvg,
+      inventoryValue,
+    };
+
+    qtyTotal += qty;
+    totalInventoryValue += inventoryValue;
+    if (qty > 0) {
+      hasAnyStock = true;
+      if (unitCostAvg == null) {
+        hasMissingCost = true;
+      }
+    }
+  }
+
+  return {
+    branches,
+    qtyTotal,
+    totalInventoryValue: Number(totalInventoryValue.toFixed(2)),
+    hasAnyStock,
+    hasMissingCost,
+  };
 }
 
 function createBranchStockMockDb() {
@@ -177,14 +217,47 @@ function createBranchStockMockDb() {
       }
 
       if (
-        normalized.includes("as total_inventory_value") &&
+        normalized.startsWith("select count(*)::int as product_count,") &&
         normalized.includes("from ada.branch_stock_snapshots bs")
       ) {
+        const rows = [...state.snapshots.values()];
+        const isAllBranchesSummary = DISPLAY_BRANCH_CODES.every((branchCode) =>
+          normalized.includes(`products_with_stock_${branchCode}`),
+        );
+
+        if (isAllBranchesSummary) {
+          const aggregate = rows.map((row) => ({
+            row,
+            stats: buildInventoryBranchStats(row),
+          }));
+          const summaryRow = {
+            product_count: rows.length,
+            products_with_stock: aggregate.filter(({ stats }) => stats.hasAnyStock).length,
+            products_with_cost: aggregate.filter(({ stats }) => stats.hasAnyStock && !stats.hasMissingCost).length,
+            total_inventory_value: aggregate.reduce((sum, { stats }) => sum + stats.totalInventoryValue, 0).toFixed(2),
+          };
+
+          for (const branchCode of DISPLAY_BRANCH_CODES) {
+            const branchRows = aggregate.filter(({ stats }) => stats.branches[branchCode].qty > 0);
+            summaryRow[`products_with_stock_${branchCode}`] = branchRows.length;
+            summaryRow[`products_with_cost_${branchCode}`] = branchRows.filter(
+              ({ stats }) => stats.branches[branchCode].unitCostAvg != null,
+            ).length;
+            summaryRow[`total_inventory_value_${branchCode}`] = branchRows
+              .reduce((sum, { stats }) => sum + stats.branches[branchCode].inventoryValue, 0)
+              .toFixed(2);
+          }
+
+          return {
+            rowCount: 1,
+            rows: [summaryRow],
+          };
+        }
+
         const branchCodeMatch = normalized.match(/qty_branch_(\d{3})/);
         const branchCode = branchCodeMatch?.[1] || "005";
         const qtyKey = `qty_branch_${branchCode}`;
         const costKey = `cost_avg_branch_${branchCode}`;
-        const rows = [...state.snapshots.values()];
         const productsWithStock = rows.filter((row) => Number(row[qtyKey] || 0) > 0);
         const productsWithCost = productsWithStock.filter((row) => row[costKey] != null);
         const totalInventoryValue = productsWithStock.reduce(
@@ -204,12 +277,20 @@ function createBranchStockMockDb() {
 
       if (normalized.startsWith("select count(*)::int as total from ada.branch_stock_snapshots bs")) {
         const search = String(params[0] || "").toLowerCase();
-        const branchCodeMatch = normalized.match(/qty_branch_(\d{3})\s*>\s*0/);
-        const branchCode = branchCodeMatch?.[1] || null;
-        const qtyKey = branchCode ? `qty_branch_${branchCode}` : null;
+        const isAllBranchesCount = DISPLAY_BRANCH_CODES.every((branchCode) =>
+          normalized.includes(`qty_branch_${branchCode}`),
+        );
         const matches = [...state.snapshots.values()]
           .map(buildSnapshotViewRow)
-          .filter((row) => (!qtyKey || Number(row[qtyKey] || 0) > 0))
+          .filter((row) => {
+            if (isAllBranchesCount) {
+              return buildInventoryBranchStats(row).hasAnyStock;
+            }
+            const branchCodeMatch = normalized.match(/qty_branch_(\d{3})\s*>\s*0/);
+            const branchCode = branchCodeMatch?.[1] || null;
+            const qtyKey = branchCode ? `qty_branch_${branchCode}` : null;
+            return !qtyKey || Number(row[qtyKey] || 0) > 0;
+          })
           .filter((row) => matchesBranchStockSearch(row, search));
         return { rowCount: 1, rows: [{ total: matches.length }] };
       }
@@ -266,25 +347,65 @@ function createBranchStockMockDb() {
         const hasPaging = Number.isFinite(Number(params[1])) && Number.isFinite(Number(params[2]));
         const limit = hasPaging ? Number(params[1]) : null;
         const offset = hasPaging ? Number(params[2]) : 0;
+        const isAllBranchesDetail = normalized.includes("as unit_cost_avg_branch_000");
         const branchCodeMatch = normalized.match(/qty_branch_(\d{3})\s*>\s*0/);
         const branchCode = branchCodeMatch?.[1] || null;
         const qtyKey = branchCode ? `qty_branch_${branchCode}` : null;
         const costKey = branchCode ? `cost_avg_branch_${branchCode}` : null;
         const rows = [...state.snapshots.values()]
           .map(buildSnapshotViewRow)
-          .filter((row) => (!qtyKey || Number(row[qtyKey] || 0) > 0))
-          .filter((row) => matchesBranchStockSearch(row, search))
+          .map((row) => ({
+            row,
+            stats: isAllBranchesDetail ? buildInventoryBranchStats(row) : null,
+          }))
+          .filter(({ row, stats }) => {
+            if (isAllBranchesDetail) {
+              return stats.hasAnyStock;
+            }
+            return !qtyKey || Number(row[qtyKey] || 0) > 0;
+          })
+          .map(({ row, stats }) => ({
+            row,
+            stats,
+          }))
+          .filter(({ row }) => matchesBranchStockSearch(row, search))
           .sort((left, right) => {
+            if (isAllBranchesDetail) {
+              if (left.stats.totalInventoryValue !== right.stats.totalInventoryValue) {
+                return right.stats.totalInventoryValue - left.stats.totalInventoryValue;
+              }
+              return left.row.product_code.localeCompare(right.row.product_code);
+            }
             if (qtyKey && costKey) {
-              const leftValue = Number(left[qtyKey] || 0) * Number(left[costKey] || 0);
-              const rightValue = Number(right[qtyKey] || 0) * Number(right[costKey] || 0);
+              const leftValue = Number(left.row[qtyKey] || 0) * Number(left.row[costKey] || 0);
+              const rightValue = Number(right.row[qtyKey] || 0) * Number(right.row[costKey] || 0);
               if (leftValue !== rightValue) {
                 return rightValue - leftValue;
               }
             }
-            return left.product_code.localeCompare(right.product_code);
+            return left.row.product_code.localeCompare(right.row.product_code);
           })
-          .map((row) => {
+          .map(({ row, stats }) => {
+            if (isAllBranchesDetail) {
+              const detailRow = {
+                product_code: row.product_code,
+                product_name_thai: row.product_name_thai,
+                product_name_eng: row.product_name_eng,
+                barcode: row.barcode,
+                unit: row.unit,
+                category_name: row.category_name,
+                qty_total_all_branches: stats.qtyTotal,
+                total_inventory_value: stats.totalInventoryValue,
+                synced_at: row.synced_at,
+              };
+              for (const displayBranchCode of DISPLAY_BRANCH_CODES) {
+                detailRow[`qty_branch_${displayBranchCode}`] = stats.branches[displayBranchCode].qty;
+                detailRow[`unit_cost_avg_branch_${displayBranchCode}`] = stats.branches[displayBranchCode].unitCostAvg;
+                detailRow[`inventory_value_branch_${displayBranchCode}`] = stats.branches[displayBranchCode].inventoryValue;
+              }
+              return detailRow;
+            }
+
             if (!qtyKey || !costKey || !normalized.includes("as unit_cost_avg")) {
               return row;
             }
@@ -586,6 +707,95 @@ test("branch stock inventory value detail returns per-product average cost and i
   assert.equal(response.body.products[1].productCode, "630010502");
   assert.equal(response.body.products[1].unitCostAvg, null);
   assert.equal(response.body.products[1].inventoryValue, 0);
+});
+
+test("branch stock inventory value all returns combined summary and compare rows for admins only", async () => {
+  const { app, db } = createTestApp();
+  db.state.snapshots.set("630019001", {
+    product_code: "630019001",
+    product_name_thai: "สินค้ารวม 1",
+    product_name_eng: "Combined 1",
+    barcode: "885000019001",
+    unit: "BOX",
+    qty_branch_000: 2,
+    qty_branch_001: 0,
+    qty_branch_002: 0,
+    qty_branch_003: 0,
+    qty_branch_004: 0,
+    qty_branch_005: 4,
+    qty_total_all_branches: 6,
+    cost_avg_branch_000: 10,
+    cost_avg_branch_005: 12.5,
+    synced_at: "2026-06-17T08:15:00.000Z",
+  });
+  db.state.snapshots.set("630019002", {
+    product_code: "630019002",
+    product_name_thai: "สินค้ารวม 2",
+    product_name_eng: "Combined 2",
+    barcode: "885000019002",
+    unit: "TAB",
+    qty_branch_000: 0,
+    qty_branch_001: 3,
+    qty_branch_002: 0,
+    qty_branch_003: 0,
+    qty_branch_004: 1,
+    qty_branch_005: 0,
+    qty_total_all_branches: 4,
+    cost_avg_branch_001: null,
+    cost_avg_branch_004: 8,
+    synced_at: "2026-06-17T19:20:00.000Z",
+  });
+  db.state.snapshots.set("630019003", {
+    product_code: "630019003",
+    product_name_thai: "ไม่มีสต๊อก",
+    product_name_eng: "No Stock",
+    barcode: "885000019003",
+    unit: "BOT",
+    qty_branch_000: 0,
+    qty_branch_001: 0,
+    qty_branch_002: 0,
+    qty_branch_003: 0,
+    qty_branch_004: 0,
+    qty_branch_005: 0,
+    qty_total_all_branches: 0,
+    synced_at: "2026-06-17T19:30:00.000Z",
+  });
+
+  const adminAgent = request.agent(app);
+  await loginAsAdmin(adminAgent);
+
+  const response = await adminAgent.get("/api/branch-stock/inventory-value?branchCode=all&detail=true&limit=25&offset=0");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.branchCode, "all");
+  assert.equal(response.body.productCount, 3);
+  assert.equal(response.body.productsWithStock, 2);
+  assert.equal(response.body.productsWithCost, 1);
+  assert.equal(response.body.totalInventoryValue, 78);
+  assert.equal(response.body.pagination.total, 2);
+  assert.equal(response.body.branchSummaries.length, 5);
+  assert.deepEqual(
+    response.body.branchSummaries.map((branch) => branch.branchCode),
+    DISPLAY_BRANCH_CODES,
+  );
+  assert.equal(
+    response.body.branchSummaries.find((branch) => branch.branchCode === "000")?.totalInventoryValue,
+    20,
+  );
+  assert.equal(
+    response.body.branchSummaries.find((branch) => branch.branchCode === "001")?.productsWithCost,
+    0,
+  );
+  assert.equal(response.body.products.length, 2);
+  assert.equal(response.body.products[0].productCode, "630019001");
+  assert.equal(response.body.products[0].qtyTotalAllBranches, 6);
+  assert.equal(response.body.products[0].totalInventoryValue, 70);
+  assert.equal(response.body.products[0].branches["000"].qty, 2);
+  assert.equal(response.body.products[0].branches["000"].unitCostAvg, 10);
+  assert.equal(response.body.products[0].branches["005"].inventoryValue, 50);
+  assert.equal(response.body.products[1].productCode, "630019002");
+  assert.equal(response.body.products[1].branches["001"].qty, 3);
+  assert.equal(response.body.products[1].branches["001"].unitCostAvg, null);
+  assert.equal(response.body.products[1].branches["004"].inventoryValue, 8);
 });
 
 test("branch stock export returns branch-specific xlsx rows for authenticated admins", async () => {

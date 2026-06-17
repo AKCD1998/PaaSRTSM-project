@@ -15,6 +15,7 @@ const BRANCH_EXPORT_CONFIG = {
   "004": { label: "สาขา 004", qtyKey: "qtyBranch004", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 004" },
   "005": { label: "สาขา 005", qtyKey: "qtyBranch005", title: "บริษัท เอสซีกรุ๊ป (1989) จำกัด สาขา 005" },
 };
+const INVENTORY_VALUE_BRANCH_ORDER = ["000", "001", "003", "004", "005"];
 
 const { runCategorizationBatch } = require("../categorization");
 
@@ -457,6 +458,89 @@ function mapInventoryValueRow(row) {
   };
 }
 
+function buildInventoryValueBranchConfig(branchCodes) {
+  return branchCodes.map((branchCode) => ({
+    branchCode,
+    label: BRANCH_EXPORT_CONFIG[branchCode]?.label || `สาขา ${branchCode}`,
+    qtyColumn: `qty_branch_${branchCode}`,
+    costColumn: `cost_avg_branch_${branchCode}`,
+  }));
+}
+
+function buildInventoryValueSummaryQueryParts(branchConfig) {
+  const qtyTerms = branchConfig.map(({ qtyColumn }) => `COALESCE(bs.${qtyColumn}, 0)`);
+  const valueTerms = branchConfig.map(
+    ({ qtyColumn, costColumn }) => `(COALESCE(bs.${qtyColumn}, 0) * COALESCE(bs.${costColumn}, 0))`,
+  );
+  const missingCostTerms = branchConfig.map(
+    ({ qtyColumn, costColumn }) => `(COALESCE(bs.${qtyColumn}, 0) > 0 AND bs.${costColumn} IS NULL)`,
+  );
+  const qtyTotalExpression = qtyTerms.join(" + ");
+  const totalInventoryValueExpression = valueTerms.join(" + ");
+  const missingCostExpression = missingCostTerms.join(" OR ");
+  const perBranchSummaryColumns = branchConfig
+    .flatMap(({ branchCode, qtyColumn, costColumn }) => ([
+      `COUNT(*) FILTER (WHERE COALESCE(bs.${qtyColumn}, 0) > 0)::int AS products_with_stock_${branchCode}`,
+      `COUNT(*) FILTER (WHERE COALESCE(bs.${qtyColumn}, 0) > 0 AND bs.${costColumn} IS NOT NULL)::int AS products_with_cost_${branchCode}`,
+      `ROUND(SUM((COALESCE(bs.${qtyColumn}, 0) * COALESCE(bs.${costColumn}, 0)))::numeric, 2) AS total_inventory_value_${branchCode}`,
+    ]))
+    .join(",\n              ");
+
+  return {
+    qtyTotalExpression,
+    totalInventoryValueExpression,
+    hasAnyStockExpression: `(${qtyTotalExpression}) > 0`,
+    missingCostExpression: `(${missingCostExpression})`,
+    perBranchSummaryColumns,
+  };
+}
+
+function buildInventoryValueAllBranchSelectColumns(branchConfig) {
+  return branchConfig
+    .flatMap(({ branchCode, qtyColumn, costColumn }) => ([
+      `bs.${qtyColumn} AS qty_branch_${branchCode}`,
+      `bs.${costColumn} AS unit_cost_avg_branch_${branchCode}`,
+      `ROUND((COALESCE(bs.${qtyColumn}, 0) * COALESCE(bs.${costColumn}, 0))::numeric, 2) AS inventory_value_branch_${branchCode}`,
+    ]))
+    .join(",\n              ");
+}
+
+function mapInventoryValueAllBranchesSummary(row, branchConfig) {
+  return branchConfig.map(({ branchCode, label }) => ({
+    branchCode,
+    label,
+    productsWithStock: Number(row[`products_with_stock_${branchCode}`] || 0),
+    productsWithCost: Number(row[`products_with_cost_${branchCode}`] || 0),
+    totalInventoryValue: Number(row[`total_inventory_value_${branchCode}`] || 0),
+  }));
+}
+
+function mapInventoryValueAllBranchesRow(row, branchConfig) {
+  const branches = {};
+  for (const { branchCode } of branchConfig) {
+    branches[branchCode] = {
+      qty: Number(row[`qty_branch_${branchCode}`] || 0),
+      unitCostAvg: row[`unit_cost_avg_branch_${branchCode}`] == null
+        ? null
+        : Number(row[`unit_cost_avg_branch_${branchCode}`]),
+      inventoryValue: Number(row[`inventory_value_branch_${branchCode}`] || 0),
+    };
+  }
+
+  return {
+    productCode: row.product_code,
+    productNameThai: row.product_name_thai || "",
+    productNameEng: row.product_name_eng || "",
+    barcode: row.barcode || "",
+    unit: row.unit || "",
+    category: row.category_name || "",
+    branches,
+    qtyTotalAllBranches: Number(row.qty_total_all_branches || 0),
+    totalInventoryValue: Number(row.total_inventory_value || 0),
+    syncedAt: row.synced_at || null,
+  };
+}
+
 function buildBranchStockExportWorkbook(rows, branchCode) {
   const branchConfig = BRANCH_EXPORT_CONFIG[branchCode];
   const sheetRows = [
@@ -525,8 +609,6 @@ function buildBranchSheet(rows, branchCode) {
   return worksheet;
 }
 
-const ALL_BRANCHES_EXPORT_ORDER = ["000", "001", "003", "004", "005"];
-
 const COMPARISON_HEADERS = [
   "รหัสสินค้า", "ชื่อสินค้าไทย", "ชื่ออังกฤษ", "Barcode", "หน่วย",
   "หมวดหมู่", "สถานะหมวดหมู่",
@@ -569,7 +651,7 @@ function buildAllBranchesExportWorkbook(rows) {
   XLSX.utils.book_append_sheet(workbook, comparisonSheet, "ทุกสาขา");
 
   // ── Sheets 2–6: Individual branch sheets (same layout as single export) ───
-  for (const branchCode of ALL_BRANCHES_EXPORT_ORDER) {
+  for (const branchCode of INVENTORY_VALUE_BRANCH_ORDER) {
     XLSX.utils.book_append_sheet(workbook, buildBranchSheet(rows, branchCode), branchCode);
   }
 
@@ -1351,8 +1433,9 @@ function createBranchStockRouter(deps) {
     requireRoleMiddleware("admin"),
     async (req, res, next) => {
       const branchCode = normalizeText(req.query.branchCode);
-      if (!ALLOWED_BRANCH_CODES.has(branchCode)) {
-        return res.status(400).json({ message: "branchCode must be one of 000, 001, 002, 003, 004, 005." });
+      const isAllBranches = branchCode === "all";
+      if (!isAllBranches && !ALLOWED_BRANCH_CODES.has(branchCode)) {
+        return res.status(400).json({ message: "branchCode must be one of 000, 001, 002, 003, 004, 005, or all." });
       }
 
       const detail = parseBooleanFlag(req.query.detail);
@@ -1366,9 +1449,128 @@ function createBranchStockRouter(deps) {
       }
 
       const search = normalizeQuery(req.query.search || "");
-      const { qtyColumn, costColumn } = getBranchSnapshotColumnNames(branchCode);
+      const branchConfig = isAllBranches
+        ? buildInventoryValueBranchConfig(INVENTORY_VALUE_BRANCH_ORDER)
+        : [getBranchSnapshotColumnNames(branchCode)];
 
       try {
+        if (isAllBranches) {
+          const {
+            qtyTotalExpression,
+            totalInventoryValueExpression,
+            hasAnyStockExpression,
+            missingCostExpression,
+            perBranchSummaryColumns,
+          } = buildInventoryValueSummaryQueryParts(branchConfig);
+
+          const summaryResult = await db.query(
+            `
+              SELECT
+                COUNT(*)::int AS product_count,
+                COUNT(*) FILTER (WHERE ${hasAnyStockExpression})::int AS products_with_stock,
+                COUNT(*) FILTER (WHERE ${hasAnyStockExpression} AND NOT ${missingCostExpression})::int AS products_with_cost,
+                ROUND(SUM((${totalInventoryValueExpression}))::numeric, 2) AS total_inventory_value,
+                ${perBranchSummaryColumns}
+              FROM ada.branch_stock_snapshots bs
+            `,
+          );
+
+          const summaryRow = summaryResult.rows[0] || {};
+          const summary = {
+            branchCode,
+            productCount: Number(summaryRow.product_count || 0),
+            productsWithStock: Number(summaryRow.products_with_stock || 0),
+            productsWithCost: Number(summaryRow.products_with_cost || 0),
+            totalInventoryValue: Number(summaryRow.total_inventory_value || 0),
+            branchSummaries: mapInventoryValueAllBranchesSummary(summaryRow, branchConfig),
+          };
+
+          if (!detail) {
+            return res.json(summary);
+          }
+
+          const countResult = await db.query(
+            `
+              SELECT COUNT(*)::int AS total
+              FROM ada.branch_stock_snapshots bs
+              LEFT JOIN ada.products p
+                ON p.product_code = bs.product_code
+              LEFT JOIN public.skus s
+                ON s.company_code = bs.product_code
+              LEFT JOIN ada.product_category_states pcs
+                ON pcs.product_code = bs.product_code
+              LEFT JOIN LATERAL (
+                SELECT barcode
+                FROM ada.product_barcodes pb
+                WHERE pb.product_code = bs.product_code
+                ORDER BY
+                  CASE pb.barcode_role
+                    WHEN 'primary' THEN 0
+                    ELSE 1
+                  END,
+                  pb.updated_at DESC,
+                  pb.barcode ASC
+                LIMIT 1
+              ) pb ON TRUE
+              WHERE ${hasAnyStockExpression}
+                AND ${branchStockSearchCondition()}
+            `,
+            [search],
+          );
+
+          const rowsResult = await db.query(
+            `
+              SELECT
+                bs.product_code,
+                COALESCE(bs.product_name_thai, p.product_name_th) AS product_name_thai,
+                COALESCE(bs.product_name_eng, p.product_name) AS product_name_eng,
+                COALESCE(bs.barcode, pb.barcode) AS barcode,
+                COALESCE(bs.unit, p.unit_small, p.unit_medium, p.unit_large) AS unit,
+                COALESCE(pcs.category_name, s.category_name, p.category_name) AS category_name,
+                ${buildInventoryValueAllBranchSelectColumns(branchConfig)},
+                (${qtyTotalExpression}) AS qty_total_all_branches,
+                ROUND((${totalInventoryValueExpression})::numeric, 2) AS total_inventory_value,
+                bs.synced_at
+              FROM ada.branch_stock_snapshots bs
+              LEFT JOIN ada.products p
+                ON p.product_code = bs.product_code
+              LEFT JOIN public.skus s
+                ON s.company_code = bs.product_code
+              LEFT JOIN ada.product_category_states pcs
+                ON pcs.product_code = bs.product_code
+              LEFT JOIN LATERAL (
+                SELECT barcode
+                FROM ada.product_barcodes pb
+                WHERE pb.product_code = bs.product_code
+                ORDER BY
+                  CASE pb.barcode_role
+                    WHEN 'primary' THEN 0
+                    ELSE 1
+                  END,
+                  pb.updated_at DESC,
+                  pb.barcode ASC
+                LIMIT 1
+              ) pb ON TRUE
+              WHERE ${hasAnyStockExpression}
+                AND ${branchStockSearchCondition()}
+              ORDER BY total_inventory_value DESC, bs.product_code ASC
+              LIMIT $2 OFFSET $3
+            `,
+            [search, limit, offset],
+          );
+
+          return res.json({
+            ...summary,
+            products: rowsResult.rows.map((row) => mapInventoryValueAllBranchesRow(row, branchConfig)),
+            pagination: {
+              limit,
+              offset,
+              total: Number(countResult.rows[0]?.total || 0),
+            },
+          });
+        }
+
+        const { qtyColumn, costColumn } = branchConfig[0];
         const summaryResult = await db.query(
           `
             SELECT
