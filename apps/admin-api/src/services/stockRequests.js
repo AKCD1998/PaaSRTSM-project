@@ -1397,6 +1397,96 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
   }
 }
 
+// ---- WP-09: DB-backed notifications (read side; writes happen in WP-08) ----
+
+const NOTIFICATION_LIST_LIMIT = 50;
+
+function mapNotificationRow(row) {
+  return {
+    notificationId: Number(row.notification_id),
+    type: row.type,
+    message: row.message || null,
+    linkTarget: row.link_target || null,
+    batchId: row.batch_id == null ? null : Number(row.batch_id),
+    requestId: row.request_id == null ? null : Number(row.request_id),
+    readAt: row.read_at || null,
+    createdAt: row.created_at,
+  };
+}
+
+async function loadNotificationsByBranch(dbLike, branchCode, limit) {
+  const result = await dbLike.query(
+    `
+      SELECT
+        notification_id,
+        recipient_branch_code,
+        recipient_user,
+        type,
+        batch_id,
+        request_id,
+        message,
+        link_target,
+        dedup_key,
+        read_at,
+        created_at
+      FROM ordering.stock_request_notifications
+      WHERE recipient_branch_code = $1
+      ORDER BY created_at DESC, notification_id DESC
+      LIMIT $2
+    `,
+    [branchCode, limit],
+  );
+  return result.rows;
+}
+
+async function listStockRequestNotifications({ db, auth }) {
+  validateSubmissionAccess(auth);
+  const rows = await loadNotificationsByBranch(db, auth.effectiveBranchCode, NOTIFICATION_LIST_LIMIT);
+  return rows.map(mapNotificationRow);
+}
+
+async function getUnreadNotificationCount({ db, auth }) {
+  validateSubmissionAccess(auth);
+  const result = await db.query(
+    `
+      SELECT COUNT(*)::int AS unread_count
+      FROM ordering.stock_request_notifications
+      WHERE recipient_branch_code = $1
+        AND read_at IS NULL
+    `,
+    [auth.effectiveBranchCode],
+  );
+  return Number(result.rows[0]?.unread_count || 0);
+}
+
+async function markNotificationRead({ db, auth, notificationId }) {
+  validateSubmissionAccess(auth);
+  const numericId = Number(notificationId);
+  if (!Number.isInteger(numericId) || numericId <= 0) {
+    throw createHttpError("Invalid notification id.", 400);
+  }
+
+  const result = await db.query(
+    `
+      UPDATE ordering.stock_request_notifications
+      SET read_at = COALESCE(read_at, now())
+      WHERE notification_id = $1
+        AND recipient_branch_code = $2
+      RETURNING notification_id, read_at
+    `,
+    [numericId, auth.effectiveBranchCode],
+  );
+
+  if (!result.rows.length) {
+    throw createHttpError("Not found", 404);
+  }
+
+  return {
+    notificationId: Number(result.rows[0].notification_id),
+    readAt: result.rows[0].read_at,
+  };
+}
+
 module.exports = {
   submitStockRequestBatch,
   listOutgoingStockRequestBatches,
@@ -1406,6 +1496,9 @@ module.exports = {
   getStockRequestEvents,
   saveLineResponseDraft,
   submitStockRequestResponse,
+  listStockRequestNotifications,
+  getUnreadNotificationCount,
+  markNotificationRead,
   normalizeSubmitPayload,
   formatBatchPublicId,
   formatRequestPublicId,

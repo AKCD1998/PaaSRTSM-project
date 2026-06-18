@@ -11,6 +11,9 @@ const {
   getStockRequestEvents,
   saveLineResponseDraft,
   submitStockRequestResponse,
+  listStockRequestNotifications,
+  getUnreadNotificationCount,
+  markNotificationRead,
 } = require("../services/stockRequests");
 
 function createStockRequestsRouter(deps) {
@@ -167,6 +170,68 @@ function createStockRequestsRouter(deps) {
           ok: true,
           request_id: req.requestId,
           ...result,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.get(
+    "/notifications",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const records = await listStockRequestNotifications({ db, auth: req.auth });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          records,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.get(
+    "/notifications/unread-count",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const unreadCount = await getUnreadNotificationCount({ db, auth: req.auth });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          unreadCount,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
+    "/notifications/:id/read",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await markNotificationRead({
+          db,
+          auth: req.auth,
+          notificationId: req.params.id,
+        });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          notification: result,
         });
       } catch (error) {
         return next(error);

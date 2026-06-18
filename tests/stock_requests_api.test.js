@@ -513,6 +513,43 @@ function createStockRequestMockDb() {
       return { rowCount: batch ? 1 : 0, rows: [] };
     }
 
+    if (
+      normalized.includes("select count(*)::int as unread_count") &&
+      normalized.includes("from ordering.stock_request_notifications")
+    ) {
+      const unread = state.notifications.filter(
+        (row) => row.recipient_branch_code === params[0] && row.read_at == null,
+      ).length;
+      return { rowCount: 1, rows: [{ unread_count: unread }] };
+    }
+
+    if (
+      normalized.includes("from ordering.stock_request_notifications") &&
+      normalized.includes("where recipient_branch_code = $1") &&
+      normalized.includes("limit $2")
+    ) {
+      const rows = state.notifications
+        .filter((row) => row.recipient_branch_code === params[0])
+        .sort(
+          (left, right) =>
+            String(right.created_at || "").localeCompare(String(left.created_at || "")) ||
+            right.notification_id - left.notification_id,
+        )
+        .slice(0, Number(params[1]));
+      return { rowCount: rows.length, rows };
+    }
+
+    if (normalized.startsWith("update ordering.stock_request_notifications set read_at")) {
+      const row = state.notifications.find(
+        (item) => item.notification_id === Number(params[0]) && item.recipient_branch_code === params[1],
+      );
+      if (!row) {
+        return { rowCount: 0, rows: [] };
+      }
+      row.read_at = row.read_at || "2026-06-18T12:10:00.000Z";
+      return { rowCount: 1, rows: [{ notification_id: row.notification_id, read_at: row.read_at }] };
+    }
+
     if (normalized.startsWith("insert into ordering.stock_request_notifications")) {
       const dedupKey = params[7] || null;
       if (dedupKey && state.notifications.some((row) => row.dedup_key === dedupKey)) {
@@ -1180,4 +1217,104 @@ test("a draft line response can be saved without finalizing the request", async 
   assert.equal(ctx.db.state.responses[0].is_submitted, false);
   // request stays open
   assert.equal(ctx.db.state.requests.find((row) => row.public_id === ctx.requestPublicId).status, "SUBMITTED");
+});
+
+test("requester sees an unread notification after a response, and can list and mark it read", async () => {
+  const ctx = await setupIncomingForBranch003();
+  const [lineA, lineB] = ctx.lines;
+
+  // before any response: requester has no notifications
+  const requesterCsrf = await login(ctx.requesterAgent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+  const emptyCount = await ctx.requesterAgent.get("/api/notifications/unread-count");
+  assert.equal(emptyCount.status, 200);
+  assert.equal(emptyCount.body.unreadCount, 0);
+
+  // source branch responds -> notification created for branch 001
+  const submit = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/submit-response`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({
+      responses: [
+        { lineId: lineA.lineId, responseStatus: "APPROVED_FULL" },
+        { lineId: lineB.lineId, responseStatus: "APPROVED_FULL" },
+      ],
+    });
+  assert.equal(submit.status, 200);
+
+  const unread = await ctx.requesterAgent.get("/api/notifications/unread-count");
+  assert.equal(unread.body.unreadCount, 1);
+
+  const list = await ctx.requesterAgent.get("/api/notifications");
+  assert.equal(list.status, 200);
+  assert.equal(list.body.records.length, 1);
+  const notification = list.body.records[0];
+  assert.equal(notification.type, "RESPONSE_SUBMITTED");
+  assert.equal(notification.readAt, null);
+
+  const markRead = await ctx.requesterAgent
+    .post(`/api/notifications/${notification.notificationId}/read`)
+    .set("x-csrf-token", requesterCsrf);
+  assert.equal(markRead.status, 200);
+  assert.ok(markRead.body.notification.readAt);
+
+  const afterRead = await ctx.requesterAgent.get("/api/notifications/unread-count");
+  assert.equal(afterRead.body.unreadCount, 0);
+});
+
+test("a branch cannot see or mark another branch's notifications", async () => {
+  const ctx = await setupIncomingForBranch003();
+  const [lineA, lineB] = ctx.lines;
+
+  const submit = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/submit-response`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({
+      responses: [
+        { lineId: lineA.lineId, responseStatus: "APPROVED_FULL" },
+        { lineId: lineB.lineId, responseStatus: "APPROVED_FULL" },
+      ],
+    });
+  assert.equal(submit.status, 200);
+
+  // the notification belongs to branch 001; branch 003 must not see it
+  const sourceList = await ctx.sourceAgent.get("/api/notifications");
+  assert.equal(sourceList.status, 200);
+  assert.equal(sourceList.body.records.length, 0);
+
+  const sourceCount = await ctx.sourceAgent.get("/api/notifications/unread-count");
+  assert.equal(sourceCount.body.unreadCount, 0);
+
+  // branch 003 trying to mark branch 001's notification -> 404
+  const notificationId = ctx.db.state.notifications[0].notification_id;
+  const forbidden = await ctx.sourceAgent
+    .post(`/api/notifications/${notificationId}/read`)
+    .set("x-csrf-token", ctx.sourceCsrf);
+  assert.equal(forbidden.status, 404);
+});
+
+test("csrf is enforced on marking a notification read", async () => {
+  const ctx = await setupIncomingForBranch003();
+  const [lineA, lineB] = ctx.lines;
+
+  await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/submit-response`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({
+      responses: [
+        { lineId: lineA.lineId, responseStatus: "APPROVED_FULL" },
+        { lineId: lineB.lineId, responseStatus: "APPROVED_FULL" },
+      ],
+    });
+
+  await login(ctx.requesterAgent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+  const notificationId = ctx.db.state.notifications[0].notification_id;
+  const response = await ctx.requesterAgent.post(`/api/notifications/${notificationId}/read`);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.error, "CSRF token invalid");
 });
