@@ -269,6 +269,42 @@ test("admins can set and clear explicit branch override and csrf stays enforced"
   assert.ok(db.state.auditActions.includes("auth.branch_override_cleared"));
 });
 
+test("staff users can set and clear explicit branch override", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+
+  const loginResponse = await loginAs(agent, {
+    username: "staff@example.com",
+    password: "staff-pass-123",
+  });
+  const csrfToken = loginResponse.body.csrf_token;
+
+  const overrideResponse = await agent
+    .post("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken)
+    .send({ branchCode: "000" });
+
+  assert.equal(overrideResponse.status, 200);
+  assert.equal(overrideResponse.body.user.role, "staff");
+  assert.equal(overrideResponse.body.user.effective_branch_code, "000");
+  assert.equal(overrideResponse.body.user.is_branch_override, true);
+
+  const meResponse = await agent.get("/admin/me");
+  assert.equal(meResponse.status, 200);
+  assert.equal(meResponse.body.user.effective_branch_code, "000");
+  assert.equal(meResponse.body.permissions.can_select_branch_context, true);
+
+  const clearResponse = await agent
+    .delete("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken);
+
+  assert.equal(clearResponse.status, 200);
+  assert.equal(clearResponse.body.user.effective_branch_code, null);
+  assert.equal(clearResponse.body.user.is_branch_override, false);
+  assert.ok(db.state.auditActions.includes("auth.branch_override_set"));
+  assert.ok(db.state.auditActions.includes("auth.branch_override_cleared"));
+});
+
 test("inactive branch assignments and invalid override branch codes are rejected", async () => {
   const { app } = createTestApp();
   const inactiveAgent = request.agent(app);
@@ -312,4 +348,108 @@ test("logout clears the authenticated branch context with the session cookie", a
 
   const meResponse = await agent.get("/admin/me");
   assert.equal(meResponse.status, 401);
+});
+
+function createTestAppWithAllowlist(allowlistMap) {
+  const base = buildConfig();
+  const config = {
+    ...base,
+    staffBranchAllowlists: allowlistMap,
+  };
+  const db = createMockDb();
+  const { app: baseApp } = createApp({ config, db, runImporter: async () => ({}), runExcelPriceImporter: async () => ({}), runRuleApplication: async () => ({}) });
+  const app = require("express")();
+  app.use(require("express").json({ limit: "1mb" }));
+  app.use(require("cookie-parser")());
+  app.use(baseApp);
+  return { app, db, config };
+}
+
+test("staff with branch allowlist can override to an allowed branch", async () => {
+  const { app, db } = createTestAppWithAllowlist(
+    new Map([["staff@example.com", new Set(["000", "001"])]]),
+  );
+  const agent = request.agent(app);
+
+  const loginResponse = await loginAs(agent, {
+    username: "staff@example.com",
+    password: "staff-pass-123",
+  });
+  assert.equal(loginResponse.status, 200);
+  assert.deepEqual(loginResponse.body.permissions.allowed_branch_codes, ["000", "001"]);
+  const csrfToken = loginResponse.body.csrf_token;
+
+  const overrideResponse = await agent
+    .post("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken)
+    .send({ branchCode: "001" });
+
+  assert.equal(overrideResponse.status, 200);
+  assert.equal(overrideResponse.body.user.effective_branch_code, "001");
+  assert.ok(db.state.auditActions.includes("auth.branch_override_set"));
+});
+
+test("staff with branch allowlist cannot override to a branch not in their allowlist", async () => {
+  const { app, db } = createTestAppWithAllowlist(
+    new Map([["staff@example.com", new Set(["001"])]]),
+  );
+  const agent = request.agent(app);
+
+  const loginResponse = await loginAs(agent, {
+    username: "staff@example.com",
+    password: "staff-pass-123",
+  });
+  const csrfToken = loginResponse.body.csrf_token;
+
+  const overrideResponse = await agent
+    .post("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken)
+    .send({ branchCode: "000" });
+
+  assert.equal(overrideResponse.status, 403);
+  assert.equal(overrideResponse.body.error, "Branch not in allowlist");
+  assert.ok(db.state.auditActions.includes("auth.branch_override_denied"));
+});
+
+test("admin is never restricted by staff allowlist even if one is configured", async () => {
+  const { app } = createTestAppWithAllowlist(
+    new Map([["staff@example.com", new Set(["001"])]]),
+  );
+  const agent = request.agent(app);
+
+  const loginResponse = await loginAs(agent, {
+    username: "admin@example.com",
+    password: "admin-pass-123",
+  });
+  const csrfToken = loginResponse.body.csrf_token;
+
+  const overrideResponse = await agent
+    .post("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken)
+    .send({ branchCode: "000" });
+
+  assert.equal(overrideResponse.status, 200);
+  assert.equal(overrideResponse.body.user.effective_branch_code, "000");
+});
+
+test("staff with no allowlist entry can override to any branch (backward compatibility)", async () => {
+  const { app } = createTestAppWithAllowlist(new Map());
+  const agent = request.agent(app);
+
+  const loginResponse = await loginAs(agent, {
+    username: "staff@example.com",
+    password: "staff-pass-123",
+  });
+  const csrfToken = loginResponse.body.csrf_token;
+
+  const meResponse = await agent.get("/admin/me");
+  assert.equal(meResponse.body.permissions.allowed_branch_codes, null);
+
+  const overrideResponse = await agent
+    .post("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken)
+    .send({ branchCode: "000" });
+
+  assert.equal(overrideResponse.status, 200);
+  assert.equal(overrideResponse.body.user.effective_branch_code, "000");
 });

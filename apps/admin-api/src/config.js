@@ -63,6 +63,40 @@ function parseCsvSet(value, options = {}) {
   );
 }
 
+// Parse STAFF_BRANCH_ALLOWLISTS: "user1@example.com:001|002;user2@example.com:003"
+// Returns Map<userId, Set<branchCode>>
+function parseMultiValueMap(value, options = {}) {
+  if (!value) {
+    return new Map();
+  }
+  const normalizeKey = typeof options.normalizeKey === "function" ? options.normalizeKey : (k) => k;
+  const normalizeItem = typeof options.normalizeItem === "function" ? options.normalizeItem : (v) => v;
+  const entrySeparator = options.entrySeparator || ";";
+  const valueSeparator = options.valueSeparator || "|";
+
+  const map = new Map();
+  for (const rawEntry of String(value).split(entrySeparator)) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const separatorIndex = entry.indexOf(":");
+    if (separatorIndex <= 0 || separatorIndex === entry.length - 1) continue;
+    const key = normalizeKey(entry.slice(0, separatorIndex).trim());
+    if (!key) continue;
+    const items = new Set(
+      entry
+        .slice(separatorIndex + 1)
+        .trim()
+        .split(valueSeparator)
+        .map((v) => normalizeItem(v.trim()))
+        .filter(Boolean),
+    );
+    if (items.size > 0) {
+      map.set(key, items);
+    }
+  }
+  return map;
+}
+
 function parseKeyValueMap(value, options = {}) {
   if (!value) {
     return new Map();
@@ -161,6 +195,10 @@ function loadConfig(env = process.env) {
     posApiKeys: parseCsvSet(env.POS_API_KEYS || ""),
     crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
     crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",
+    staffBranchAllowlists: parseMultiValueMap(env.STAFF_BRANCH_ALLOWLISTS || "", {
+      normalizeKey: (k) => String(k || "").trim().toLowerCase(),
+      normalizeItem: (v) => (/^\d{3}$/.test(String(v || "").trim()) ? String(v).trim() : null),
+    }),
   };
 }
 

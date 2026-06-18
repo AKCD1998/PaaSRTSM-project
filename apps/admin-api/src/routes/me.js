@@ -1,20 +1,20 @@
 "use strict";
 
 const express = require("express");
+const { buildPermissionsResponse } = require("../auth/users");
 
 function createMeRouter(deps) {
-  const { requireAuthMiddleware } = deps;
+  const { requireAuthMiddleware, config } = deps;
   const router = express.Router();
 
   router.get("/", requireAuthMiddleware, (req, res) => {
-    const role = req.auth.role;
-    const canWrite = role === "admin";
+    const { role, userId } = req.auth;
 
     return res.json({
       ok: true,
       request_id: req.requestId,
       user: {
-        id: req.auth.userId,
+        id: userId,
         role,
         branch_code: req.auth.effectiveBranchCode || null,
         actor_branch_code: req.auth.actorBranchCode || null,
@@ -22,11 +22,7 @@ function createMeRouter(deps) {
         is_branch_override: Boolean(req.auth.isBranchOverride),
       },
       csrf_token: req.auth.csrf,
-      permissions: {
-        can_edit_products: canWrite,
-        can_run_imports: canWrite,
-        can_apply_rules: canWrite,
-      },
+      permissions: buildPermissionsResponse(role, userId, config),
     });
   });
 

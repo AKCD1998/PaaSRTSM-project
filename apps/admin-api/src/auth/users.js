@@ -69,6 +69,37 @@ function getPasswordHashForRole(role, config) {
   return "";
 }
 
+function resolveStaffBranchAllowlist(userId, config) {
+  const allowlists = config?.staffBranchAllowlists;
+  if (!allowlists || !(allowlists instanceof Map) || allowlists.size === 0) {
+    return null;
+  }
+  const normalized = normalizeUserId(userId);
+  if (!allowlists.has(normalized)) {
+    return null;
+  }
+  return allowlists.get(normalized);
+}
+
+function buildPermissionsResponse(role, userId, config) {
+  const canWrite = role === "admin";
+  const canSelectBranchContext = role === "admin" || role === "staff";
+  let allowedBranchCodes = null;
+  if (role === "staff") {
+    const allowlist = resolveStaffBranchAllowlist(userId, config);
+    if (allowlist !== null) {
+      allowedBranchCodes = [...allowlist].sort();
+    }
+  }
+  return {
+    can_edit_products: canWrite,
+    can_run_imports: canWrite,
+    can_apply_rules: canWrite,
+    can_select_branch_context: canSelectBranchContext,
+    allowed_branch_codes: allowedBranchCodes,
+  };
+}
+
 async function findBranchRecordByCode(db, branchCode) {
   const normalized = normalizeBranchCode(branchCode);
   if (!normalized || !db || typeof db.query !== "function") {
@@ -103,5 +134,7 @@ module.exports = {
   resolveConfiguredUserAccount,
   resolveUserRole,
   getPasswordHashForRole,
+  resolveStaffBranchAllowlist,
+  buildPermissionsResponse,
   findBranchRecordByCode,
 };

@@ -8,6 +8,8 @@ const {
   normalizeUserId,
   normalizeBranchCode,
   resolveConfiguredUserAccount,
+  resolveStaffBranchAllowlist,
+  buildPermissionsResponse,
   findBranchRecordByCode,
 } = require("../auth/users");
 const {
@@ -216,6 +218,7 @@ function createAuthRouter(deps) {
       request_id: req.requestId,
       user: buildUserResponse(sessionIdentity),
       csrf_token: csrfToken,
+      permissions: buildPermissionsResponse(sessionIdentity.role, sessionIdentity.userId, config),
     });
   });
 
@@ -227,13 +230,13 @@ function createAuthRouter(deps) {
       });
     }
 
-    if (req.auth.role !== "admin") {
+    if (!["admin", "staff"].includes(req.auth.role)) {
       await auditLog(
         db,
         auditBase(req, {
           action: "auth.branch_override_denied",
           success: false,
-          message: "Only admins can override branch context",
+          message: "Only admin/staff can override branch context",
           meta: {
             requested_branch_code: req.body?.branchCode || req.body?.branch_code || null,
           },
@@ -265,6 +268,28 @@ function createAuthRouter(deps) {
         error: "Branch inactive",
         request_id: req.requestId,
       });
+    }
+
+    if (req.auth.role === "staff") {
+      const allowlist = resolveStaffBranchAllowlist(req.auth.userId, config);
+      if (allowlist !== null && !allowlist.has(requestedBranchCode)) {
+        await auditLog(
+          db,
+          auditBase(req, {
+            action: "auth.branch_override_denied",
+            success: false,
+            message: "Branch not in staff allowlist",
+            meta: {
+              requested_branch_code: requestedBranchCode,
+              allowed_branch_codes: [...allowlist],
+            },
+          }),
+        );
+        return res.status(403).json({
+          error: "Branch not in allowlist",
+          request_id: req.requestId,
+        });
+      }
     }
 
     const sessionIdentity = buildSessionIdentity(
@@ -311,13 +336,13 @@ function createAuthRouter(deps) {
       });
     }
 
-    if (req.auth.role !== "admin") {
+    if (!["admin", "staff"].includes(req.auth.role)) {
       await auditLog(
         db,
         auditBase(req, {
           action: "auth.branch_override_denied",
           success: false,
-          message: "Only admins can clear branch context overrides",
+          message: "Only admin/staff can clear branch context overrides",
         }),
       );
       return res.status(403).json({

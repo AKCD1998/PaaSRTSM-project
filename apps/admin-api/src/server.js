@@ -142,6 +142,7 @@ function createApp(overrides = {}) {
     "/admin/me",
     createMeRouter({
       requireAuthMiddleware,
+      config,
     }),
   );
   app.use(
