@@ -1512,6 +1512,177 @@ async function acknowledgeStockRequest({ db, auth, requestPublicId, body, reques
   }
 }
 
+// ---- WP-12: printable packing document (immutable versioned snapshot) ----
+
+function ensureCanAccessDocument(auth, requestRow) {
+  if (canAdminReadAll(auth)) {
+    return;
+  }
+  const branch = auth?.effectiveBranchCode;
+  if (!branch || (requestRow.source_branch_code !== branch && requestRow.requesting_branch_code !== branch)) {
+    throw createHttpError("Forbidden", 403);
+  }
+}
+
+async function loadMaxDocumentForRequest(client, requestId) {
+  const result = await client.query(
+    `
+      SELECT document_id, version
+      FROM ordering.stock_request_documents
+      WHERE request_id = $1
+      ORDER BY version DESC
+      LIMIT 1
+    `,
+    [requestId],
+  );
+  return result.rows[0] || null;
+}
+
+async function loadLatestDocumentPayload(dbLike, requestId) {
+  const result = await dbLike.query(
+    `
+      SELECT document_id, request_id, version, document_payload, generated_by, generated_at, reprint_of
+      FROM ordering.stock_request_documents
+      WHERE request_id = $1
+      ORDER BY version DESC
+      LIMIT 1
+    `,
+    [requestId],
+  );
+  return result.rows[0] || null;
+}
+
+async function insertDocument(client, { requestId, version, payload, generatedBy, reprintOf }) {
+  const result = await client.query(
+    `
+      INSERT INTO ordering.stock_request_documents
+        (request_id, version, document_payload, generated_by, reprint_of)
+      VALUES
+        ($1, $2, $3::jsonb, $4, $5)
+      RETURNING document_id, generated_at
+    `,
+    [requestId, version, JSON.stringify(payload), generatedBy, reprintOf],
+  );
+  return result.rows[0];
+}
+
+// Freeze the request/response state into the immutable document body (plan §13).
+function buildDocumentPayload({ requestRow, batchRow, lineRows, responseMap, version }) {
+  return {
+    requestPublicId: requestRow.public_id,
+    batchPublicId: batchRow?.public_id || null,
+    sourceBranchCode: requestRow.source_branch_code,
+    requestingBranchCode: requestRow.requesting_branch_code,
+    requestedAt: batchRow?.submitted_at || null,
+    respondedAt: requestRow.responded_at || null,
+    version,
+    lines: lineRows.map((lineRow) => {
+      const response = responseMap.get(Number(lineRow.line_id)) || null;
+      return {
+        productCode: lineRow.product_code,
+        productNameThai: lineRow.product_name_thai || null,
+        productNameEng: lineRow.product_name_eng || null,
+        barcode: lineRow.barcode || null,
+        unit: lineRow.unit,
+        requestedQty: Number(lineRow.requested_qty || 0),
+        approvedQty: response ? Number(response.approved_qty || 0) : 0,
+        responseStatus: response ? response.response_status : "PENDING",
+        reason: response ? response.reason_code || response.note || null : null,
+      };
+    }),
+  };
+}
+
+// WP-12: source branch generates (or reprints) the packing document. Reprints add
+// a new immutable version row; historical versions are never mutated.
+async function generateStockRequestDocument({ db, auth, requestPublicId, requestId }) {
+  validateSubmissionAccess(auth);
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const requestRow = await loadRequestByPublicId(client, requestPublicId);
+    if (!requestRow) {
+      throw createHttpError("Not found", 404);
+    }
+    ensureCanReadIncomingRequest(auth, requestRow); // source branch (or admin) only
+    if (requestRow.status === "SUBMITTED" || requestRow.status === "CANCELLED") {
+      throw createHttpError("A document can only be generated after the request has been responded to.", 409);
+    }
+
+    const lineRows = await loadLineRowsByRequestIds(client, [requestRow.request_id]);
+    const responseRows = await loadLatestSubmittedResponsesByLineIds(
+      client,
+      lineRows.map((row) => row.line_id),
+    );
+    const responseMap = new Map(responseRows.map((row) => [Number(row.line_id), row]));
+    const batchRow = await loadBatchById(client, requestRow.batch_id);
+
+    const previous = await loadMaxDocumentForRequest(client, requestRow.request_id);
+    const version = previous ? Number(previous.version) + 1 : 1;
+    const payload = buildDocumentPayload({ requestRow, batchRow, lineRows, responseMap, version });
+
+    const inserted = await insertDocument(client, {
+      requestId: requestRow.request_id,
+      version,
+      payload,
+      generatedBy: auth.userId,
+      reprintOf: previous ? previous.document_id : null,
+    });
+
+    await insertEvent(client, {
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      eventType: version > 1 ? "DOCUMENT_REPRINTED" : "DOCUMENT_GENERATED",
+      actorUser: auth.userId,
+      actorBranch: auth.effectiveBranchCode,
+      metadata: { document_id: Number(inserted.document_id), version },
+      requestCorrelationId: requestId,
+    });
+
+    await client.query("COMMIT");
+    return {
+      documentId: Number(inserted.document_id),
+      version,
+      reprint: version > 1,
+      document: { ...payload, generatedAt: inserted.generated_at, generatedBy: auth.userId },
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback shadow errors
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getStockRequestDocument({ db, auth, requestPublicId }) {
+  validateSubmissionAccess(auth);
+
+  const requestRow = await loadRequestByPublicId(db, requestPublicId);
+  if (!requestRow) {
+    throw createHttpError("Not found", 404);
+  }
+  ensureCanAccessDocument(auth, requestRow);
+
+  const row = await loadLatestDocumentPayload(db, requestRow.request_id);
+  if (!row) {
+    throw createHttpError("No document has been generated for this request.", 404);
+  }
+
+  const payload =
+    typeof row.document_payload === "string" ? JSON.parse(row.document_payload) : row.document_payload;
+  return {
+    documentId: Number(row.document_id),
+    version: Number(row.version),
+    reprint: Number(row.version) > 1,
+    document: { ...payload, generatedAt: row.generated_at, generatedBy: row.generated_by || null },
+  };
+}
+
 // ---- WP-09: DB-backed notifications (read side; writes happen in WP-08) ----
 
 const NOTIFICATION_LIST_LIMIT = 50;
@@ -1612,6 +1783,8 @@ module.exports = {
   saveLineResponseDraft,
   submitStockRequestResponse,
   acknowledgeStockRequest,
+  generateStockRequestDocument,
+  getStockRequestDocument,
   listStockRequestNotifications,
   getUnreadNotificationCount,
   markNotificationRead,

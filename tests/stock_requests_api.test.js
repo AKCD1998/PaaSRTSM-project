@@ -86,6 +86,7 @@ function createInitialState() {
     lines: [],
     responses: [],
     notifications: [],
+    documents: [],
     events: [],
     txLog: [],
     nextBatchId: 1,
@@ -93,6 +94,7 @@ function createInitialState() {
     nextLineId: 1,
     nextResponseId: 1,
     nextNotificationId: 1,
+    nextDocumentId: 1,
     nextEventId: 1,
     failOnLineProductCode: null,
   };
@@ -108,6 +110,7 @@ function cloneState(state) {
     lines: state.lines.map((row) => ({ ...row })),
     responses: state.responses.map((row) => ({ ...row })),
     notifications: state.notifications.map((row) => ({ ...row })),
+    documents: state.documents.map((row) => ({ ...row })),
     events: state.events.map((row) => ({ ...row })),
     txLog: [...state.txLog],
     nextBatchId: state.nextBatchId,
@@ -115,6 +118,7 @@ function cloneState(state) {
     nextLineId: state.nextLineId,
     nextResponseId: state.nextResponseId,
     nextNotificationId: state.nextNotificationId,
+    nextDocumentId: state.nextDocumentId,
     nextEventId: state.nextEventId,
     failOnLineProductCode: state.failOnLineProductCode,
   };
@@ -529,6 +533,43 @@ function createStockRequestMockDb() {
         batch.status = params[1];
       }
       return { rowCount: batch ? 1 : 0, rows: [] };
+    }
+
+    if (
+      normalized.includes("select document_id, request_id, version, document_payload") &&
+      normalized.includes("from ordering.stock_request_documents")
+    ) {
+      const rows = state.documents
+        .filter((row) => row.request_id === Number(params[0]))
+        .sort((left, right) => right.version - left.version)
+        .slice(0, 1);
+      return { rowCount: rows.length, rows };
+    }
+
+    if (
+      normalized.includes("select document_id, version") &&
+      normalized.includes("from ordering.stock_request_documents")
+    ) {
+      const rows = state.documents
+        .filter((row) => row.request_id === Number(params[0]))
+        .sort((left, right) => right.version - left.version)
+        .slice(0, 1)
+        .map((row) => ({ document_id: row.document_id, version: row.version }));
+      return { rowCount: rows.length, rows };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_documents")) {
+      const row = {
+        document_id: state.nextDocumentId++,
+        request_id: Number(params[0]),
+        version: Number(params[1]),
+        document_payload: typeof params[2] === "string" ? JSON.parse(params[2]) : params[2],
+        generated_by: params[3],
+        reprint_of: params[4] == null ? null : Number(params[4]),
+        generated_at: "2026-06-18T12:20:00.000Z",
+      };
+      state.documents.push(row);
+      return { rowCount: 1, rows: [{ document_id: row.document_id, generated_at: row.generated_at }] };
     }
 
     if (
@@ -1442,6 +1483,90 @@ test("csrf is enforced on acknowledge", async () => {
     .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
     .send({ version: ctx.childVersion });
 
+  assert.equal(response.status, 403);
+  assert.equal(response.body.error, "CSRF token invalid");
+});
+
+test("source branch generates a packing document and the requester can read it", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const generate = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/document`)
+    .set("x-csrf-token", ctx.sourceCsrf);
+
+  assert.equal(generate.status, 200);
+  assert.equal(generate.body.version, 1);
+  assert.equal(generate.body.reprint, false);
+  assert.equal(generate.body.document.sourceBranchCode, "003");
+  assert.equal(generate.body.document.requestingBranchCode, "001");
+  assert.equal(generate.body.document.lines.length, 2);
+  assert.equal(generate.body.document.lines[0].responseStatus, "APPROVED_FULL");
+  assert.equal(ctx.db.state.documents.length, 1);
+  assert.ok(ctx.db.state.events.some((row) => row.event_type === "DOCUMENT_GENERATED"));
+
+  // requesting branch can read the immutable document
+  const read = await ctx.requesterAgent.get(`/api/stock-requests/${ctx.requestPublicId}/document`);
+  assert.equal(read.status, 200);
+  assert.equal(read.body.version, 1);
+  assert.equal(read.body.document.requestPublicId, ctx.requestPublicId);
+});
+
+test("regenerating a document creates a new version (reprint) without mutating the first", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const first = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/document`)
+    .set("x-csrf-token", ctx.sourceCsrf);
+  const second = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/document`)
+    .set("x-csrf-token", ctx.sourceCsrf);
+
+  assert.equal(first.body.version, 1);
+  assert.equal(second.body.version, 2);
+  assert.equal(second.body.reprint, true);
+  assert.equal(ctx.db.state.documents.length, 2);
+  assert.equal(ctx.db.state.documents[1].reprint_of, ctx.db.state.documents[0].document_id);
+  assert.ok(ctx.db.state.events.some((row) => row.event_type === "DOCUMENT_REPRINTED"));
+
+  // GET returns the latest version
+  const read = await ctx.sourceAgent.get(`/api/stock-requests/${ctx.requestPublicId}/document`);
+  assert.equal(read.body.version, 2);
+});
+
+test("a document cannot be generated before the request is responded to", async () => {
+  const ctx = await setupIncomingForBranch003();
+
+  const response = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/document`)
+    .set("x-csrf-token", ctx.sourceCsrf);
+
+  assert.equal(response.status, 409);
+  assert.equal(ctx.db.state.documents.length, 0);
+});
+
+test("only the source branch may generate the document", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/document`)
+    .set("x-csrf-token", ctx.requesterCsrf);
+
+  assert.equal(response.status, 403);
+});
+
+test("reading a document returns 404 before one is generated", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.requesterAgent.get(`/api/stock-requests/${ctx.requestPublicId}/document`);
+  assert.equal(response.status, 404);
+});
+
+test("csrf is enforced on document generation", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.sourceAgent.post(
+    `/api/stock-requests/incoming/${ctx.requestPublicId}/document`,
+  );
   assert.equal(response.status, 403);
   assert.equal(response.body.error, "CSRF token invalid");
 });

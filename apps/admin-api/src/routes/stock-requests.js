@@ -12,6 +12,8 @@ const {
   saveLineResponseDraft,
   submitStockRequestResponse,
   acknowledgeStockRequest,
+  generateStockRequestDocument,
+  getStockRequestDocument,
   listStockRequestNotifications,
   getUnreadNotificationCount,
   markNotificationRead,
@@ -166,6 +168,54 @@ function createStockRequestsRouter(deps) {
           requestPublicId: req.params.publicId,
           body: req.body,
           requestId: req.requestId,
+        });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          ...result,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
+    "/stock-requests/incoming/:publicId/document",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await generateStockRequestDocument({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
+          requestId: req.requestId,
+        });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          ...result,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.get(
+    "/stock-requests/:publicId/document",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await getStockRequestDocument({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
         });
         return res.json({
           ok: true,
