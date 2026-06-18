@@ -6,6 +6,16 @@ const bcrypt = require("bcryptjs");
 const request = require("supertest");
 
 const { createApp } = require("../apps/admin-api/src/server");
+const {
+  formatBatchPublicId,
+} = require("../apps/admin-api/src/services/stockRequests");
+
+test("batch public IDs format PostgreSQL Date values as UTC YYYYMMDD", () => {
+  assert.equal(
+    formatBatchPublicId(new Date("2026-06-18T15:27:29.000Z"), "001", 1),
+    "SRQ-20260618-001-000001",
+  );
+});
 
 function buildConfig() {
   return {
@@ -87,6 +97,10 @@ function createInitialState() {
     responses: [],
     notifications: [],
     documents: [],
+    shipments: [],
+    shipmentLines: [],
+    receipts: [],
+    receiptLines: [],
     events: [],
     txLog: [],
     nextBatchId: 1,
@@ -95,6 +109,10 @@ function createInitialState() {
     nextResponseId: 1,
     nextNotificationId: 1,
     nextDocumentId: 1,
+    nextShipmentId: 1,
+    nextShipmentLineId: 1,
+    nextReceiptId: 1,
+    nextReceiptLineId: 1,
     nextEventId: 1,
     failOnLineProductCode: null,
   };
@@ -111,6 +129,10 @@ function cloneState(state) {
     responses: state.responses.map((row) => ({ ...row })),
     notifications: state.notifications.map((row) => ({ ...row })),
     documents: state.documents.map((row) => ({ ...row })),
+    shipments: state.shipments.map((row) => ({ ...row })),
+    shipmentLines: state.shipmentLines.map((row) => ({ ...row })),
+    receipts: state.receipts.map((row) => ({ ...row })),
+    receiptLines: state.receiptLines.map((row) => ({ ...row })),
     events: state.events.map((row) => ({ ...row })),
     txLog: [...state.txLog],
     nextBatchId: state.nextBatchId,
@@ -119,6 +141,10 @@ function cloneState(state) {
     nextResponseId: state.nextResponseId,
     nextNotificationId: state.nextNotificationId,
     nextDocumentId: state.nextDocumentId,
+    nextShipmentId: state.nextShipmentId,
+    nextShipmentLineId: state.nextShipmentLineId,
+    nextReceiptId: state.nextReceiptId,
+    nextReceiptLineId: state.nextReceiptLineId,
     nextEventId: state.nextEventId,
     failOnLineProductCode: state.failOnLineProductCode,
   };
@@ -527,6 +553,104 @@ function createStockRequestMockDb() {
       return { rowCount: 1, rows: [{ request_id: requestRow.request_id, version: requestRow.version }] };
     }
 
+    if (normalized.startsWith("update ordering.stock_requests set status = $2, version = version + 1")) {
+      const requestRow = state.requests.find(
+        (row) =>
+          row.request_id === Number(params[0]) &&
+          row.status === params[2] &&
+          (params[3] == null || Number(row.version) === Number(params[3])),
+      );
+      if (!requestRow) {
+        return { rowCount: 0, rows: [] };
+      }
+      requestRow.status = params[1];
+      requestRow.version = Number(requestRow.version) + 1;
+      requestRow.updated_at = "2026-06-18T12:30:00.000Z";
+      return { rowCount: 1, rows: [{ request_id: requestRow.request_id, version: requestRow.version }] };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_shipments")) {
+      const row = {
+        shipment_id: state.nextShipmentId++,
+        request_id: Number(params[0]),
+        dispatched_by: params[1],
+        note: params[2],
+        dispatched_at: "2026-06-18T12:30:00.000Z",
+      };
+      state.shipments.push(row);
+      return { rowCount: 1, rows: [{ shipment_id: row.shipment_id, dispatched_at: row.dispatched_at }] };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_shipment_lines")) {
+      state.shipmentLines.push({
+        shipment_line_id: state.nextShipmentLineId++,
+        shipment_id: Number(params[0]),
+        line_id: Number(params[1]),
+        dispatched_qty: Number(params[2]),
+      });
+      return { rowCount: 1, rows: [] };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_receipts")) {
+      const row = {
+        receipt_id: state.nextReceiptId++,
+        request_id: Number(params[0]),
+        received_by: params[1],
+        note: params[2],
+        received_at: "2026-06-18T12:35:00.000Z",
+      };
+      state.receipts.push(row);
+      return { rowCount: 1, rows: [{ receipt_id: row.receipt_id, received_at: row.received_at }] };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_receipt_lines")) {
+      state.receiptLines.push({
+        receipt_line_id: state.nextReceiptLineId++,
+        receipt_id: Number(params[0]),
+        line_id: Number(params[1]),
+        received_qty: Number(params[2]),
+      });
+      return { rowCount: 1, rows: [] };
+    }
+
+    if (
+      normalized.includes("select shipment_id, dispatched_by, note, dispatched_at") &&
+      normalized.includes("from ordering.stock_request_shipments")
+    ) {
+      const rows = state.shipments
+        .filter((row) => row.request_id === Number(params[0]))
+        .sort((left, right) => right.shipment_id - left.shipment_id);
+      return { rowCount: rows.length, rows };
+    }
+
+    if (
+      normalized.includes("select receipt_id, received_by, note, received_at") &&
+      normalized.includes("from ordering.stock_request_receipts")
+    ) {
+      const rows = state.receipts
+        .filter((row) => row.request_id === Number(params[0]))
+        .sort((left, right) => right.receipt_id - left.receipt_id);
+      return { rowCount: rows.length, rows };
+    }
+
+    if (
+      normalized.includes("select shipment_id, line_id, dispatched_qty") &&
+      normalized.includes("from ordering.stock_request_shipment_lines")
+    ) {
+      const ids = Array.isArray(params[0]) ? params[0].map(Number) : [];
+      const rows = state.shipmentLines.filter((row) => ids.includes(Number(row.shipment_id)));
+      return { rowCount: rows.length, rows };
+    }
+
+    if (
+      normalized.includes("select receipt_id, line_id, received_qty") &&
+      normalized.includes("from ordering.stock_request_receipt_lines")
+    ) {
+      const ids = Array.isArray(params[0]) ? params[0].map(Number) : [];
+      const rows = state.receiptLines.filter((row) => ids.includes(Number(row.receipt_id)));
+      return { rowCount: rows.length, rows };
+    }
+
     if (normalized.startsWith("update ordering.stock_request_batches set status = $2")) {
       const batch = state.batches.find((row) => row.batch_id === Number(params[0]));
       if (batch) {
@@ -778,6 +902,13 @@ test("branch user submits one batch that fans out into child requests and line e
   assert.equal(db.state.requests.length, 2);
   assert.equal(db.state.lines.length, 3);
   assert.equal(db.state.events.length, 6);
+  assert.deepEqual(
+    db.state.notifications.map((item) => [item.recipient_branch_code, item.type]),
+    [
+      ["000", "REQUEST_SUBMITTED"],
+      ["003", "REQUEST_SUBMITTED"],
+    ],
+  );
   assert.deepEqual(db.state.txLog, ["BEGIN", "COMMIT"]);
 });
 
@@ -1121,9 +1252,11 @@ test("source branch submits mixed line responses transactionally, sets statuses,
   assert.equal(batch.status, "PARTIALLY_RESPONDED");
 
   // notification to requesting branch 001
-  assert.equal(ctx.db.state.notifications.length, 1);
-  assert.equal(ctx.db.state.notifications[0].recipient_branch_code, "001");
-  assert.equal(ctx.db.state.notifications[0].type, "RESPONSE_SUBMITTED");
+  const responseNotification = ctx.db.state.notifications.find(
+    (item) => item.type === "RESPONSE_SUBMITTED",
+  );
+  assert.ok(responseNotification);
+  assert.equal(responseNotification.recipient_branch_code, "001");
 
   // events: LINE_APPROVED_PARTIAL, LINE_REJECTED, RESPONSE_SUBMITTED
   const eventTypes = ctx.db.state.events.map((row) => row.event_type);
@@ -1338,16 +1471,20 @@ test("a branch cannot see or mark another branch's notifications", async () => {
     });
   assert.equal(submit.status, 200);
 
-  // the notification belongs to branch 001; branch 003 must not see it
+  // Branch 003 sees its own original incoming-request notification, but must
+  // not see the response notification addressed to requesting branch 001.
   const sourceList = await ctx.sourceAgent.get("/api/notifications");
   assert.equal(sourceList.status, 200);
-  assert.equal(sourceList.body.records.length, 0);
+  assert.equal(sourceList.body.records.length, 1);
+  assert.equal(sourceList.body.records[0].type, "REQUEST_SUBMITTED");
 
   const sourceCount = await ctx.sourceAgent.get("/api/notifications/unread-count");
-  assert.equal(sourceCount.body.unreadCount, 0);
+  assert.equal(sourceCount.body.unreadCount, 1);
 
   // branch 003 trying to mark branch 001's notification -> 404
-  const notificationId = ctx.db.state.notifications[0].notification_id;
+  const notificationId = ctx.db.state.notifications.find(
+    (item) => item.type === "RESPONSE_SUBMITTED",
+  ).notification_id;
   const forbidden = await ctx.sourceAgent
     .post(`/api/notifications/${notificationId}/read`)
     .set("x-csrf-token", ctx.sourceCsrf);
@@ -1591,6 +1728,147 @@ test("csrf is enforced on marking a notification read", async () => {
   });
   const notificationId = ctx.db.state.notifications[0].notification_id;
   const response = await ctx.requesterAgent.post(`/api/notifications/${notificationId}/read`);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.error, "CSRF token invalid");
+});
+
+// Bring a single-source (003) request all the way to ACKNOWLEDGED for WP-13 tests.
+async function setupAcknowledgedSingleSource() {
+  const ctx = await setupRespondedSingleSource();
+  const ack = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
+    .set("x-csrf-token", ctx.requesterCsrf)
+    .send({ version: ctx.childVersion });
+  assert.equal(ack.status, 200);
+
+  const batchDetail = await ctx.requesterAgent.get(`/api/stock-requests/${ctx.batchPublicId}`);
+  const child = batchDetail.body.batch.requests[0];
+  return { ...ctx, childVersion: child.version, lines: child.lines };
+}
+
+test("source dispatches, requester receives, and fulfillment reports the differences", async () => {
+  const ctx = await setupAcknowledgedSingleSource();
+  const [lineA, lineB] = ctx.lines; // approved == requested (3 and 1)
+
+  // ship short on line A to create a difference
+  const dispatch = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/dispatch`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({
+      version: ctx.childVersion,
+      lines: [
+        { lineId: lineA.lineId, dispatchedQty: 2 },
+        { lineId: lineB.lineId, dispatchedQty: 1 },
+      ],
+    });
+  assert.equal(dispatch.status, 200);
+  assert.equal(dispatch.body.status, "DISPATCHED");
+  assert.equal(ctx.db.state.shipments.length, 1);
+  assert.equal(ctx.db.state.shipmentLines.length, 2);
+  assert.ok(ctx.db.state.notifications.some((row) => row.type === "REQUEST_DISPATCHED" && row.recipient_branch_code === "001"));
+
+  // fulfillment shows the short-ship difference on line A
+  const midFulfillment = await ctx.requesterAgent.get(`/api/stock-requests/${ctx.requestPublicId}/fulfillment`);
+  assert.equal(midFulfillment.status, 200);
+  const lineAReport = midFulfillment.body.fulfillment.lines.find((row) => row.lineId === lineA.lineId);
+  assert.equal(lineAReport.approvedQty, 3);
+  assert.equal(lineAReport.dispatchedQty, 2);
+  assert.equal(lineAReport.dispatchVariance, -1);
+  assert.equal(lineAReport.hasDifference, true);
+
+  // requester receives what arrived
+  const receive = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/receive`)
+    .set("x-csrf-token", ctx.requesterCsrf)
+    .send({
+      version: dispatch.body.version,
+      lines: [
+        { lineId: lineA.lineId, receivedQty: 2 },
+        { lineId: lineB.lineId, receivedQty: 1 },
+      ],
+    });
+  assert.equal(receive.status, 200);
+  assert.equal(receive.body.status, "RECEIVED");
+  assert.equal(receive.body.batchStatus, "COMPLETED");
+  assert.equal(ctx.db.state.receipts.length, 1);
+  assert.ok(ctx.db.state.notifications.some((row) => row.type === "REQUEST_RECEIVED" && row.recipient_branch_code === "003"));
+
+  const finalFulfillment = await ctx.sourceAgent.get(`/api/stock-requests/${ctx.requestPublicId}/fulfillment`);
+  const finalLineA = finalFulfillment.body.fulfillment.lines.find((row) => row.lineId === lineA.lineId);
+  assert.equal(finalLineA.receivedQty, 2);
+  assert.equal(finalLineA.receiveVariance, 0);
+
+  assert.ok(ctx.db.state.events.some((row) => row.event_type === "REQUEST_DISPATCHED"));
+  assert.ok(ctx.db.state.events.some((row) => row.event_type === "REQUEST_RECEIVED"));
+});
+
+test("a request cannot be dispatched before it is acknowledged", async () => {
+  const ctx = await setupRespondedSingleSource();
+  const batchDetail = await ctx.requesterAgent.get(`/api/stock-requests/${ctx.batchPublicId}`);
+  const lines = batchDetail.body.batch.requests[0].lines;
+
+  const response = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/dispatch`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({ lines: lines.map((line) => ({ lineId: line.lineId, dispatchedQty: 1 })) });
+
+  assert.equal(response.status, 409);
+  assert.equal(ctx.db.state.shipments.length, 0);
+});
+
+test("only the source branch may dispatch", async () => {
+  const ctx = await setupAcknowledgedSingleSource();
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/dispatch`)
+    .set("x-csrf-token", ctx.requesterCsrf)
+    .send({ lines: ctx.lines.map((line) => ({ lineId: line.lineId, dispatchedQty: 1 })) });
+  assert.equal(response.status, 403);
+});
+
+test("a request cannot be received before it is dispatched", async () => {
+  const ctx = await setupAcknowledgedSingleSource();
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/receive`)
+    .set("x-csrf-token", ctx.requesterCsrf)
+    .send({ lines: ctx.lines.map((line) => ({ lineId: line.lineId, receivedQty: 1 })) });
+  assert.equal(response.status, 409);
+});
+
+test("only the requesting branch may receive", async () => {
+  const ctx = await setupAcknowledgedSingleSource();
+  const dispatch = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/dispatch`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({
+      version: ctx.childVersion,
+      lines: ctx.lines.map((line) => ({ lineId: line.lineId, dispatchedQty: 1 })),
+    });
+  assert.equal(dispatch.status, 200);
+
+  const response = await ctx.sourceAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/receive`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({ lines: ctx.lines.map((line) => ({ lineId: line.lineId, receivedQty: 1 })) });
+  assert.equal(response.status, 403);
+});
+
+test("dispatch rejects a stale version with 409", async () => {
+  const ctx = await setupAcknowledgedSingleSource();
+  const response = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/dispatch`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({
+      version: ctx.childVersion + 9,
+      lines: ctx.lines.map((line) => ({ lineId: line.lineId, dispatchedQty: 1 })),
+    });
+  assert.equal(response.status, 409);
+});
+
+test("csrf is enforced on dispatch", async () => {
+  const ctx = await setupAcknowledgedSingleSource();
+  const response = await ctx.sourceAgent
+    .post(`/api/stock-requests/incoming/${ctx.requestPublicId}/dispatch`)
+    .send({ lines: ctx.lines.map((line) => ({ lineId: line.lineId, dispatchedQty: 1 })) });
   assert.equal(response.status, 403);
   assert.equal(response.body.error, "CSRF token invalid");
 });

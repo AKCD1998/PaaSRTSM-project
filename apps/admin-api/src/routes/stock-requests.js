@@ -14,6 +14,9 @@ const {
   acknowledgeStockRequest,
   generateStockRequestDocument,
   getStockRequestDocument,
+  dispatchStockRequest,
+  receiveStockRequest,
+  getStockRequestFulfillment,
   listStockRequestNotifications,
   getUnreadNotificationCount,
   markNotificationRead,
@@ -222,6 +225,69 @@ function createStockRequestsRouter(deps) {
           request_id: req.requestId,
           ...result,
         });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
+    "/stock-requests/incoming/:publicId/dispatch",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await dispatchStockRequest({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
+          body: req.body,
+          requestId: req.requestId,
+        });
+        return res.json({ ok: true, request_id: req.requestId, ...result });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
+    "/stock-requests/:publicId/receive",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await receiveStockRequest({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
+          body: req.body,
+          requestId: req.requestId,
+        });
+        return res.json({ ok: true, request_id: req.requestId, ...result });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.get(
+    "/stock-requests/:publicId/fulfillment",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await getStockRequestFulfillment({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
+        });
+        return res.json({ ok: true, request_id: req.requestId, fulfillment: result });
       } catch (error) {
         return next(error);
       }

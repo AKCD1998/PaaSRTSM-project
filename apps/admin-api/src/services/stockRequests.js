@@ -63,8 +63,19 @@ function parseIsoTimestamp(value) {
 }
 
 function formatDateForPublicId(isoTimestamp) {
-  const value = String(isoTimestamp || "");
-  return value.slice(0, 10).replace(/-/g, "") || "00000000";
+  const date = isoTimestamp instanceof Date
+    ? isoTimestamp
+    : new Date(String(isoTimestamp || ""));
+
+  if (Number.isNaN(date.getTime())) {
+    return "00000000";
+  }
+
+  return [
+    String(date.getUTCFullYear()).padStart(4, "0"),
+    String(date.getUTCMonth() + 1).padStart(2, "0"),
+    String(date.getUTCDate()).padStart(2, "0"),
+  ].join("");
 }
 
 function formatBatchPublicId(submittedAt, requestingBranchCode, batchId) {
@@ -683,10 +694,18 @@ function computeBatchStatus(requestRows) {
   if (anySubmitted) {
     return anyResponded ? "PARTIALLY_RESPONDED" : "SUBMITTED";
   }
-  const allAcknowledged = active.every(
-    (row) => row.status === "ACKNOWLEDGED" || row.status === "COMPLETED",
-  );
-  return allAcknowledged ? "ACKNOWLEDGED" : "RESPONDED";
+  // Past the response stage. RECEIVED/COMPLETED close the batch; the dispatch
+  // states (ACKNOWLEDGED/DISPATCHED) keep it at the ACKNOWLEDGED aggregate since
+  // there is no batch-level DISPATCHED status.
+  const fulfilled = new Set(["RECEIVED", "COMPLETED"]);
+  if (active.every((row) => fulfilled.has(row.status))) {
+    return "COMPLETED";
+  }
+  const acknowledgedOrBeyond = new Set(["ACKNOWLEDGED", "DISPATCHED", "RECEIVED", "COMPLETED"]);
+  if (active.every((row) => acknowledgedOrBeyond.has(row.status))) {
+    return "ACKNOWLEDGED";
+  }
+  return "RESPONDED";
 }
 
 function ensureCanReadBatch(auth, batchRow) {
@@ -990,6 +1009,16 @@ async function submitStockRequestBatch({ db, auth, body, requestId }) {
           requestCorrelationId: requestId,
         });
       }
+
+      await insertNotification(client, {
+        recipientBranchCode: group.sourceBranchCode,
+        type: "REQUEST_SUBMITTED",
+        batchId: batch.batchId,
+        requestId: requestRecord.requestId,
+        message: `สาขา ${auth.effectiveBranchCode} ส่งคำขอ ${requestRecord.publicId}`,
+        linkTarget: `/incoming/${encodeURIComponent(requestRecord.publicId)}`,
+        dedupKey: `request-submitted:${requestRecord.publicId}`,
+      });
     }
 
     await client.query("COMMIT");
@@ -1683,6 +1712,415 @@ async function getStockRequestDocument({ db, auth, requestPublicId }) {
   };
 }
 
+// ---- WP-13: dispatch & receipt fulfillment (Phase 5) ----
+
+function sumByLine(rows, field) {
+  const map = new Map();
+  for (const row of rows) {
+    const lineId = Number(row.line_id);
+    map.set(lineId, (map.get(lineId) || 0) + Number(row[field] || 0));
+  }
+  return map;
+}
+
+// Parse a set of per-line fulfillment quantities, requiring every request line to
+// be present exactly once with a non-negative quantity.
+function normalizeFulfillmentLines(rawLines, lineRows, qtyField) {
+  if (!Array.isArray(rawLines) || !rawLines.length) {
+    throw createHttpError(`${qtyField} lines are required.`, 400);
+  }
+  const validLineIds = new Set(lineRows.map((row) => Number(row.line_id)));
+  const seen = new Set();
+  const result = [];
+  for (const raw of rawLines) {
+    const lineId = Number(raw?.lineId ?? raw?.line_id);
+    if (!validLineIds.has(lineId)) {
+      throw createHttpError(`Line ${lineId} does not belong to this request.`, 422);
+    }
+    if (seen.has(lineId)) {
+      throw createHttpError(`Duplicate line ${lineId}.`, 422);
+    }
+    seen.add(lineId);
+    const qty = parseOptionalNonNegativeNumber(raw?.[qtyField] ?? raw?.qty);
+    if (qty == null) {
+      throw createHttpError(`${qtyField} for line ${lineId} must be a non-negative number.`, 422);
+    }
+    result.push({ lineId, qty });
+  }
+  if (seen.size !== lineRows.length) {
+    throw createHttpError("Every line must be included.", 422);
+  }
+  return result;
+}
+
+async function transitionRequestStatus(client, { requestId, fromStatus, toStatus, expectedVersion }) {
+  const result = await client.query(
+    `
+      UPDATE ordering.stock_requests
+      SET status = $2, version = version + 1, updated_at = now()
+      WHERE request_id = $1
+        AND status = $3
+        AND ($4::int IS NULL OR version = $4)
+      RETURNING request_id, version
+    `,
+    [requestId, toStatus, fromStatus, expectedVersion],
+  );
+  return result.rows[0] || null;
+}
+
+async function insertShipment(client, { requestId, dispatchedBy, note }) {
+  const result = await client.query(
+    `
+      INSERT INTO ordering.stock_request_shipments (request_id, dispatched_by, note)
+      VALUES ($1, $2, $3)
+      RETURNING shipment_id, dispatched_at
+    `,
+    [requestId, dispatchedBy, note],
+  );
+  return result.rows[0];
+}
+
+async function insertShipmentLine(client, { shipmentId, lineId, dispatchedQty }) {
+  await client.query(
+    `
+      INSERT INTO ordering.stock_request_shipment_lines (shipment_id, line_id, dispatched_qty)
+      VALUES ($1, $2, $3)
+    `,
+    [shipmentId, lineId, dispatchedQty],
+  );
+}
+
+async function insertReceipt(client, { requestId, receivedBy, note }) {
+  const result = await client.query(
+    `
+      INSERT INTO ordering.stock_request_receipts (request_id, received_by, note)
+      VALUES ($1, $2, $3)
+      RETURNING receipt_id, received_at
+    `,
+    [requestId, receivedBy, note],
+  );
+  return result.rows[0];
+}
+
+async function insertReceiptLine(client, { receiptId, lineId, receivedQty }) {
+  await client.query(
+    `
+      INSERT INTO ordering.stock_request_receipt_lines (receipt_id, line_id, received_qty)
+      VALUES ($1, $2, $3)
+    `,
+    [receiptId, lineId, receivedQty],
+  );
+}
+
+async function loadShipmentsByRequest(dbLike, requestId) {
+  const result = await dbLike.query(
+    `
+      SELECT shipment_id, dispatched_by, note, dispatched_at
+      FROM ordering.stock_request_shipments
+      WHERE request_id = $1
+      ORDER BY shipment_id DESC
+    `,
+    [requestId],
+  );
+  return result.rows;
+}
+
+async function loadReceiptsByRequest(dbLike, requestId) {
+  const result = await dbLike.query(
+    `
+      SELECT receipt_id, received_by, note, received_at
+      FROM ordering.stock_request_receipts
+      WHERE request_id = $1
+      ORDER BY receipt_id DESC
+    `,
+    [requestId],
+  );
+  return result.rows;
+}
+
+async function loadShipmentLinesByShipmentIds(dbLike, shipmentIds) {
+  const ids = [...new Set((shipmentIds || []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0))];
+  if (!ids.length) {
+    return [];
+  }
+  const result = await dbLike.query(
+    `
+      SELECT shipment_id, line_id, dispatched_qty
+      FROM ordering.stock_request_shipment_lines
+      WHERE shipment_id = ANY($1::bigint[])
+    `,
+    [ids],
+  );
+  return result.rows;
+}
+
+async function loadReceiptLinesByReceiptIds(dbLike, receiptIds) {
+  const ids = [...new Set((receiptIds || []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0))];
+  if (!ids.length) {
+    return [];
+  }
+  const result = await dbLike.query(
+    `
+      SELECT receipt_id, line_id, received_qty
+      FROM ordering.stock_request_receipt_lines
+      WHERE receipt_id = ANY($1::bigint[])
+    `,
+    [ids],
+  );
+  return result.rows;
+}
+
+// WP-13: source branch dispatches an acknowledged request (records ship quantities).
+async function dispatchStockRequest({ db, auth, requestPublicId, body, requestId }) {
+  validateSubmissionAccess(auth);
+  const expectedVersion = body?.version == null ? null : Number(body.version);
+  if (expectedVersion != null && !Number.isInteger(expectedVersion)) {
+    throw createHttpError("version must be an integer.", 400);
+  }
+  const note = normalizeNullableText(body?.note, EVENT_NOTE_MAX_CHARS);
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const requestRow = await loadRequestByPublicId(client, requestPublicId);
+    if (!requestRow) {
+      throw createHttpError("Not found", 404);
+    }
+    ensureCanReadIncomingRequest(auth, requestRow); // source branch (or admin)
+    if (requestRow.status !== "ACKNOWLEDGED") {
+      throw createHttpError("Only an acknowledged request can be dispatched.", 409);
+    }
+    if (expectedVersion != null && Number(requestRow.version) !== expectedVersion) {
+      throw createHttpError("Request was modified by someone else. Please reload.", 409);
+    }
+
+    const lineRows = await loadLineRowsByRequestIds(client, [requestRow.request_id]);
+    const fulfillmentLines = normalizeFulfillmentLines(body?.lines, lineRows, "dispatchedQty");
+
+    const shipment = await insertShipment(client, {
+      requestId: requestRow.request_id,
+      dispatchedBy: auth.userId,
+      note,
+    });
+    for (const line of fulfillmentLines) {
+      await insertShipmentLine(client, {
+        shipmentId: shipment.shipment_id,
+        lineId: line.lineId,
+        dispatchedQty: line.qty,
+      });
+    }
+
+    const updated = await transitionRequestStatus(client, {
+      requestId: requestRow.request_id,
+      fromStatus: "ACKNOWLEDGED",
+      toStatus: "DISPATCHED",
+      expectedVersion,
+    });
+    if (!updated) {
+      throw createHttpError("Request was modified by someone else. Please reload.", 409);
+    }
+
+    await insertEvent(client, {
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      eventType: "REQUEST_DISPATCHED",
+      actorUser: auth.userId,
+      actorBranch: auth.effectiveBranchCode,
+      metadata: { shipment_id: Number(shipment.shipment_id) },
+      note,
+      requestCorrelationId: requestId,
+    });
+
+    const siblings = await loadRequestRowsByBatchId(client, requestRow.batch_id);
+    const batchStatus = computeBatchStatus(siblings);
+    await updateBatchStatus(client, requestRow.batch_id, batchStatus);
+
+    await insertNotification(client, {
+      recipientBranchCode: requestRow.requesting_branch_code,
+      type: "REQUEST_DISPATCHED",
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      message: `สาขา ${requestRow.source_branch_code} จัดส่งคำขอ ${requestRow.public_id}`,
+      linkTarget: "/requests",
+      dedupKey: `dispatched:${requestRow.public_id}`,
+    });
+
+    await client.query("COMMIT");
+    return {
+      requestPublicId: requestRow.public_id,
+      status: "DISPATCHED",
+      version: Number(updated.version),
+      shipmentId: Number(shipment.shipment_id),
+      batchStatus,
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback shadow errors
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// WP-13: requesting branch records receipt of a dispatched request.
+async function receiveStockRequest({ db, auth, requestPublicId, body, requestId }) {
+  validateSubmissionAccess(auth);
+  const expectedVersion = body?.version == null ? null : Number(body.version);
+  if (expectedVersion != null && !Number.isInteger(expectedVersion)) {
+    throw createHttpError("version must be an integer.", 400);
+  }
+  const note = normalizeNullableText(body?.note, EVENT_NOTE_MAX_CHARS);
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const requestRow = await loadRequestByPublicId(client, requestPublicId);
+    if (!requestRow) {
+      throw createHttpError("Not found", 404);
+    }
+    ensureCanAcknowledge(auth, requestRow); // requesting branch (or admin)
+    if (requestRow.status !== "DISPATCHED") {
+      throw createHttpError("Only a dispatched request can be received.", 409);
+    }
+    if (expectedVersion != null && Number(requestRow.version) !== expectedVersion) {
+      throw createHttpError("Request was modified by someone else. Please reload.", 409);
+    }
+
+    const lineRows = await loadLineRowsByRequestIds(client, [requestRow.request_id]);
+    const fulfillmentLines = normalizeFulfillmentLines(body?.lines, lineRows, "receivedQty");
+
+    const receipt = await insertReceipt(client, {
+      requestId: requestRow.request_id,
+      receivedBy: auth.userId,
+      note,
+    });
+    for (const line of fulfillmentLines) {
+      await insertReceiptLine(client, {
+        receiptId: receipt.receipt_id,
+        lineId: line.lineId,
+        receivedQty: line.qty,
+      });
+    }
+
+    const updated = await transitionRequestStatus(client, {
+      requestId: requestRow.request_id,
+      fromStatus: "DISPATCHED",
+      toStatus: "RECEIVED",
+      expectedVersion,
+    });
+    if (!updated) {
+      throw createHttpError("Request was modified by someone else. Please reload.", 409);
+    }
+
+    await insertEvent(client, {
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      eventType: "REQUEST_RECEIVED",
+      actorUser: auth.userId,
+      actorBranch: auth.effectiveBranchCode,
+      metadata: { receipt_id: Number(receipt.receipt_id) },
+      note,
+      requestCorrelationId: requestId,
+    });
+
+    const siblings = await loadRequestRowsByBatchId(client, requestRow.batch_id);
+    const batchStatus = computeBatchStatus(siblings);
+    await updateBatchStatus(client, requestRow.batch_id, batchStatus);
+
+    await insertNotification(client, {
+      recipientBranchCode: requestRow.source_branch_code,
+      type: "REQUEST_RECEIVED",
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      message: `สาขา ${requestRow.requesting_branch_code} รับสินค้าตามคำขอ ${requestRow.public_id}`,
+      linkTarget: "/incoming",
+      dedupKey: `received:${requestRow.public_id}`,
+    });
+
+    await client.query("COMMIT");
+    return {
+      requestPublicId: requestRow.public_id,
+      status: "RECEIVED",
+      version: Number(updated.version),
+      receiptId: Number(receipt.receipt_id),
+      batchStatus,
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback shadow errors
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// WP-13: difference report across approved / dispatched / received quantities.
+async function getStockRequestFulfillment({ db, auth, requestPublicId }) {
+  validateSubmissionAccess(auth);
+
+  const requestRow = await loadRequestByPublicId(db, requestPublicId);
+  if (!requestRow) {
+    throw createHttpError("Not found", 404);
+  }
+  ensureCanAccessDocument(auth, requestRow); // source or requesting branch
+
+  const lineRows = await loadLineRowsByRequestIds(db, [requestRow.request_id]);
+  const responseRows = await loadLatestSubmittedResponsesByLineIds(
+    db,
+    lineRows.map((row) => row.line_id),
+  );
+  const responseMap = new Map(responseRows.map((row) => [Number(row.line_id), row]));
+
+  const shipments = await loadShipmentsByRequest(db, requestRow.request_id);
+  const receipts = await loadReceiptsByRequest(db, requestRow.request_id);
+  const shipmentLines = await loadShipmentLinesByShipmentIds(db, shipments.map((row) => row.shipment_id));
+  const receiptLines = await loadReceiptLinesByReceiptIds(db, receipts.map((row) => row.receipt_id));
+  const dispatchedByLine = sumByLine(shipmentLines, "dispatched_qty");
+  const receivedByLine = sumByLine(receiptLines, "received_qty");
+
+  const lines = lineRows.map((lineRow) => {
+    const lineId = Number(lineRow.line_id);
+    const response = responseMap.get(lineId) || null;
+    const approvedQty = response ? Number(response.approved_qty || 0) : 0;
+    const dispatchedQty = dispatchedByLine.get(lineId) || 0;
+    const receivedQty = receivedByLine.get(lineId) || 0;
+    return {
+      lineId,
+      productCode: lineRow.product_code,
+      productNameThai: lineRow.product_name_thai || null,
+      productNameEng: lineRow.product_name_eng || null,
+      unit: lineRow.unit,
+      requestedQty: Number(lineRow.requested_qty || 0),
+      approvedQty,
+      dispatchedQty,
+      receivedQty,
+      dispatchVariance: dispatchedQty - approvedQty,
+      receiveVariance: receivedQty - dispatchedQty,
+      hasDifference: dispatchedQty !== approvedQty || receivedQty !== dispatchedQty,
+    };
+  });
+
+  return {
+    requestPublicId: requestRow.public_id,
+    status: requestRow.status,
+    sourceBranchCode: requestRow.source_branch_code,
+    requestingBranchCode: requestRow.requesting_branch_code,
+    dispatchedAt: shipments[0]?.dispatched_at || null,
+    dispatchedBy: shipments[0]?.dispatched_by || null,
+    receivedAt: receipts[0]?.received_at || null,
+    receivedBy: receipts[0]?.received_by || null,
+    lines,
+  };
+}
+
 // ---- WP-09: DB-backed notifications (read side; writes happen in WP-08) ----
 
 const NOTIFICATION_LIST_LIMIT = 50;
@@ -1785,6 +2223,9 @@ module.exports = {
   acknowledgeStockRequest,
   generateStockRequestDocument,
   getStockRequestDocument,
+  dispatchStockRequest,
+  receiveStockRequest,
+  getStockRequestFulfillment,
   listStockRequestNotifications,
   getUnreadNotificationCount,
   markNotificationRead,
