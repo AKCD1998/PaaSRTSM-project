@@ -672,6 +672,23 @@ function canAdminReadAll(auth) {
   return auth?.role === "admin";
 }
 
+// Aggregate batch status from its child request statuses (plan §7.1).
+function computeBatchStatus(requestRows) {
+  const active = requestRows.filter((row) => row.status !== "CANCELLED");
+  if (!active.length) {
+    return "CANCELLED";
+  }
+  const anySubmitted = active.some((row) => row.status === "SUBMITTED");
+  const anyResponded = active.some((row) => row.status !== "SUBMITTED");
+  if (anySubmitted) {
+    return anyResponded ? "PARTIALLY_RESPONDED" : "SUBMITTED";
+  }
+  const allAcknowledged = active.every(
+    (row) => row.status === "ACKNOWLEDGED" || row.status === "COMPLETED",
+  );
+  return allAcknowledged ? "ACKNOWLEDGED" : "RESPONDED";
+}
+
 function ensureCanReadBatch(auth, batchRow) {
   if (canAdminReadAll(auth)) {
     return;
@@ -1358,9 +1375,7 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
     });
 
     const siblingRequests = await loadRequestRowsByBatchId(client, requestRow.batch_id);
-    const activeRequests = siblingRequests.filter((row) => row.status !== "CANCELLED");
-    const allResponded = activeRequests.every((row) => row.status !== "SUBMITTED");
-    const batchStatus = allResponded ? "RESPONDED" : "PARTIALLY_RESPONDED";
+    const batchStatus = computeBatchStatus(siblingRequests);
     await updateBatchStatus(client, requestRow.batch_id, batchStatus);
 
     await insertNotification(client, {
@@ -1384,6 +1399,106 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
         status: input.lineStatus,
         approvedQty: input.approvedQty,
       })),
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackError) {
+      // ignore rollback shadow errors
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function ensureCanAcknowledge(auth, requestRow) {
+  if (canAdminReadAll(auth)) {
+    return;
+  }
+  if (!auth?.effectiveBranchCode || requestRow.requesting_branch_code !== auth.effectiveBranchCode) {
+    throw createHttpError("Forbidden", 403);
+  }
+}
+
+async function markRequestAcknowledged(client, { requestId, auth, expectedVersion }) {
+  const result = await client.query(
+    `
+      UPDATE ordering.stock_requests
+      SET status = 'ACKNOWLEDGED', acknowledged_by = $2, acknowledged_at = now(), version = version + 1, updated_at = now()
+      WHERE request_id = $1
+        AND status = 'RESPONDED'
+        AND ($3::int IS NULL OR version = $3)
+      RETURNING request_id, version
+    `,
+    [requestId, auth.userId, expectedVersion],
+  );
+  return result.rows[0] || null;
+}
+
+// WP-11: the requesting branch acknowledges a source branch's response.
+async function acknowledgeStockRequest({ db, auth, requestPublicId, body, requestId }) {
+  validateSubmissionAccess(auth);
+  const expectedVersion = body?.version == null ? null : Number(body.version);
+  if (expectedVersion != null && !Number.isInteger(expectedVersion)) {
+    throw createHttpError("version must be an integer.", 400);
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const requestRow = await loadRequestByPublicId(client, requestPublicId);
+    if (!requestRow) {
+      throw createHttpError("Not found", 404);
+    }
+    ensureCanAcknowledge(auth, requestRow);
+    if (requestRow.status !== "RESPONDED") {
+      throw createHttpError("Only a responded request can be acknowledged.", 409);
+    }
+    if (expectedVersion != null && Number(requestRow.version) !== expectedVersion) {
+      throw createHttpError("Request was modified by someone else. Please reload.", 409);
+    }
+
+    const updatedRequest = await markRequestAcknowledged(client, {
+      requestId: requestRow.request_id,
+      auth,
+      expectedVersion,
+    });
+    if (!updatedRequest) {
+      throw createHttpError("Request was modified by someone else. Please reload.", 409);
+    }
+
+    await insertEvent(client, {
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      eventType: "RESPONSE_ACKNOWLEDGED",
+      actorUser: auth.userId,
+      actorBranch: auth.effectiveBranchCode,
+      metadata: { request_public_id: requestRow.public_id },
+      requestCorrelationId: requestId,
+    });
+
+    const siblingRequests = await loadRequestRowsByBatchId(client, requestRow.batch_id);
+    const batchStatus = computeBatchStatus(siblingRequests);
+    await updateBatchStatus(client, requestRow.batch_id, batchStatus);
+
+    await insertNotification(client, {
+      recipientBranchCode: requestRow.source_branch_code,
+      type: "RESPONSE_ACKNOWLEDGED",
+      batchId: requestRow.batch_id,
+      requestId: requestRow.request_id,
+      message: `สาขา ${requestRow.requesting_branch_code} รับทราบการตอบกลับคำขอ ${requestRow.public_id}`,
+      linkTarget: "/incoming",
+      dedupKey: `acknowledged:${requestRow.public_id}`,
+    });
+
+    await client.query("COMMIT");
+    return {
+      requestPublicId: requestRow.public_id,
+      status: "ACKNOWLEDGED",
+      version: Number(updatedRequest.version),
+      batchStatus,
     };
   } catch (error) {
     try {
@@ -1496,6 +1611,7 @@ module.exports = {
   getStockRequestEvents,
   saveLineResponseDraft,
   submitStockRequestResponse,
+  acknowledgeStockRequest,
   listStockRequestNotifications,
   getUnreadNotificationCount,
   markNotificationRead,

@@ -505,6 +505,24 @@ function createStockRequestMockDb() {
       return { rowCount: 1, rows: [{ request_id: requestRow.request_id, version: requestRow.version }] };
     }
 
+    if (normalized.startsWith("update ordering.stock_requests set status = 'acknowledged'")) {
+      const requestRow = state.requests.find(
+        (row) =>
+          row.request_id === Number(params[0]) &&
+          row.status === "RESPONDED" &&
+          (params[2] == null || Number(row.version) === Number(params[2])),
+      );
+      if (!requestRow) {
+        return { rowCount: 0, rows: [] };
+      }
+      requestRow.status = "ACKNOWLEDGED";
+      requestRow.acknowledged_by = params[1];
+      requestRow.acknowledged_at = "2026-06-18T12:15:00.000Z";
+      requestRow.version = Number(requestRow.version) + 1;
+      requestRow.updated_at = "2026-06-18T12:15:00.000Z";
+      return { rowCount: 1, rows: [{ request_id: requestRow.request_id, version: requestRow.version }] };
+    }
+
     if (normalized.startsWith("update ordering.stock_request_batches set status = $2")) {
       const batch = state.batches.find((row) => row.batch_id === Number(params[0]));
       if (batch) {
@@ -1293,6 +1311,139 @@ test("a branch cannot see or mark another branch's notifications", async () => {
     .post(`/api/notifications/${notificationId}/read`)
     .set("x-csrf-token", ctx.sourceCsrf);
   assert.equal(forbidden.status, 404);
+});
+
+// Submit a single-source (003) batch and have branch 003 respond to it, leaving
+// the child request in RESPONDED state ready for the requester to acknowledge.
+async function setupRespondedSingleSource() {
+  const { app, db } = createTestApp();
+  const requesterAgent = request.agent(app);
+  const requesterCsrf = await login(requesterAgent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+  const submitResponse = await submitSampleBatch(requesterAgent, requesterCsrf, {
+    idempotencyKey: "stock-request:001:ack-flow",
+    groups: [
+      {
+        sourceBranchCode: "003",
+        lines: [
+          { productCode: "630010002", requestedQty: 3, unit: "TAB", snapshotQty: 6 },
+          { productCode: "630010003", requestedQty: 1, unit: "BOX", snapshotQty: 2 },
+        ],
+      },
+    ],
+  });
+  const childRequest = submitResponse.body.requests[0];
+
+  const sourceAgent = request.agent(app);
+  const sourceCsrf = await login(sourceAgent, {
+    username: "branch003@example.com",
+    password: "branch-pass-003",
+  });
+  const detail = await sourceAgent.get(`/api/stock-requests/incoming/${childRequest.publicId}`);
+  const submitRes = await sourceAgent
+    .post(`/api/stock-requests/incoming/${childRequest.publicId}/submit-response`)
+    .set("x-csrf-token", sourceCsrf)
+    .send({
+      version: detail.body.request.version,
+      responses: detail.body.request.lines.map((line) => ({
+        lineId: line.lineId,
+        responseStatus: "APPROVED_FULL",
+      })),
+    });
+  assert.equal(submitRes.status, 200);
+
+  // requester reads the current child version for optimistic acknowledge
+  const batchDetail = await requesterAgent.get(`/api/stock-requests/${submitResponse.body.batchPublicId}`);
+  const childVersion = batchDetail.body.batch.requests[0].version;
+
+  return {
+    app,
+    db,
+    requesterAgent,
+    requesterCsrf,
+    sourceAgent,
+    sourceCsrf,
+    requestPublicId: childRequest.publicId,
+    batchPublicId: submitResponse.body.batchPublicId,
+    childVersion,
+  };
+}
+
+test("requester acknowledges a responded request, completing the batch and notifying the source", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
+    .set("x-csrf-token", ctx.requesterCsrf)
+    .send({ version: ctx.childVersion });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, "ACKNOWLEDGED");
+  assert.equal(response.body.batchStatus, "ACKNOWLEDGED");
+
+  const childRow = ctx.db.state.requests.find((row) => row.public_id === ctx.requestPublicId);
+  assert.equal(childRow.status, "ACKNOWLEDGED");
+  assert.equal(childRow.acknowledged_by, "branch001@example.com");
+
+  const batchRow = ctx.db.state.batches.find((row) => row.public_id === ctx.batchPublicId);
+  assert.equal(batchRow.status, "ACKNOWLEDGED");
+
+  assert.ok(ctx.db.state.events.some((row) => row.event_type === "RESPONSE_ACKNOWLEDGED"));
+
+  // source branch 003 is notified of the acknowledgment
+  const ackNotification = ctx.db.state.notifications.find((row) => row.type === "RESPONSE_ACKNOWLEDGED");
+  assert.ok(ackNotification);
+  assert.equal(ackNotification.recipient_branch_code, "003");
+});
+
+test("only a responded request can be acknowledged", async () => {
+  const ctx = await setupIncomingForBranch003();
+  const requesterCsrf = await login(ctx.requesterAgent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+
+  // the child request is still SUBMITTED (no response yet)
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
+    .set("x-csrf-token", requesterCsrf);
+
+  assert.equal(response.status, 409);
+});
+
+test("only the requesting branch may acknowledge, not the source branch", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.sourceAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
+    .set("x-csrf-token", ctx.sourceCsrf)
+    .send({ version: ctx.childVersion });
+
+  assert.equal(response.status, 403);
+});
+
+test("acknowledge rejects a stale version with 409", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
+    .set("x-csrf-token", ctx.requesterCsrf)
+    .send({ version: ctx.childVersion + 5 });
+
+  assert.equal(response.status, 409);
+});
+
+test("csrf is enforced on acknowledge", async () => {
+  const ctx = await setupRespondedSingleSource();
+
+  const response = await ctx.requesterAgent
+    .post(`/api/stock-requests/${ctx.requestPublicId}/acknowledge`)
+    .send({ version: ctx.childVersion });
+
+  assert.equal(response.status, 403);
+  assert.equal(response.body.error, "CSRF token invalid");
 });
 
 test("csrf is enforced on marking a notification read", async () => {

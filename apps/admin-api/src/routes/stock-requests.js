@@ -11,6 +11,7 @@ const {
   getStockRequestEvents,
   saveLineResponseDraft,
   submitStockRequestResponse,
+  acknowledgeStockRequest,
   listStockRequestNotifications,
   getUnreadNotificationCount,
   markNotificationRead,
@@ -160,6 +161,32 @@ function createStockRequestsRouter(deps) {
     async (req, res, next) => {
       try {
         const result = await submitStockRequestResponse({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
+          body: req.body,
+          requestId: req.requestId,
+        });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          ...result,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
+    "/stock-requests/:publicId/acknowledge",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await acknowledgeStockRequest({
           db,
           auth: req.auth,
           requestPublicId: req.params.publicId,
