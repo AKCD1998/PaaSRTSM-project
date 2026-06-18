@@ -63,6 +63,34 @@ function parseCsvSet(value, options = {}) {
   );
 }
 
+function parseKeyValueMap(value, options = {}) {
+  if (!value) {
+    return new Map();
+  }
+  const normalizeKey = typeof options.normalizeKey === "function" ? options.normalizeKey : (entry) => entry;
+  const normalizeValue =
+    typeof options.normalizeValue === "function" ? options.normalizeValue : (entry) => entry;
+
+  const map = new Map();
+  for (const rawEntry of String(value).split(",")) {
+    const entry = rawEntry.trim();
+    if (!entry) {
+      continue;
+    }
+    const separatorIndex = entry.indexOf(":");
+    if (separatorIndex <= 0 || separatorIndex === entry.length - 1) {
+      continue;
+    }
+    const key = normalizeKey(entry.slice(0, separatorIndex).trim());
+    const parsedValue = normalizeValue(entry.slice(separatorIndex + 1).trim());
+    if (!key || parsedValue == null || parsedValue === "") {
+      continue;
+    }
+    map.set(key, parsedValue);
+  }
+  return map;
+}
+
 function parseCookieSameSite(value, fallback = "lax") {
   const normalized = String(value || fallback).trim().toLowerCase();
   if (["lax", "strict", "none"].includes(normalized)) {
@@ -111,6 +139,7 @@ function loadConfig(env = process.env) {
     loginRateLimitWindowMs: parseIntWithFallback(env.LOGIN_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
     maxUploadBytes: parseIntWithFallback(env.MAX_UPLOAD_MB, 25) * 1024 * 1024,
     defaultPeriodDays: parseIntWithFallback(env.DEFAULT_PERIOD_DAYS, 30),
+    featureStockRequests: parseBool(env.FEATURE_STOCK_REQUESTS, false),
     embeddingProvider,
     embeddingModel,
     embeddingDimension,
@@ -118,8 +147,17 @@ function loadConfig(env = process.env) {
     embeddingOpenAiBaseUrl: env.OPENAI_BASE_URL || "https://api.openai.com/v1",
     adminUsers: parseAllowlist(env.ADMIN_USERS),
     staffUsers: parseAllowlist(env.STAFF_USERS),
+    branchUsers: parseAllowlist(env.BRANCH_USERS),
     adminPasswordHash: env.ADMIN_PASSWORD_HASH || "",
     staffPasswordHash: env.STAFF_PASSWORD_HASH || "",
+    branchUserBranches: parseKeyValueMap(env.BRANCH_USER_BRANCHES || "", {
+      normalizeKey: (entry) => String(entry || "").trim().toLowerCase(),
+      normalizeValue: (entry) => String(entry || "").trim(),
+    }),
+    branchUserPasswordHashes: parseKeyValueMap(env.BRANCH_USER_PASSWORD_HASHES || "", {
+      normalizeKey: (entry) => String(entry || "").trim().toLowerCase(),
+      normalizeValue: (entry) => String(entry || "").trim(),
+    }),
     posApiKeys: parseCsvSet(env.POS_API_KEYS || ""),
     crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
     crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",

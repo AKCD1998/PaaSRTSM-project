@@ -2,7 +2,7 @@
 
 const MESSAGE_MAX_CHARS = 4000;
 const META_MAX_BYTES = 64 * 1024;
-const ALLOWED_ROLES = new Set(["admin", "staff", "system"]);
+const ALLOWED_ROLES = new Set(["admin", "staff", "branch", "system"]);
 
 const SENSITIVE_KEY_PATTERNS = [
   /password/i,

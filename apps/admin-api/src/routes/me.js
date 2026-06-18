@@ -16,6 +16,10 @@ function createMeRouter(deps) {
       user: {
         id: req.auth.userId,
         role,
+        branch_code: req.auth.effectiveBranchCode || null,
+        actor_branch_code: req.auth.actorBranchCode || null,
+        effective_branch_code: req.auth.effectiveBranchCode || null,
+        is_branch_override: Boolean(req.auth.isBranchOverride),
       },
       csrf_token: req.auth.csrf,
       permissions: {

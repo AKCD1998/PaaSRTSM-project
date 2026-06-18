@@ -72,10 +72,22 @@ function requireAuth(config) {
         request_id: req.requestId,
       });
     }
+    const effectiveBranchCode = decoded.branch_code || null;
+    const actorBranchCode =
+      decoded.actor_branch_code != null
+        ? decoded.actor_branch_code || null
+        : decoded.role === "branch"
+          ? effectiveBranchCode
+          : null;
+
     req.auth = {
       userId: decoded.sub,
       role: decoded.role,
       csrf: decoded.csrf || "",
+      branchCode: effectiveBranchCode,
+      actorBranchCode,
+      effectiveBranchCode,
+      isBranchOverride: Boolean(decoded.is_branch_override),
     };
     return next();
   };
@@ -106,6 +118,20 @@ function requireCsrf(req, res, next) {
   return next();
 }
 
+function getAuthenticatedBranch(req) {
+  return req.auth?.effectiveBranchCode || null;
+}
+
+function requireBranchIdentity(req, res, next) {
+  if (!getAuthenticatedBranch(req)) {
+    return res.status(403).json({
+      error: "Branch identity required",
+      request_id: req.requestId,
+    });
+  }
+  return next();
+}
+
 module.exports = {
   requestContextMiddleware,
   getRequestIp,
@@ -115,4 +141,6 @@ module.exports = {
   requireAuth,
   requireRole,
   requireCsrf,
+  getAuthenticatedBranch,
+  requireBranchIdentity,
 };

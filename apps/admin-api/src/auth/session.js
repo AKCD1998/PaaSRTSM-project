@@ -7,6 +7,17 @@ function generateCsrfToken() {
   return crypto.randomBytes(24).toString("base64url");
 }
 
+function buildSessionPayload(identity) {
+  return {
+    sub: identity.userId,
+    role: identity.role,
+    branch_code: identity.effectiveBranchCode || null,
+    actor_branch_code: identity.actorBranchCode || null,
+    is_branch_override: Boolean(identity.isBranchOverride),
+    csrf: identity.csrfToken,
+  };
+}
+
 function signSessionToken(payload, config) {
   if (!config.authJwtSecret) {
     throw new Error("AUTH_JWT_SECRET is required");
@@ -39,6 +50,7 @@ function authCookieOptions(config) {
 
 module.exports = {
   generateCsrfToken,
+  buildSessionPayload,
   signSessionToken,
   verifySessionToken,
   authCookieOptions,
