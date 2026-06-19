@@ -261,7 +261,7 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code, status, responded_by, responded_at, acknowledged_by, acknowledged_at, version, created_at, updated_at") &&
+      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code, status") &&
       normalized.includes("from ordering.stock_requests") &&
       normalized.includes("where public_id = $1")
     ) {
@@ -270,7 +270,7 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code, status, responded_by, responded_at, acknowledged_by, acknowledged_at, version, created_at, updated_at") &&
+      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code, status") &&
       normalized.includes("from ordering.stock_requests") &&
       normalized.includes("where batch_id = $1")
     ) {
@@ -440,6 +440,8 @@ function createStockRequestMockDb() {
         requesting_branch_code: params[2],
         source_branch_code: params[3],
         status: "SUBMITTED",
+        response_result: null,
+        response_note: null,
         responded_by: null,
         responded_at: null,
         acknowledged_by: null,
@@ -533,6 +535,17 @@ function createStockRequestMockDb() {
       requestRow.version = Number(requestRow.version) + 1;
       requestRow.updated_at = "2026-06-18T12:05:00.000Z";
       return { rowCount: 1, rows: [{ request_id: requestRow.request_id, version: requestRow.version }] };
+    }
+
+    if (normalized.startsWith("update ordering.stock_requests set response_result = $2, response_note = $3, updated_at = now() where request_id = $1")) {
+      const requestRow = state.requests.find((row) => row.request_id === Number(params[0]));
+      if (!requestRow) {
+        return { rowCount: 0, rows: [] };
+      }
+      requestRow.response_result = params[1];
+      requestRow.response_note = params[2];
+      requestRow.updated_at = "2026-06-18T12:05:00.000Z";
+      return { rowCount: 1, rows: [] };
     }
 
     if (normalized.startsWith("update ordering.stock_requests set status = 'acknowledged'")) {
@@ -720,6 +733,27 @@ function createStockRequestMockDb() {
         )
         .slice(0, Number(params[1]));
       return { rowCount: rows.length, rows };
+    }
+
+    if (
+      normalized.startsWith("update ordering.stock_request_notifications set read_at") &&
+      normalized.includes("where request_id = $1") &&
+      normalized.includes("and recipient_branch_code = $2") &&
+      normalized.includes("and type = 'request_submitted'")
+    ) {
+      let rowCount = 0;
+      for (const row of state.notifications) {
+        if (
+          row.request_id === Number(params[0]) &&
+          row.recipient_branch_code === params[1] &&
+          row.type === "REQUEST_SUBMITTED" &&
+          row.read_at == null
+        ) {
+          row.read_at = "2026-06-18T12:10:00.000Z";
+          rowCount += 1;
+        }
+      }
+      return { rowCount, rows: [] };
     }
 
     if (normalized.startsWith("update ordering.stock_request_notifications set read_at")) {
@@ -1284,7 +1318,7 @@ test("source branch submits mixed line responses transactionally, sets statuses,
     .send({
       version: ctx.version,
       responses: [
-        { lineId: lineA.lineId, responseStatus: "APPROVED_PARTIAL", approvedQty: 2, reasonCode: "LOW_STOCK" },
+        { lineId: lineA.lineId, responseStatus: "CUSTOM", approvedQty: 2, reasonCode: "LOW_STOCK" },
         { lineId: lineB.lineId, responseStatus: "REJECTED", note: "ไม่มีสินค้า" },
       ],
     });
@@ -1302,7 +1336,7 @@ test("source branch submits mixed line responses transactionally, sets statuses,
 
   const submittedResponses = ctx.db.state.responses.filter((row) => row.is_submitted === true);
   assert.equal(submittedResponses.length, 2);
-  assert.equal(ctx.db.state.lines.find((row) => row.line_id === lineA.lineId).status, "APPROVED_PARTIAL");
+  assert.equal(ctx.db.state.lines.find((row) => row.line_id === lineA.lineId).status, "CUSTOM");
   assert.equal(ctx.db.state.lines.find((row) => row.line_id === lineB.lineId).status, "REJECTED");
 
   const batch = ctx.db.state.batches.find((row) => row.public_id === ctx.batchPublicId);
@@ -1314,15 +1348,19 @@ test("source branch submits mixed line responses transactionally, sets statuses,
   );
   assert.ok(responseNotification);
   assert.equal(responseNotification.recipient_branch_code, "001");
+  const sourceNotification = ctx.db.state.notifications.find(
+    (item) => item.type === "REQUEST_SUBMITTED" && item.recipient_branch_code === "003" && item.request_id === updatedRequest.request_id,
+  );
+  assert.ok(sourceNotification?.read_at);
 
-  // events: LINE_APPROVED_PARTIAL, LINE_REJECTED, RESPONSE_SUBMITTED
+  // events: LINE_CUSTOM, LINE_REJECTED, RESPONSE_SUBMITTED
   const eventTypes = ctx.db.state.events.map((row) => row.event_type);
-  assert.ok(eventTypes.includes("LINE_APPROVED_PARTIAL"));
+  assert.ok(eventTypes.includes("LINE_CUSTOM"));
   assert.ok(eventTypes.includes("LINE_REJECTED"));
   assert.ok(eventTypes.includes("RESPONSE_SUBMITTED"));
 });
 
-test("partial approval requires a valid quantity and a reason", async () => {
+test("rejected and zero-qty custom responses require a reason, and custom qty must be non-negative", async () => {
   const ctx = await setupIncomingForBranch003();
   const [lineA, lineB] = ctx.lines;
 
@@ -1331,7 +1369,7 @@ test("partial approval requires a valid quantity and a reason", async () => {
     .set("x-csrf-token", ctx.sourceCsrf)
     .send({
       responses: [
-        { lineId: lineA.lineId, responseStatus: "APPROVED_PARTIAL", approvedQty: 1 },
+        { lineId: lineA.lineId, responseStatus: "CUSTOM", approvedQty: 0 },
         { lineId: lineB.lineId, responseStatus: "APPROVED_FULL" },
       ],
     });
@@ -1342,7 +1380,7 @@ test("partial approval requires a valid quantity and a reason", async () => {
     .set("x-csrf-token", ctx.sourceCsrf)
     .send({
       responses: [
-        { lineId: lineA.lineId, responseStatus: "APPROVED_PARTIAL", approvedQty: 999, reasonCode: "X" },
+        { lineId: lineA.lineId, responseStatus: "CUSTOM", approvedQty: -1, reasonCode: "X" },
         { lineId: lineB.lineId, responseStatus: "APPROVED_FULL" },
       ],
     });
@@ -1528,15 +1566,18 @@ test("a branch cannot see or mark another branch's notifications", async () => {
     });
   assert.equal(submit.status, 200);
 
-  // Branch 003 sees its own original incoming-request notification, but must
-  // not see the response notification addressed to requesting branch 001.
+  // Branch 003 keeps its original incoming-request notification as history, but
+  // after submitting a response it is auto-marked read and no longer counts
+  // toward the red badge. It must not see the response notification addressed
+  // to requesting branch 001.
   const sourceList = await ctx.sourceAgent.get("/api/notifications");
   assert.equal(sourceList.status, 200);
   assert.equal(sourceList.body.records.length, 1);
   assert.equal(sourceList.body.records[0].type, "REQUEST_SUBMITTED");
+  assert.ok(sourceList.body.records[0].readAt);
 
   const sourceCount = await ctx.sourceAgent.get("/api/notifications/unread-count");
-  assert.equal(sourceCount.body.unreadCount, 1);
+  assert.equal(sourceCount.body.unreadCount, 0);
 
   // branch 003 trying to mark branch 001's notification -> 404
   const notificationId = ctx.db.state.notifications.find(

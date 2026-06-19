@@ -1333,6 +1333,20 @@ async function insertNotification(client, notification) {
   );
 }
 
+async function markRequestNotificationsResponded(client, { requestId, recipientBranchCode }) {
+  await client.query(
+    `
+      UPDATE ordering.stock_request_notifications
+      SET read_at = COALESCE(read_at, now())
+      WHERE request_id = $1
+        AND recipient_branch_code = $2
+        AND type = 'REQUEST_SUBMITTED'
+        AND read_at IS NULL
+    `,
+    [requestId, recipientBranchCode],
+  );
+}
+
 async function loadRequestForResponse(client, publicId, auth) {
   const requestRow = await loadRequestByPublicId(client, publicId);
   if (!requestRow) {
@@ -1471,6 +1485,10 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
     const siblingRequests = await loadRequestRowsByBatchId(client, requestRow.batch_id);
     const batchStatus = computeBatchStatus(siblingRequests);
     await updateBatchStatus(client, requestRow.batch_id, batchStatus);
+    await markRequestNotificationsResponded(client, {
+      requestId: requestRow.request_id,
+      recipientBranchCode: requestRow.source_branch_code,
+    });
 
     await insertNotification(client, {
       recipientBranchCode: requestRow.requesting_branch_code,
