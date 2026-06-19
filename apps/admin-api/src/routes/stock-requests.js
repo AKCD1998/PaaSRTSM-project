@@ -13,6 +13,7 @@ const {
   submitStockRequestResponse,
   acknowledgeStockRequest,
   generateStockRequestDocument,
+  generateStockRequestDocuments,
   getStockRequestDocument,
   dispatchStockRequest,
   receiveStockRequest,
@@ -182,6 +183,32 @@ function createStockRequestsRouter(deps) {
   );
 
   router.post(
+    "/stock-requests/incoming/:publicId/documents",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requireCsrfMiddleware,
+    requireBranchIdentity,
+    async (req, res, next) => {
+      try {
+        const result = await generateStockRequestDocuments({
+          db,
+          auth: req.auth,
+          requestPublicId: req.params.publicId,
+          body: req.body,
+          requestId: req.requestId,
+        });
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          ...result,
+        });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  router.post(
     "/stock-requests/incoming/:publicId/document",
     requireFeatureEnabled,
     requireAuthMiddleware,
@@ -217,6 +244,7 @@ function createStockRequestsRouter(deps) {
           db,
           auth: req.auth,
           requestPublicId: req.params.publicId,
+          documentType: req.query.type || null,
         });
         return res.json({
           ok: true,

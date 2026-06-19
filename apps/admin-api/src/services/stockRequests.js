@@ -7,7 +7,8 @@ const EVENT_NOTE_MAX_CHARS = 2000;
 const RESPONSE_NOTE_MAX_CHARS = 2000;
 const REASON_CODE_MAX_CHARS = 64;
 const ALLOWED_SUBMITTER_ROLES = new Set(["admin", "branch"]);
-const VALID_RESPONSE_STATUSES = new Set(["APPROVED_FULL", "APPROVED_PARTIAL", "REJECTED"]);
+const VALID_RESPONSE_STATUSES = new Set(["APPROVED_FULL", "CUSTOM", "REJECTED"]);
+const STOCK_REQUEST_DOCUMENT_TYPES = new Set(["RESPONSE_SUMMARY", "PACKING_SLIP"]);
 
 function createHttpError(message, statusCode, extra = {}) {
   return Object.assign(new Error(message), { statusCode, ...extra });
@@ -267,6 +268,8 @@ async function loadRequestByPublicId(dbLike, publicId) {
         requesting_branch_code,
         source_branch_code,
         status,
+        response_result,
+        response_note,
         responded_by,
         responded_at,
         acknowledged_by,
@@ -293,6 +296,8 @@ async function loadRequestRowsByBatchId(dbLike, batchId) {
         requesting_branch_code,
         source_branch_code,
         status,
+        response_result,
+        response_note,
         responded_by,
         responded_at,
         acknowledged_by,
@@ -319,6 +324,8 @@ async function loadRequestRowsByRequestingBranch(dbLike, requestingBranchCode, s
         requesting_branch_code,
         source_branch_code,
         status,
+        response_result,
+        response_note,
         responded_by,
         responded_at,
         acknowledged_by,
@@ -350,6 +357,8 @@ async function loadIncomingRequestRowsBySourceBranch(dbLike, sourceBranchCode, s
         requesting_branch_code,
         source_branch_code,
         status,
+        response_result,
+        response_note,
         responded_by,
         responded_at,
         acknowledged_by,
@@ -708,6 +717,26 @@ function computeBatchStatus(requestRows) {
   return "RESPONDED";
 }
 
+function computeResponseResult(inputs) {
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    return null;
+  }
+  if (inputs.every((input) => input.lineStatus === "REJECTED")) {
+    return "FULLY_REJECTED";
+  }
+  if (inputs.every((input) => input.lineStatus === "APPROVED_FULL")) {
+    return "FULLY_APPROVED";
+  }
+  return "PARTIALLY_APPROVED";
+}
+
+function getDocumentsToGenerate(responseResult) {
+  if (responseResult === "FULLY_REJECTED") {
+    return ["RESPONSE_SUMMARY"];
+  }
+  return ["RESPONSE_SUMMARY", "PACKING_SLIP"];
+}
+
 function ensureCanReadBatch(auth, batchRow) {
   if (canAdminReadAll(auth)) {
     return;
@@ -733,6 +762,7 @@ function mapResponseRow(row) {
   return {
     responseId: Number(row.response_id),
     status: row.response_status,
+    responseStatus: row.response_status,
     approvedQty: Number(row.approved_qty || 0),
     reasonCode: row.reason_code || null,
     note: row.note || null,
@@ -769,6 +799,8 @@ function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId) {
     requestingBranchCode: requestRow.requesting_branch_code,
     sourceBranchCode: requestRow.source_branch_code,
     status: requestRow.status,
+    responseResult: requestRow.response_result || null,
+    responseNote: requestRow.response_note || null,
     respondedBy: requestRow.responded_by || null,
     respondedAt: requestRow.responded_at || null,
     acknowledgedBy: requestRow.acknowledged_by || null,
@@ -845,6 +877,8 @@ function mapIncomingSummary(requestRow, batchMap, lineCountsByRequestId) {
     requestingBranchCode: requestRow.requesting_branch_code,
     sourceBranchCode: requestRow.source_branch_code,
     status: requestRow.status,
+    responseResult: requestRow.response_result || null,
+    responseNote: requestRow.response_note || null,
     submittedAt: batchRow?.submitted_at || null,
     createdAt: requestRow.created_at,
     updatedAt: requestRow.updated_at,
@@ -1170,8 +1204,9 @@ async function getStockRequestEvents({ db, auth, publicId }) {
 }
 
 // Validate a single line response and resolve approved_qty + line status per the
-// business rules: full approval ships the requested qty; partial must be strictly
-// between 0 and requested and carry a reason; rejection zeroes qty and needs a reason.
+// business rules: full approval ships the requested qty; custom lets the source
+// branch set any non-negative quantity (including more than requested); zero maps
+// to reject; rejection always needs a reason.
 function normalizeLineResponseInput(rawLine, lineRow) {
   const lineId = Number(rawLine?.lineId ?? rawLine?.line_id);
   const responseStatus = normalizeText(rawLine?.responseStatus ?? rawLine?.response_status).toUpperCase();
@@ -1186,25 +1221,31 @@ function normalizeLineResponseInput(rawLine, lineRow) {
   let approvedQty;
   if (responseStatus === "APPROVED_FULL") {
     approvedQty = requestedQty;
-  } else if (responseStatus === "APPROVED_PARTIAL") {
-    approvedQty = parsePositiveNumber(rawLine?.approvedQty ?? rawLine?.approved_qty);
-    if (approvedQty == null || approvedQty >= requestedQty) {
-      throw createHttpError(
-        `approvedQty for line ${lineId} must be greater than 0 and less than the requested quantity for a partial approval.`,
-        422,
-      );
-    }
-    if (!reasonCode && !note) {
-      throw createHttpError(`A reason is required for a partial approval on line ${lineId}.`, 422);
-    }
-  } else {
+    return { lineId, responseStatus, lineStatus: "APPROVED_FULL", approvedQty, reasonCode, note };
+  }
+
+  if (responseStatus === "REJECTED") {
     approvedQty = 0;
     if (!reasonCode && !note) {
       throw createHttpError(`A reason is required to reject line ${lineId}.`, 422);
     }
+    return { lineId, responseStatus, lineStatus: "REJECTED", approvedQty, reasonCode, note };
   }
 
-  return { lineId, responseStatus, lineStatus: responseStatus, approvedQty, reasonCode, note };
+  approvedQty = parseOptionalNonNegativeNumber(rawLine?.approvedQty ?? rawLine?.approved_qty);
+  if (approvedQty == null) {
+    throw createHttpError(`approvedQty for line ${lineId} must be a non-negative number.`, 422);
+  }
+  if (approvedQty === 0) {
+    if (!reasonCode && !note) {
+      throw createHttpError(`A reason is required when approvedQty is 0 for line ${lineId}.`, 422);
+    }
+    return { lineId, responseStatus, lineStatus: "REJECTED", approvedQty: 0, reasonCode, note };
+  }
+  if (approvedQty === requestedQty) {
+    return { lineId, responseStatus, lineStatus: "APPROVED_FULL", approvedQty, reasonCode, note };
+  }
+  return { lineId, responseStatus, lineStatus: "CUSTOM", approvedQty, reasonCode, note };
 }
 
 async function insertLineResponse(client, { lineId, input, auth, isSubmitted }) {
@@ -1250,6 +1291,17 @@ async function markRequestResponded(client, { requestId, auth, expectedVersion }
     [requestId, auth.userId, expectedVersion],
   );
   return result.rows[0] || null;
+}
+
+async function updateRequestResponseSummary(client, { requestId, responseResult, responseNote }) {
+  await client.query(
+    `
+      UPDATE ordering.stock_requests
+      SET response_result = $2, response_note = $3, updated_at = now()
+      WHERE request_id = $1
+    `,
+    [requestId, responseResult, normalizeNullableText(responseNote, RESPONSE_NOTE_MAX_CHARS)],
+  );
 }
 
 async function updateBatchStatus(client, batchId, status) {
@@ -1327,6 +1379,7 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
   validateSubmissionAccess(auth);
 
   const responsesInput = Array.isArray(body?.responses) ? body.responses : null;
+  const decisionNote = normalizeNullableText(body?.decisionNote ?? body?.decision_note, RESPONSE_NOTE_MAX_CHARS);
   if (!responsesInput || !responsesInput.length) {
     throw createHttpError("responses must contain at least one line response.", 400);
   }
@@ -1385,6 +1438,7 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
       });
     }
 
+    const responseResult = computeResponseResult(normalizedInputs);
     const updatedRequest = await markRequestResponded(client, {
       requestId: requestRow.request_id,
       auth,
@@ -1393,6 +1447,11 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
     if (!updatedRequest) {
       throw createHttpError("Request was modified by someone else. Please reload.", 409);
     }
+    await updateRequestResponseSummary(client, {
+      requestId: requestRow.request_id,
+      responseResult,
+      responseNote: decisionNote,
+    });
 
     await insertEvent(client, {
       batchId: requestRow.batch_id,
@@ -1403,7 +1462,9 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
       metadata: {
         request_public_id: requestRow.public_id,
         line_count: lineRows.length,
+        response_result: responseResult,
       },
+      note: decisionNote,
       requestCorrelationId: requestId,
     });
 
@@ -1425,8 +1486,10 @@ async function submitStockRequestResponse({ db, auth, requestPublicId, body, req
     return {
       requestPublicId: requestRow.public_id,
       status: "RESPONDED",
+      responseResult,
       version: Number(updatedRequest.version),
       batchStatus,
+      documentsToGenerate: getDocumentsToGenerate(responseResult),
       lines: normalizedInputs.map((input) => ({
         lineId: input.lineId,
         status: input.lineStatus,
@@ -1557,50 +1620,70 @@ function ensureCanAccessDocument(auth, requestRow) {
   }
 }
 
-async function loadMaxDocumentForRequest(client, requestId) {
+async function loadMaxDocumentForRequest(client, requestId, documentType) {
   const result = await client.query(
     `
       SELECT document_id, version
       FROM ordering.stock_request_documents
       WHERE request_id = $1
+        AND document_type = $2
       ORDER BY version DESC
       LIMIT 1
     `,
-    [requestId],
+    [requestId, documentType],
   );
   return result.rows[0] || null;
 }
 
-async function loadLatestDocumentPayload(dbLike, requestId) {
+async function loadLatestDocumentPayload(dbLike, requestId, documentType = null) {
   const result = await dbLike.query(
     `
-      SELECT document_id, request_id, version, document_payload, generated_by, generated_at, reprint_of
+      SELECT document_id, request_id, document_type, version, document_payload, generated_by, generated_at, reprint_of
       FROM ordering.stock_request_documents
       WHERE request_id = $1
+        AND ($2::text IS NULL OR document_type = $2)
       ORDER BY version DESC
       LIMIT 1
     `,
-    [requestId],
+    [requestId, documentType],
   );
   return result.rows[0] || null;
 }
 
-async function insertDocument(client, { requestId, version, payload, generatedBy, reprintOf }) {
+async function insertDocument(client, { requestId, documentType, version, payload, generatedBy, reprintOf }) {
   const result = await client.query(
     `
       INSERT INTO ordering.stock_request_documents
-        (request_id, version, document_payload, generated_by, reprint_of)
+        (request_id, document_type, version, document_payload, generated_by, reprint_of)
       VALUES
-        ($1, $2, $3::jsonb, $4, $5)
+        ($1, $2, $3, $4::jsonb, $5, $6)
       RETURNING document_id, generated_at
     `,
-    [requestId, version, JSON.stringify(payload), generatedBy, reprintOf],
+    [requestId, documentType, version, JSON.stringify(payload), generatedBy, reprintOf],
   );
   return result.rows[0];
 }
 
-// Freeze the request/response state into the immutable document body (plan §13).
-function buildDocumentPayload({ requestRow, batchRow, lineRows, responseMap, version }) {
+function buildDocumentLineItems(lineRows, responseMap) {
+  return lineRows.map((lineRow) => {
+    const response = responseMap.get(Number(lineRow.line_id)) || null;
+    return {
+      lineId: Number(lineRow.line_id),
+      productCode: lineRow.product_code,
+      productNameThai: lineRow.product_name_thai || null,
+      productNameEng: lineRow.product_name_eng || null,
+      barcode: lineRow.barcode || null,
+      unit: lineRow.unit,
+      requestedQty: Number(lineRow.requested_qty || 0),
+      approvedQty: response ? Number(response.approved_qty || 0) : 0,
+      responseStatus: response ? response.response_status : "PENDING",
+      reasonCode: response ? response.reason_code || null : null,
+      note: response ? response.note || null : null,
+    };
+  });
+}
+
+function buildDocumentBasePayload({ requestRow, batchRow, version }) {
   return {
     requestPublicId: requestRow.public_id,
     batchPublicId: batchRow?.public_id || null,
@@ -1608,27 +1691,52 @@ function buildDocumentPayload({ requestRow, batchRow, lineRows, responseMap, ver
     requestingBranchCode: requestRow.requesting_branch_code,
     requestedAt: batchRow?.submitted_at || null,
     respondedAt: requestRow.responded_at || null,
+    responseResult: requestRow.response_result || null,
+    responseNote: requestRow.response_note || null,
     version,
-    lines: lineRows.map((lineRow) => {
-      const response = responseMap.get(Number(lineRow.line_id)) || null;
-      return {
-        productCode: lineRow.product_code,
-        productNameThai: lineRow.product_name_thai || null,
-        productNameEng: lineRow.product_name_eng || null,
-        barcode: lineRow.barcode || null,
-        unit: lineRow.unit,
-        requestedQty: Number(lineRow.requested_qty || 0),
-        approvedQty: response ? Number(response.approved_qty || 0) : 0,
-        responseStatus: response ? response.response_status : "PENDING",
-        reason: response ? response.reason_code || response.note || null : null,
-      };
-    }),
   };
 }
 
-// WP-12: source branch generates (or reprints) the packing document. Reprints add
-// a new immutable version row; historical versions are never mutated.
-async function generateStockRequestDocument({ db, auth, requestPublicId, requestId }) {
+function buildResponseSummaryPayload({ requestRow, batchRow, lineRows, responseMap, version }) {
+  return {
+    documentType: "RESPONSE_SUMMARY",
+    ...buildDocumentBasePayload({ requestRow, batchRow, version }),
+    lines: buildDocumentLineItems(lineRows, responseMap),
+  };
+}
+
+function buildPackingSlipPayload({ requestRow, batchRow, lineRows, responseMap, version }) {
+  return {
+    documentType: "PACKING_SLIP",
+    ...buildDocumentBasePayload({ requestRow, batchRow, version }),
+    lines: buildDocumentLineItems(lineRows, responseMap).filter((line) => Number(line.approvedQty || 0) > 0),
+  };
+}
+
+function buildDocumentPayloadByType({ documentType, requestRow, batchRow, lineRows, responseMap, version }) {
+  if (documentType === "RESPONSE_SUMMARY") {
+    return buildResponseSummaryPayload({ requestRow, batchRow, lineRows, responseMap, version });
+  }
+  if (documentType === "PACKING_SLIP") {
+    return buildPackingSlipPayload({ requestRow, batchRow, lineRows, responseMap, version });
+  }
+  throw createHttpError(`Unsupported document type: ${documentType}`, 400);
+}
+
+function normalizeRequestedDocumentTypes(rawTypes, requestRow) {
+  if (Array.isArray(rawTypes) && rawTypes.length > 0) {
+    const uniqueTypes = [...new Set(rawTypes.map((value) => normalizeText(value).toUpperCase()).filter(Boolean))];
+    const invalidType = uniqueTypes.find((type) => !STOCK_REQUEST_DOCUMENT_TYPES.has(type));
+    if (invalidType) {
+      throw createHttpError(`Unsupported document type: ${invalidType}`, 400);
+    }
+    return uniqueTypes;
+  }
+  return getDocumentsToGenerate(requestRow.response_result);
+}
+
+// WP-12: source branch generates (or reprints) immutable request documents.
+async function generateStockRequestDocuments({ db, auth, requestPublicId, body, requestId }) {
   validateSubmissionAccess(auth);
   const client = await db.connect();
   try {
@@ -1642,6 +1750,9 @@ async function generateStockRequestDocument({ db, auth, requestPublicId, request
     if (requestRow.status === "SUBMITTED" || requestRow.status === "CANCELLED") {
       throw createHttpError("A document can only be generated after the request has been responded to.", 409);
     }
+    if (!requestRow.response_result) {
+      throw createHttpError("Request response summary is missing. Please resubmit the response.", 409);
+    }
 
     const lineRows = await loadLineRowsByRequestIds(client, [requestRow.request_id]);
     const responseRows = await loadLatestSubmittedResponsesByLineIds(
@@ -1650,35 +1761,53 @@ async function generateStockRequestDocument({ db, auth, requestPublicId, request
     );
     const responseMap = new Map(responseRows.map((row) => [Number(row.line_id), row]));
     const batchRow = await loadBatchById(client, requestRow.batch_id);
+    const requestedTypes = normalizeRequestedDocumentTypes(body?.types, requestRow);
+    const documents = [];
 
-    const previous = await loadMaxDocumentForRequest(client, requestRow.request_id);
-    const version = previous ? Number(previous.version) + 1 : 1;
-    const payload = buildDocumentPayload({ requestRow, batchRow, lineRows, responseMap, version });
+    for (const documentType of requestedTypes) {
+      const previous = await loadMaxDocumentForRequest(client, requestRow.request_id, documentType);
+      const version = previous ? Number(previous.version) + 1 : 1;
+      const payload = buildDocumentPayloadByType({
+        documentType,
+        requestRow,
+        batchRow,
+        lineRows,
+        responseMap,
+        version,
+      });
 
-    const inserted = await insertDocument(client, {
-      requestId: requestRow.request_id,
-      version,
-      payload,
-      generatedBy: auth.userId,
-      reprintOf: previous ? previous.document_id : null,
-    });
+      const inserted = await insertDocument(client, {
+        requestId: requestRow.request_id,
+        documentType,
+        version,
+        payload,
+        generatedBy: auth.userId,
+        reprintOf: previous ? previous.document_id : null,
+      });
 
-    await insertEvent(client, {
-      batchId: requestRow.batch_id,
-      requestId: requestRow.request_id,
-      eventType: version > 1 ? "DOCUMENT_REPRINTED" : "DOCUMENT_GENERATED",
-      actorUser: auth.userId,
-      actorBranch: auth.effectiveBranchCode,
-      metadata: { document_id: Number(inserted.document_id), version },
-      requestCorrelationId: requestId,
-    });
+      await insertEvent(client, {
+        batchId: requestRow.batch_id,
+        requestId: requestRow.request_id,
+        eventType: version > 1 ? "DOCUMENT_REPRINTED" : "DOCUMENT_GENERATED",
+        actorUser: auth.userId,
+        actorBranch: auth.effectiveBranchCode,
+        metadata: { document_id: Number(inserted.document_id), document_type: documentType, version },
+        requestCorrelationId: requestId,
+      });
+
+      documents.push({
+        documentId: Number(inserted.document_id),
+        documentType,
+        version,
+        reprint: version > 1,
+        document: { ...payload, generatedAt: inserted.generated_at, generatedBy: auth.userId },
+      });
+    }
 
     await client.query("COMMIT");
     return {
-      documentId: Number(inserted.document_id),
-      version,
-      reprint: version > 1,
-      document: { ...payload, generatedAt: inserted.generated_at, generatedBy: auth.userId },
+      requestPublicId: requestRow.public_id,
+      documents,
     };
   } catch (error) {
     try {
@@ -1692,7 +1821,22 @@ async function generateStockRequestDocument({ db, auth, requestPublicId, request
   }
 }
 
-async function getStockRequestDocument({ db, auth, requestPublicId }) {
+async function generateStockRequestDocument({ db, auth, requestPublicId, requestId }) {
+  const result = await generateStockRequestDocuments({
+    db,
+    auth,
+    requestPublicId,
+    body: { types: ["PACKING_SLIP"] },
+    requestId,
+  });
+  const firstDocument = result.documents[0] || null;
+  if (!firstDocument) {
+    throw createHttpError("No document was generated.", 500);
+  }
+  return firstDocument;
+}
+
+async function getStockRequestDocument({ db, auth, requestPublicId, documentType = null }) {
   validateSubmissionAccess(auth);
 
   const requestRow = await loadRequestByPublicId(db, requestPublicId);
@@ -1701,7 +1845,8 @@ async function getStockRequestDocument({ db, auth, requestPublicId }) {
   }
   ensureCanAccessDocument(auth, requestRow);
 
-  const row = await loadLatestDocumentPayload(db, requestRow.request_id);
+  const normalizedDocumentType = normalizeNullableText(documentType)?.toUpperCase() || null;
+  const row = await loadLatestDocumentPayload(db, requestRow.request_id, normalizedDocumentType);
   if (!row) {
     throw createHttpError("No document has been generated for this request.", 404);
   }
@@ -1710,6 +1855,7 @@ async function getStockRequestDocument({ db, auth, requestPublicId }) {
     typeof row.document_payload === "string" ? JSON.parse(row.document_payload) : row.document_payload;
   return {
     documentId: Number(row.document_id),
+    documentType: row.document_type,
     version: Number(row.version),
     reprint: Number(row.version) > 1,
     document: { ...payload, generatedAt: row.generated_at, generatedBy: row.generated_by || null },
@@ -2231,6 +2377,7 @@ module.exports = {
   submitStockRequestResponse,
   acknowledgeStockRequest,
   generateStockRequestDocument,
+  generateStockRequestDocuments,
   getStockRequestDocument,
   dispatchStockRequest,
   receiveStockRequest,
