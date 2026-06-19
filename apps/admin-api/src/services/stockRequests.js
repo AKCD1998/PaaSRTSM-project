@@ -1101,7 +1101,9 @@ async function getStockRequestBatchDetail({ db, auth, publicId }) {
 }
 
 async function listIncomingStockRequests({ db, auth, search }) {
-  validateSubmissionAccess(auth);
+  if (!auth?.userId || !auth?.role) throw createHttpError("Unauthorized", 401);
+  if (!ALLOWED_SUBMITTER_ROLES.has(auth.role)) throw createHttpError("Forbidden", 403);
+  if (!auth.effectiveBranchCode) return [];
   const searchTerm = normalizeSearchTerm(search);
   const requestRows = await loadIncomingRequestRowsBySourceBranch(db, auth.effectiveBranchCode, searchTerm);
   const batchRows = await loadBatchRowsByIds(
