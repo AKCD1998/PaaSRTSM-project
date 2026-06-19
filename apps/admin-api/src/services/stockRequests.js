@@ -2170,7 +2170,12 @@ async function listStockRequestNotifications({ db, auth }) {
 }
 
 async function getUnreadNotificationCount({ db, auth }) {
-  validateSubmissionAccess(auth);
+  if (!auth?.userId || !auth?.role) {
+    throw createHttpError("Unauthorized", 401);
+  }
+  if (!auth.effectiveBranchCode) {
+    return 0;
+  }
   const result = await db.query(
     `
       SELECT COUNT(*)::int AS unread_count

@@ -343,7 +343,6 @@ function createStockRequestsRouter(deps) {
     "/notifications/unread-count",
     requireFeatureEnabled,
     requireAuthMiddleware,
-    requireBranchIdentity,
     async (req, res, next) => {
       try {
         const unreadCount = await getUnreadNotificationCount({ db, auth: req.auth });
