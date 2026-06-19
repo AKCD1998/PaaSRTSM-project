@@ -873,6 +873,8 @@ function mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId) 
     0,
   );
   const isAdminAlert = childRequests.some((row) => row.request_mode === "ADMIN_ALERT");
+  const hasStandard = childRequests.some((row) => (row.request_mode || "STANDARD") !== "ADMIN_ALERT");
+  const isMixedMode = isAdminAlert && hasStandard;
 
   return {
     batchPublicId: batchRow.public_id,
@@ -886,6 +888,7 @@ function mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId) 
     lineCount,
     sourceBranchCodes,
     isAdminAlert,
+    isMixedMode,
   };
 }
 
