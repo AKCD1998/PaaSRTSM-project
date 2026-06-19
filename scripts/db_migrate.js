@@ -249,6 +249,55 @@ async function recordMigration(client, filename) {
   );
 }
 
+// Migrations that existed before schema_migrations tracking was introduced.
+// Seeding them prevents re-running ALTER TABLE / CREATE INDEX on a live database.
+const LEGACY_MIGRATIONS = [
+  "001_inventory_schema.sql",
+  "migrations/002_add_sku_price_tiers.sql",
+  "migrations/003_add_product_fields.sql",
+  "migrations/004_add_enrichment_workflow.sql",
+  "migrations/005_add_sales_daily.sql",
+  "migrations/010_add_audit_logs.sql",
+  "migrations/011_add_sku_unit_prices.sql",
+  "migrations/012_add_sku_embeddings.sql",
+  "migrations/013_add_embedding_sync_jobs.sql",
+  "migrations/014_add_shared_ordering_and_sync.sql",
+  "migrations/015_add_ada_raw_ingestion.sql",
+  "migrations/016_add_ada_foundation_derivations.sql",
+  "migrations/017_add_ada_analytics_derivations.sql",
+  "migrations/018_add_ada_standard_analytics_windows.sql",
+  "migrations/019_add_transfer_reconciliation_foundation.sql",
+  "migrations/020_add_admin_receipt_staging.sql",
+  "migrations/020_add_product_category_states.sql",
+  "migrations/021_seed_core_branches_from_ada.sql",
+  "migrations/022_add_ada_branch_stock_snapshots.sql",
+  "migrations/023_add_ada_branch_stock_uploads.sql",
+  "migrations/024_add_branch_sync_log.sql",
+  "migrations/025_add_product_category_embeddings.sql",
+  "migrations/026_finalize_knee_joint_category_normalization.sql",
+  "migrations/027_rename_shelf6_to_shelf9_categories.sql",
+  "migrations/028_add_member_profile_fields.sql",
+  "migrations/029_add_product_movement_groups.sql",
+  "migrations/030_add_supplier_logos.sql",
+  "migrations/031_add_ingredient_knowledge_layer.sql",
+  "migrations/032_add_branch_stock_cost_columns.sql",
+  "migrations/033_add_stock_request_workflow.sql",
+  "migrations/034_add_stock_request_fulfillment.sql",
+  "migrations/035_allow_branch_audit_role.sql",
+  "migrations/036_expand_stock_request_response_documents.sql",
+  "migrations/037_add_stock_request_mode.sql",
+];
+
+async function seedLegacyMigrations(client) {
+  if (LEGACY_MIGRATIONS.length === 0) return;
+  const values = LEGACY_MIGRATIONS.map((_, i) => `($${i + 1})`).join(", ");
+  await client.query(
+    `INSERT INTO public.schema_migrations (filename) VALUES ${values} ON CONFLICT DO NOTHING`,
+    LEGACY_MIGRATIONS,
+  );
+  console.log(`Seeded ${LEGACY_MIGRATIONS.length} legacy migration(s) into schema_migrations.`);
+}
+
 async function applySqlFile(client, filePath, rootDir) {
   const sql = await fs.readFile(filePath, "utf8");
   const relativePath = path.relative(rootDir, filePath);
@@ -281,6 +330,7 @@ async function run() {
 
   try {
     await ensureMigrationsTable(client);
+    await seedLegacyMigrations(client);
     const applied = await getAppliedMigrations(client);
     const sqlFiles = await loadSqlFiles(rootDir);
 
