@@ -8,6 +8,7 @@ const RESPONSE_NOTE_MAX_CHARS = 2000;
 const REASON_CODE_MAX_CHARS = 64;
 const ALLOWED_SUBMITTER_ROLES = new Set(["admin", "branch", "staff"]);
 const VALID_RESPONSE_STATUSES = new Set(["APPROVED_FULL", "CUSTOM", "REJECTED"]);
+const VALID_REQUEST_MODES = new Set(["STANDARD", "ADMIN_ALERT"]);
 const STOCK_REQUEST_DOCUMENT_TYPES = new Set(["RESPONSE_SUMMARY", "PACKING_SLIP"]);
 
 function createHttpError(message, statusCode, extra = {}) {
@@ -109,8 +110,12 @@ function normalizeSubmitPayload(body) {
 
   for (const [groupIndex, groupSource] of groupsSource.entries()) {
     const sourceBranchCode = normalizeBranchCode(groupSource?.sourceBranchCode || groupSource?.source_branch_code);
+    const requestMode = normalizeText(groupSource?.requestMode ?? groupSource?.request_mode).toUpperCase() || "STANDARD";
     if (!sourceBranchCode) {
       throw createHttpError(`groups[${groupIndex}].sourceBranchCode must be a 3-digit branch code.`, 400);
+    }
+    if (!VALID_REQUEST_MODES.has(requestMode)) {
+      throw createHttpError(`groups[${groupIndex}].requestMode is invalid.`, 400);
     }
     if (seenSourceBranches.has(sourceBranchCode)) {
       throw createHttpError(`Duplicate sourceBranchCode ${sourceBranchCode} in groups.`, 400);
@@ -171,6 +176,7 @@ function normalizeSubmitPayload(body) {
 
     groups.push({
       sourceBranchCode,
+      requestMode,
       lines,
     });
   }
@@ -267,6 +273,7 @@ async function loadRequestByPublicId(dbLike, publicId) {
         batch_id,
         requesting_branch_code,
         source_branch_code,
+        request_mode,
         status,
         response_result,
         response_note,
@@ -295,6 +302,7 @@ async function loadRequestRowsByBatchId(dbLike, batchId) {
         batch_id,
         requesting_branch_code,
         source_branch_code,
+        request_mode,
         status,
         response_result,
         response_note,
@@ -323,6 +331,7 @@ async function loadRequestRowsByRequestingBranch(dbLike, requestingBranchCode, s
         batch_id,
         requesting_branch_code,
         source_branch_code,
+        request_mode,
         status,
         response_result,
         response_note,
@@ -356,6 +365,7 @@ async function loadIncomingRequestRowsBySourceBranch(dbLike, sourceBranchCode, s
         batch_id,
         requesting_branch_code,
         source_branch_code,
+        request_mode,
         status,
         response_result,
         response_note,
@@ -610,23 +620,24 @@ async function insertBatch(client, payload, auth) {
   };
 }
 
-async function insertRequest(client, { batch, auth, sourceBranchCode }) {
+async function insertRequest(client, { batch, auth, sourceBranchCode, requestMode }) {
   const publicId = formatRequestPublicId(batch.publicId, sourceBranchCode);
   const result = await client.query(
     `
       INSERT INTO ordering.stock_requests
-        (public_id, batch_id, requesting_branch_code, source_branch_code, status)
+        (public_id, batch_id, requesting_branch_code, source_branch_code, request_mode, status)
       VALUES
-        ($1, $2, $3, $4, 'SUBMITTED')
+        ($1, $2, $3, $4, $5, 'SUBMITTED')
       RETURNING request_id
     `,
-    [publicId, batch.batchId, auth.effectiveBranchCode, sourceBranchCode],
+    [publicId, batch.batchId, auth.effectiveBranchCode, sourceBranchCode, requestMode || "STANDARD"],
   );
 
   return {
     requestId: Number(result.rows[0].request_id),
     publicId,
     sourceBranchCode,
+    requestMode: requestMode || "STANDARD",
   };
 }
 
@@ -791,6 +802,7 @@ function mapLineRow(row, responseRow) {
 }
 
 function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId) {
+  const requestMode = requestRow.request_mode || "STANDARD";
   return {
     requestId: Number(requestRow.request_id),
     publicId: requestRow.public_id,
@@ -798,6 +810,8 @@ function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId) {
     batchPublicId,
     requestingBranchCode: requestRow.requesting_branch_code,
     sourceBranchCode: requestRow.source_branch_code,
+    requestMode,
+    isAdminAlert: requestMode === "ADMIN_ALERT",
     status: requestRow.status,
     responseResult: requestRow.response_result || null,
     responseNote: requestRow.response_note || null,
@@ -871,11 +885,14 @@ function mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId) 
 
 function mapIncomingSummary(requestRow, batchMap, lineCountsByRequestId) {
   const batchRow = batchMap.get(Number(requestRow.batch_id)) || null;
+  const requestMode = requestRow.request_mode || "STANDARD";
   return {
     requestPublicId: requestRow.public_id,
     batchPublicId: batchRow?.public_id || null,
     requestingBranchCode: requestRow.requesting_branch_code,
     sourceBranchCode: requestRow.source_branch_code,
+    requestMode,
+    isAdminAlert: requestMode === "ADMIN_ALERT",
     status: requestRow.status,
     responseResult: requestRow.response_result || null,
     responseNote: requestRow.response_note || null,
@@ -997,11 +1014,13 @@ async function submitStockRequestBatch({ db, auth, body, requestId }) {
         batch,
         auth,
         sourceBranchCode: group.sourceBranchCode,
+        requestMode: group.requestMode,
       });
 
       createdRequests.push({
         publicId: requestRecord.publicId,
         sourceBranchCode: requestRecord.sourceBranchCode,
+        requestMode: requestRecord.requestMode,
       });
 
       await insertEvent(client, {
@@ -1013,6 +1032,7 @@ async function submitStockRequestBatch({ db, auth, body, requestId }) {
         metadata: {
           request_public_id: requestRecord.publicId,
           source_branch_code: group.sourceBranchCode,
+          request_mode: group.requestMode,
           line_count: group.lines.length,
         },
         requestCorrelationId: requestId,

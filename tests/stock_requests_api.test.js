@@ -261,7 +261,7 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code, status") &&
+      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code") &&
       normalized.includes("from ordering.stock_requests") &&
       normalized.includes("where public_id = $1")
     ) {
@@ -270,7 +270,7 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code, status") &&
+      normalized.includes("select request_id, public_id, batch_id, requesting_branch_code, source_branch_code") &&
       normalized.includes("from ordering.stock_requests") &&
       normalized.includes("where batch_id = $1")
     ) {
@@ -439,6 +439,7 @@ function createStockRequestMockDb() {
         batch_id: Number(params[1]),
         requesting_branch_code: params[2],
         source_branch_code: params[3],
+        request_mode: params[4] || "STANDARD",
         status: "SUBMITTED",
         response_result: null,
         response_note: null,
@@ -1068,6 +1069,63 @@ test("staff with branch override can submit, list mine, and read incoming reques
   assert.equal(detailResponse.status, 200);
   assert.equal(detailResponse.body.request.publicId, source003Request.publicId);
   assert.equal(detailResponse.body.request.sourceBranchCode, "003");
+});
+
+test("admin alert requests to HQ are flagged in admin incoming cards", async () => {
+  const { app, db } = createTestApp();
+  const requesterAgent = request.agent(app);
+  const requesterCsrf = await login(requesterAgent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+
+  const submitResponse = await requesterAgent
+    .post("/api/stock-requests")
+    .set("x-csrf-token", requesterCsrf)
+    .send({
+      idempotencyKey: "stock-request:001:admin-alert",
+      groups: [
+        {
+          sourceBranchCode: "000",
+          requestMode: "ADMIN_ALERT",
+          lines: [
+            {
+              productCode: "630010001",
+              requestedQty: 1,
+              unit: "BOX",
+              snapshotQty: 0,
+            },
+          ],
+        },
+      ],
+    });
+
+  assert.equal(submitResponse.status, 201);
+  assert.equal(submitResponse.body.requests[0].sourceBranchCode, "000");
+
+  const adminAgent = request.agent(app);
+  const adminCsrf = await login(adminAgent, {
+    username: "admin@example.com",
+    password: "admin-pass-123",
+  });
+  await applyBranchOverride(adminAgent, adminCsrf, "000");
+
+  const incomingResponse = await adminAgent.get("/api/stock-requests/incoming");
+  assert.equal(incomingResponse.status, 200);
+  assert.equal(incomingResponse.body.records.length, 1);
+  assert.equal(incomingResponse.body.records[0].requestMode, "ADMIN_ALERT");
+  assert.equal(incomingResponse.body.records[0].isAdminAlert, true);
+
+  const requestId = db.state.requests[0].request_id;
+  assert.equal(db.state.requests[0].request_mode, "ADMIN_ALERT");
+  assert.ok(
+    db.state.notifications.some(
+      (item) =>
+        item.recipient_branch_code === "000" &&
+        item.request_id === requestId &&
+        item.type === "REQUEST_SUBMITTED",
+    ),
+  );
 });
 
 test("invalid branch and product validation rejects bad input before persistence", async () => {
