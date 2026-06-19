@@ -1,5 +1,7 @@
 BEGIN;
 
+SET lock_timeout = '8s';
+
 -- Commercial product metadata (backward-compatible; no existing columns removed/renamed).
 ALTER TABLE public.items
   ADD COLUMN IF NOT EXISTS source_company_code text,

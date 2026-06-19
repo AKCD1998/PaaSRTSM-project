@@ -228,6 +228,27 @@ function splitSqlStatements(sql) {
   return statements;
 }
 
+async function ensureMigrationsTable(client) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.schema_migrations (
+      filename TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function getAppliedMigrations(client) {
+  const result = await client.query("SELECT filename FROM public.schema_migrations");
+  return new Set(result.rows.map((row) => row.filename));
+}
+
+async function recordMigration(client, filename) {
+  await client.query(
+    "INSERT INTO public.schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING",
+    [filename],
+  );
+}
+
 async function applySqlFile(client, filePath, rootDir) {
   const sql = await fs.readFile(filePath, "utf8");
   const relativePath = path.relative(rootDir, filePath);
@@ -243,6 +264,7 @@ async function applySqlFile(client, filePath, rootDir) {
     for (const statement of statements) {
       await client.query(statement);
     }
+    await recordMigration(client, relativePath);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -258,9 +280,22 @@ async function run() {
   const client = await pool.connect();
 
   try {
+    await ensureMigrationsTable(client);
+    const applied = await getAppliedMigrations(client);
     const sqlFiles = await loadSqlFiles(rootDir);
+
+    let skipped = 0;
     for (const file of sqlFiles) {
+      const relativePath = path.relative(rootDir, file);
+      if (applied.has(relativePath)) {
+        skipped += 1;
+        continue;
+      }
       await applySqlFile(client, file, rootDir);
+    }
+
+    if (skipped > 0) {
+      console.log(`Skipped ${skipped} already-applied migration(s).`);
     }
     console.log("Database migrations completed.");
   } finally {

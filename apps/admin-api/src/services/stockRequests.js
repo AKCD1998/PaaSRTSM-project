@@ -868,6 +868,7 @@ function mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId) 
     (sum, row) => sum + Number(lineCountsByRequestId.get(Number(row.request_id)) || 0),
     0,
   );
+  const isAdminAlert = childRequests.some((row) => row.request_mode === "ADMIN_ALERT");
 
   return {
     batchPublicId: batchRow.public_id,
@@ -880,6 +881,7 @@ function mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId) 
     requestCount: childRequests.length,
     lineCount,
     sourceBranchCodes,
+    isAdminAlert,
   };
 }
 
