@@ -96,6 +96,7 @@ function createStockRequestsRouter(deps) {
           db,
           auth: req.auth,
           search: req.query.search || "",
+          filterBranchCode: req.query.branch || "",
         });
         return res.json({
           ok: true,

@@ -377,15 +377,19 @@ async function loadIncomingRequestRowsBySourceBranch(dbLike, sourceBranchCode, s
         created_at,
         updated_at
       FROM ordering.stock_requests
-      WHERE source_branch_code = $1
+      WHERE ($1::text IS NULL OR source_branch_code = $1)
         AND (
           $2::text IS NULL
           OR public_id ILIKE ('%' || $2 || '%')
           OR requesting_branch_code ILIKE ('%' || $2 || '%')
+          OR source_branch_code ILIKE ('%' || $2 || '%')
         )
-      ORDER BY created_at DESC, request_id DESC
+      ORDER BY
+        CASE WHEN request_mode = 'ADMIN_ALERT' AND status = 'SUBMITTED' THEN 0 ELSE 1 END,
+        created_at DESC,
+        request_id DESC
     `,
-    [sourceBranchCode, searchTerm],
+    [sourceBranchCode || null, searchTerm],
   );
   return result.rows;
 }
@@ -1156,12 +1160,14 @@ async function getStockRequestBatchDetail({ db, auth, publicId }) {
   return mapBatchDetail(batchRow, requestRows, lineRows, responseRows);
 }
 
-async function listIncomingStockRequests({ db, auth, search }) {
+async function listIncomingStockRequests({ db, auth, search, filterBranchCode }) {
   if (!auth?.userId || !auth?.role) throw createHttpError("Unauthorized", 401);
   if (!ALLOWED_SUBMITTER_ROLES.has(auth.role)) throw createHttpError("Forbidden", 403);
-  if (!auth.effectiveBranchCode) return [];
+  const isAdmin = auth.role === "admin";
+  if (!isAdmin && !auth.effectiveBranchCode) return [];
+  const sourceBranch = isAdmin ? (filterBranchCode || null) : auth.effectiveBranchCode;
   const searchTerm = normalizeSearchTerm(search);
-  const requestRows = await loadIncomingRequestRowsBySourceBranch(db, auth.effectiveBranchCode, searchTerm);
+  const requestRows = await loadIncomingRequestRowsBySourceBranch(db, sourceBranch, searchTerm);
   const batchRows = await loadBatchRowsByIds(
     db,
     requestRows.map((row) => row.batch_id),
