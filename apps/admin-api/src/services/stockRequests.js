@@ -322,6 +322,15 @@ async function loadRequestRowsByBatchId(dbLike, batchId) {
   return result.rows;
 }
 
+async function loadRequestRowsByBatchIds(dbLike, batchIds) {
+  if (!batchIds.length) return [];
+  const result = await dbLike.query(
+    `SELECT batch_id, request_mode FROM ordering.stock_requests WHERE batch_id = ANY($1::bigint[])`,
+    [batchIds],
+  );
+  return result.rows;
+}
+
 async function loadRequestRowsByRequestingBranch(dbLike, requestingBranchCode, searchTerm) {
   const result = await dbLike.query(
     `
@@ -892,16 +901,21 @@ function mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId) 
   };
 }
 
-function mapIncomingSummary(requestRow, batchMap, lineCountsByRequestId) {
+function mapIncomingSummary(requestRow, batchMap, lineCountsByRequestId, batchModesMap) {
   const batchRow = batchMap.get(Number(requestRow.batch_id)) || null;
   const requestMode = requestRow.request_mode || "STANDARD";
+  const isAdminAlert = requestMode === "ADMIN_ALERT";
+  const batchModes = batchModesMap ? (batchModesMap.get(Number(requestRow.batch_id)) || new Set()) : new Set();
+  const isMixedMode = isAdminAlert &&
+    [...batchModes].some((m) => (m || "STANDARD") !== "ADMIN_ALERT");
   return {
     requestPublicId: requestRow.public_id,
     batchPublicId: batchRow?.public_id || null,
     requestingBranchCode: requestRow.requesting_branch_code,
     sourceBranchCode: requestRow.source_branch_code,
     requestMode,
-    isAdminAlert: requestMode === "ADMIN_ALERT",
+    isAdminAlert,
+    isMixedMode,
     status: requestRow.status,
     responseResult: requestRow.response_result || null,
     responseNote: requestRow.response_note || null,
@@ -1186,7 +1200,16 @@ async function listIncomingStockRequests({ db, auth, search, filterBranchCode })
     lineCountsByRequestId.set(requestId, Number(lineCountsByRequestId.get(requestId) || 0) + 1);
   }
 
-  return requestRows.map((requestRow) => mapIncomingSummary(requestRow, batchMap, lineCountsByRequestId));
+  const batchIds = [...new Set(requestRows.map((row) => Number(row.batch_id)))];
+  const allBatchRequestRows = await loadRequestRowsByBatchIds(db, batchIds);
+  const batchModesMap = new Map();
+  for (const row of allBatchRequestRows) {
+    const bid = Number(row.batch_id);
+    if (!batchModesMap.has(bid)) batchModesMap.set(bid, new Set());
+    batchModesMap.get(bid).add(row.request_mode || "STANDARD");
+  }
+
+  return requestRows.map((requestRow) => mapIncomingSummary(requestRow, batchMap, lineCountsByRequestId, batchModesMap));
 }
 
 async function getIncomingStockRequestDetail({ db, auth, publicId }) {
