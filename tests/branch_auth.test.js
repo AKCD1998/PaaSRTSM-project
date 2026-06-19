@@ -32,7 +32,7 @@ function buildConfig() {
     defaultPeriodDays: 30,
     featureStockRequests: true,
     adminUsers: new Set(["admin@example.com"]),
-    staffUsers: new Set(["staff@example.com"]),
+    staffUsers: new Set(["staff@example.com", "staff004"]),
     branchUsers: new Set(["branch001@example.com", "branch005@example.com"]),
     adminPasswordHash: bcrypt.hashSync("admin-pass-123", 10),
     staffPasswordHash: bcrypt.hashSync("staff-pass-123", 10),
@@ -54,6 +54,7 @@ function createMockDb() {
     branches: new Map([
       ["000", { branch_code: "000", branch_name: "HQ", is_active: true, is_hq: true }],
       ["001", { branch_code: "001", branch_name: "Branch 001", is_active: true, is_hq: false }],
+      ["004", { branch_code: "004", branch_name: "Branch 004", is_active: true, is_hq: false }],
       ["005", { branch_code: "005", branch_name: "Branch 005", is_active: false, is_hq: false }],
     ]),
   };
@@ -303,6 +304,29 @@ test("staff users can set and clear explicit branch override", async () => {
   assert.equal(clearResponse.body.user.is_branch_override, false);
   assert.ok(db.state.auditActions.includes("auth.branch_override_set"));
   assert.ok(db.state.auditActions.includes("auth.branch_override_cleared"));
+});
+
+test("staffNNN login auto-applies the matching active branch context", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+
+  const loginResponse = await loginAs(agent, {
+    username: "staff004",
+    password: "staff-pass-123",
+  });
+
+  assert.equal(loginResponse.status, 200);
+  assert.equal(loginResponse.body.user.role, "staff");
+  assert.equal(loginResponse.body.user.branch_code, "004");
+  assert.equal(loginResponse.body.user.actor_branch_code, null);
+  assert.equal(loginResponse.body.user.effective_branch_code, "004");
+  assert.equal(loginResponse.body.user.is_branch_override, false);
+  assert.deepEqual(loginResponse.body.permissions.allowed_branch_codes, ["004"]);
+
+  const meResponse = await agent.get("/admin/me");
+  assert.equal(meResponse.status, 200);
+  assert.equal(meResponse.body.user.effective_branch_code, "004");
+  assert.deepEqual(meResponse.body.permissions.allowed_branch_codes, ["004"]);
 });
 
 test("inactive branch assignments and invalid override branch codes are rejected", async () => {

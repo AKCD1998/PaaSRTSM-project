@@ -69,16 +69,21 @@ function getPasswordHashForRole(role, config) {
   return "";
 }
 
+function deriveStaffBranchCode(userId) {
+  const normalized = normalizeUserId(userId);
+  const match = normalized.match(/^staff(\d{3})(?:@.*)?$/);
+  return match ? normalizeBranchCode(match[1]) : null;
+}
+
 function resolveStaffBranchAllowlist(userId, config) {
   const allowlists = config?.staffBranchAllowlists;
-  if (!allowlists || !(allowlists instanceof Map) || allowlists.size === 0) {
-    return null;
-  }
   const normalized = normalizeUserId(userId);
-  if (!allowlists.has(normalized)) {
-    return null;
+  if (allowlists && allowlists instanceof Map && allowlists.size > 0 && allowlists.has(normalized)) {
+    return allowlists.get(normalized);
   }
-  return allowlists.get(normalized);
+
+  const derivedBranchCode = deriveStaffBranchCode(normalized);
+  return derivedBranchCode ? new Set([derivedBranchCode]) : null;
 }
 
 function buildPermissionsResponse(role, userId, config) {
@@ -131,6 +136,7 @@ async function findBranchRecordByCode(db, branchCode) {
 module.exports = {
   normalizeUserId,
   normalizeBranchCode,
+  deriveStaffBranchCode,
   resolveConfiguredUserAccount,
   resolveUserRole,
   getPasswordHashForRole,

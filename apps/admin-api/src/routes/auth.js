@@ -191,12 +191,30 @@ function createAuthRouter(deps) {
 
     clearLoginFailures(req);
     const csrfToken = generateCsrfToken();
+    const staffAllowlist = account.role === "staff" ? resolveStaffBranchAllowlist(account.userId, config) : null;
+    const inferredStaffBranchCode =
+      staffAllowlist && staffAllowlist.size === 1
+        ? [...staffAllowlist][0]
+        : null;
+    let autoContextBranchCode = null;
+    if (inferredStaffBranchCode) {
+      const inferredBranch = await findBranchRecordByCode(db, inferredStaffBranchCode);
+      if (inferredBranch?.isActive) {
+        autoContextBranchCode = inferredBranch.branchCode;
+      }
+    }
     const sessionIdentity = buildSessionIdentity(
       {
         ...account,
         branchCode: resolvedBranch?.branchCode || null,
       },
       csrfToken,
+      autoContextBranchCode
+        ? {
+            effectiveBranchCode: autoContextBranchCode,
+            isBranchOverride: false,
+          }
+        : {},
     );
     setAuthCookie(res, sessionIdentity, config);
 
