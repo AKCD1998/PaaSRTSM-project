@@ -793,6 +793,15 @@ async function login(agent, credentials) {
   return response.body.csrf_token;
 }
 
+async function applyBranchOverride(agent, csrfToken, branchCode) {
+  const response = await agent
+    .post("/admin/auth/branch-override")
+    .set("x-csrf-token", csrfToken)
+    .send({ branchCode });
+  assert.equal(response.status, 200);
+  return response.body;
+}
+
 async function submitSampleBatch(agent, csrfToken, overrides = {}) {
   const payload = {
     idempotencyKey: overrides.idempotencyKey || "stock-request:001:sample",
@@ -977,6 +986,54 @@ test("admin must set an explicit branch override before submitting", async () =>
 
   assert.equal(submitResponse.status, 201);
   assert.match(submitResponse.body.batchPublicId, /^SRQ-20260618-000-\d{6}$/);
+});
+
+test("staff without branch context gets empty outgoing and incoming lists", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  await login(agent, {
+    username: "staff@example.com",
+    password: "staff-pass-123",
+  });
+
+  const mineResponse = await agent.get("/api/stock-requests/mine");
+  assert.equal(mineResponse.status, 200);
+  assert.deepEqual(mineResponse.body.records, []);
+
+  const incomingResponse = await agent.get("/api/stock-requests/incoming");
+  assert.equal(incomingResponse.status, 200);
+  assert.deepEqual(incomingResponse.body.records, []);
+});
+
+test("staff with branch override can submit, list mine, and read incoming requests", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  const csrfToken = await login(agent, {
+    username: "staff@example.com",
+    password: "staff-pass-123",
+  });
+
+  await applyBranchOverride(agent, csrfToken, "001");
+  const submitResponse = await submitSampleBatch(agent, csrfToken, {
+    idempotencyKey: "stock-request:staff:001:sample",
+  });
+  const source003Request = submitResponse.body.requests.find((item) => item.sourceBranchCode === "003");
+
+  const mineResponse = await agent.get("/api/stock-requests/mine");
+  assert.equal(mineResponse.status, 200);
+  assert.equal(mineResponse.body.records.length, 1);
+  assert.equal(mineResponse.body.records[0].batchPublicId, submitResponse.body.batchPublicId);
+
+  await applyBranchOverride(agent, csrfToken, "003");
+  const incomingResponse = await agent.get("/api/stock-requests/incoming");
+  assert.equal(incomingResponse.status, 200);
+  assert.equal(incomingResponse.body.records.length, 1);
+  assert.equal(incomingResponse.body.records[0].requestPublicId, source003Request.publicId);
+
+  const detailResponse = await agent.get(`/api/stock-requests/incoming/${source003Request.publicId}`);
+  assert.equal(detailResponse.status, 200);
+  assert.equal(detailResponse.body.request.publicId, source003Request.publicId);
+  assert.equal(detailResponse.body.request.sourceBranchCode, "003");
 });
 
 test("invalid branch and product validation rejects bad input before persistence", async () => {
