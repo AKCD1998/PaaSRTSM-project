@@ -1043,7 +1043,9 @@ async function submitStockRequestBatch({ db, auth, body, requestId }) {
 }
 
 async function listOutgoingStockRequestBatches({ db, auth, search }) {
-  validateSubmissionAccess(auth);
+  if (!auth?.userId || !auth?.role) throw createHttpError("Unauthorized", 401);
+  if (!ALLOWED_SUBMITTER_ROLES.has(auth.role)) throw createHttpError("Forbidden", 403);
+  if (!auth.effectiveBranchCode) return [];
   const searchTerm = normalizeSearchTerm(search);
   const requestRows = await loadRequestRowsByRequestingBranch(db, auth.effectiveBranchCode, searchTerm);
   const batchRows = await loadBatchRowsByIds(

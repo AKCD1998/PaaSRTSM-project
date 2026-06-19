@@ -67,7 +67,6 @@ function createStockRequestsRouter(deps) {
     "/stock-requests/mine",
     requireFeatureEnabled,
     requireAuthMiddleware,
-    requireBranchIdentity,
     async (req, res, next) => {
       try {
         const records = await listOutgoingStockRequestBatches({
