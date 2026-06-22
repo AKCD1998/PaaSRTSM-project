@@ -246,7 +246,7 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select public_id, source_branch_code") &&
+      normalized.includes("select public_id, source_branch_code, request_mode") &&
       normalized.includes("from ordering.stock_requests") &&
       normalized.includes("where batch_id = $1")
     ) {
@@ -256,6 +256,7 @@ function createStockRequestMockDb() {
         .map((row) => ({
           public_id: row.public_id,
           source_branch_code: row.source_branch_code,
+          request_mode: row.request_mode || "STANDARD",
         }));
       return { rowCount: rows.length, rows };
     }
@@ -304,20 +305,35 @@ function createStockRequestMockDb() {
 
     if (
       normalized.includes("from ordering.stock_requests") &&
-      normalized.includes("where source_branch_code = $1")
+      normalized.includes("source_branch_code = $1") &&
+      !normalized.includes("where batch_id")
     ) {
       const sourceBranchCode = params[0];
       const searchTerm = params[1];
       const rows = state.requests
-        .filter((row) => row.source_branch_code === sourceBranchCode)
+        .filter((row) => sourceBranchCode === null || row.source_branch_code === sourceBranchCode)
         .filter(
           (row) =>
-            includesSearch(row.public_id, searchTerm) || includesSearch(row.requesting_branch_code, searchTerm),
+            includesSearch(row.public_id, searchTerm) ||
+            includesSearch(row.requesting_branch_code, searchTerm) ||
+            includesSearch(row.source_branch_code, searchTerm),
         )
         .sort(
           (left, right) =>
             String(right.created_at || "").localeCompare(String(left.created_at || "")) || right.request_id - left.request_id,
         );
+      return { rowCount: rows.length, rows };
+    }
+
+    if (
+      normalized.includes("select batch_id, request_mode") &&
+      normalized.includes("from ordering.stock_requests") &&
+      normalized.includes("batch_id = any(")
+    ) {
+      const batchIds = (params[0] || []).map(Number);
+      const rows = state.requests
+        .filter((row) => batchIds.includes(Number(row.batch_id)))
+        .map((row) => ({ batch_id: row.batch_id, request_mode: row.request_mode || "STANDARD" }));
       return { rowCount: rows.length, rows };
     }
 
@@ -674,11 +690,12 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select document_id, request_id, version, document_payload") &&
+      normalized.includes("select document_id, request_id, document_type, version, document_payload") &&
       normalized.includes("from ordering.stock_request_documents")
     ) {
+      const docType = params[1] || null;
       const rows = state.documents
-        .filter((row) => row.request_id === Number(params[0]))
+        .filter((row) => row.request_id === Number(params[0]) && (docType === null || row.document_type === docType))
         .sort((left, right) => right.version - left.version)
         .slice(0, 1);
       return { rowCount: rows.length, rows };
@@ -688,8 +705,9 @@ function createStockRequestMockDb() {
       normalized.includes("select document_id, version") &&
       normalized.includes("from ordering.stock_request_documents")
     ) {
+      const docType = params[1] || null;
       const rows = state.documents
-        .filter((row) => row.request_id === Number(params[0]))
+        .filter((row) => row.request_id === Number(params[0]) && (docType === null || row.document_type === docType))
         .sort((left, right) => right.version - left.version)
         .slice(0, 1)
         .map((row) => ({ document_id: row.document_id, version: row.version }));
@@ -700,10 +718,11 @@ function createStockRequestMockDb() {
       const row = {
         document_id: state.nextDocumentId++,
         request_id: Number(params[0]),
-        version: Number(params[1]),
-        document_payload: typeof params[2] === "string" ? JSON.parse(params[2]) : params[2],
-        generated_by: params[3],
-        reprint_of: params[4] == null ? null : Number(params[4]),
+        document_type: params[1],
+        version: Number(params[2]),
+        document_payload: typeof params[3] === "string" ? JSON.parse(params[3]) : params[3],
+        generated_by: params[4],
+        reprint_of: params[5] == null ? null : Number(params[5]),
         generated_at: "2026-06-18T12:20:00.000Z",
       };
       state.documents.push(row);

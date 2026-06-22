@@ -118,6 +118,83 @@ function requireCsrf(req, res, next) {
   return next();
 }
 
+function getBearerToken(req) {
+  const header = String(req.headers["authorization"] || "");
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match ? match[1].trim() : null;
+}
+
+// Auth for the mobile PDA app. Verifies the Bearer mobile token AND re-checks the
+// backing ordering.enrolled_devices row on every request, so revocation (revoked_at)
+// or expiry takes effect immediately. Deliberately narrow: it only populates req.mobile
+// and is mounted on PDA endpoints only — it never grants the admin/CRM surface.
+function requireMobileToken({ config, db }) {
+  return async function mobileAuthMiddleware(req, res, next) {
+    const token = getBearerToken(req);
+    const decoded = verifySessionToken(token, config);
+    if (
+      !decoded ||
+      decoded.kind !== "mobile" ||
+      !decoded.sub ||
+      !decoded.enrollment_id
+    ) {
+      return res.status(401).json({
+        error: "Unauthorized",
+        request_id: req.requestId,
+      });
+    }
+
+    let row;
+    try {
+      const result = await db.query(
+        `
+          SELECT enrollment_id, device_id, branch_code, staff_id, role, revoked_at, expires_at
+          FROM ordering.enrolled_devices
+          WHERE enrollment_id = $1
+        `,
+        [decoded.enrollment_id],
+      );
+      row = result.rows[0] || null;
+    } catch (error) {
+      return res.status(503).json({
+        error: "Authorization check failed",
+        request_id: req.requestId,
+      });
+    }
+
+    const expiresAtMs = row?.expires_at ? new Date(row.expires_at).getTime() : 0;
+    if (!row || row.revoked_at || !expiresAtMs || expiresAtMs <= Date.now()) {
+      return res.status(401).json({
+        error: "Device enrollment revoked or expired",
+        request_id: req.requestId,
+      });
+    }
+
+    req.mobile = {
+      staffId: String(row.staff_id),
+      role: row.role,
+      branchCode: row.branch_code,
+      enrollmentId: row.enrollment_id,
+      deviceId: decoded.device_id || row.device_id || null,
+    };
+    return next();
+  };
+}
+
+function requireMobileRole(...allowedRoles) {
+  const allowed = new Set(allowedRoles);
+  return function mobileRoleMiddleware(req, res, next) {
+    const role = req.mobile?.role;
+    if (!role || !allowed.has(role)) {
+      return res.status(403).json({
+        error: "Forbidden",
+        request_id: req.requestId,
+      });
+    }
+    return next();
+  };
+}
+
 function getAuthenticatedBranch(req) {
   return req.auth?.effectiveBranchCode || null;
 }
@@ -141,6 +218,9 @@ module.exports = {
   requireAuth,
   requireRole,
   requireCsrf,
+  getBearerToken,
+  requireMobileToken,
+  requireMobileRole,
   getAuthenticatedBranch,
   requireBranchIdentity,
 };

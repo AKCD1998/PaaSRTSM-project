@@ -12,6 +12,8 @@ const {
   requireAuth,
   requireRole,
   requireCsrf,
+  requireMobileToken,
+  requireMobileRole,
 } = require("./auth/middleware");
 const { createHealthRouter } = require("./routes/health");
 const { createAuthRouter } = require("./routes/auth");
@@ -32,6 +34,10 @@ const { createBranchStockRouter } = require("./routes/branch-stock");
 const { createReviewQueueRouter } = require("./routes/review-queue");
 const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowledge");
 const { createIngredientAdminRouter } = require("./routes/ingredient-admin");
+const {
+  createMobileEnrollRouter,
+  createBranchStaffRouter,
+} = require("./routes/mobile-enroll");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -278,6 +284,27 @@ function createApp(overrides = {}) {
     createSupplierLogosRouter({
       db,
       requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/mobile",
+    createMobileEnrollRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
+      requireMobileTokenMiddleware: requireMobileToken({ config, db }),
+      requireMobileRoleMiddleware: requireMobileRole,
+    }),
+  );
+  app.use(
+    "/api/admin/branch-staff",
+    createBranchStaffRouter({
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
     }),
   );

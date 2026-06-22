@@ -250,7 +250,7 @@ async function loadBatchById(dbLike, batchId) {
 async function loadBatchRequests(client, batchId) {
   const result = await client.query(
     `
-      SELECT public_id, source_branch_code
+      SELECT public_id, source_branch_code, request_mode
       FROM ordering.stock_requests
       WHERE batch_id = $1
       ORDER BY source_branch_code ASC
@@ -261,6 +261,7 @@ async function loadBatchRequests(client, batchId) {
   return result.rows.map((row) => ({
     publicId: row.public_id,
     sourceBranchCode: row.source_branch_code,
+    requestMode: row.request_mode || "STANDARD",
   }));
 }
 

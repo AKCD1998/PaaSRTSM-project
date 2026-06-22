@@ -38,6 +38,29 @@ function verifySessionToken(token, config) {
   }
 }
 
+// Mobile PDA token: a narrow, Bearer-delivered JWT (not a cookie). It carries the
+// enrollment_id so every request can be re-checked against ordering.enrolled_devices
+// (revocation + expiry). kind:"mobile" keeps it distinguishable from web sessions.
+function buildMobileTokenPayload(identity) {
+  return {
+    sub: String(identity.staffId),
+    kind: "mobile",
+    role: identity.role,
+    branch_code: identity.branchCode || null,
+    enrollment_id: identity.enrollmentId,
+    device_id: identity.deviceId || null,
+  };
+}
+
+function signMobileToken(payload, config, ttlHours = 24) {
+  if (!config.authJwtSecret) {
+    throw new Error("AUTH_JWT_SECRET is required");
+  }
+  return jwt.sign(payload, config.authJwtSecret, {
+    expiresIn: `${ttlHours}h`,
+  });
+}
+
 function authCookieOptions(config) {
   return {
     httpOnly: true,
@@ -53,5 +76,7 @@ module.exports = {
   buildSessionPayload,
   signSessionToken,
   verifySessionToken,
+  buildMobileTokenPayload,
+  signMobileToken,
   authCookieOptions,
 };

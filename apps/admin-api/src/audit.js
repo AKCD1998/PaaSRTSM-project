@@ -208,8 +208,19 @@ async function auditLog(db, payload) {
     normalizeNullableText(payload.user_agent, 1024),
   ];
 
-  const result = await db.query(query, params);
-  return result.rows[0];
+  // C-1: audit logging must never crash the request path. Validation above still
+  // throws for programmer errors, but a failed INSERT (e.g. a CHECK violation or a
+  // dropped connection) is logged and swallowed so the caller's work is unaffected.
+  try {
+    const result = await db.query(query, params);
+    return result.rows[0];
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[audit] failed to write audit log (action=${action}): ${error && error.message}`,
+    );
+    return null;
+  }
 }
 
 module.exports = {
