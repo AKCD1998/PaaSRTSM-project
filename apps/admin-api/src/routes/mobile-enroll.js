@@ -445,6 +445,7 @@ function createBranchStaffRouter(deps) {
       const displayName = String(req.body?.displayName || "").trim();
       const role = String(req.body?.role || "sales").trim();
       const isProbationary = Boolean(req.body?.isProbationary);
+      const note = req.body?.note ? String(req.body.note).trim().slice(0, 255) : null;
 
       if (!/^\d{3}$/.test(branchCode)) {
         return res.status(400).json({ error: "Invalid branchCode", request_id: req.requestId });
@@ -459,11 +460,11 @@ function createBranchStaffRouter(deps) {
       try {
         const result = await db.query(
           `
-            INSERT INTO core.branch_staff (branch_code, display_name, role, is_probationary)
-            VALUES ($1, $2, $3, $4)
-            RETURNING staff_id, branch_code, display_name, role, is_active, is_probationary
+            INSERT INTO core.branch_staff (branch_code, display_name, role, is_probationary, note)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING staff_id, branch_code, display_name, role, is_active, is_probationary, note
           `,
-          [branchCode, displayName, role, isProbationary],
+          [branchCode, displayName, role, isProbationary, note],
         );
         const row = result.rows[0];
 
@@ -486,6 +487,7 @@ function createBranchStaffRouter(deps) {
             role: row.role,
             isActive: row.is_active,
             isProbationary: row.is_probationary,
+            note: row.note || null,
           },
         });
       } catch (error) {
