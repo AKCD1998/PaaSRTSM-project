@@ -38,6 +38,7 @@ const {
   createMobileEnrollRouter,
   createBranchStaffRouter,
 } = require("./routes/mobile-enroll");
+const { createMobileProductsRouter } = require("./routes/mobile-products");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -287,6 +288,7 @@ function createApp(overrides = {}) {
       requireCsrfMiddleware: requireCsrf,
     }),
   );
+  const requireMobileTokenMiddleware = requireMobileToken({ config, db });
   app.use(
     "/api/mobile",
     createMobileEnrollRouter({
@@ -295,7 +297,15 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
-      requireMobileTokenMiddleware: requireMobileToken({ config, db }),
+      requireMobileTokenMiddleware,
+      requireMobileRoleMiddleware: requireMobileRole,
+    }),
+  );
+  app.use(
+    "/api/mobile",
+    requireMobileTokenMiddleware,
+    createMobileProductsRouter({
+      db,
       requireMobileRoleMiddleware: requireMobileRole,
     }),
   );

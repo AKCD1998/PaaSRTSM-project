@@ -193,7 +193,7 @@ function createMockDb() {
       n.includes("left join core.branch_staff")
     ) {
       const rows = state.devices
-        .filter((d) => d.branch_code === params[0] && !d.revoked_at && d.expires_at > new Date())
+        .filter((d) => d.branch_code === params[0])
         .map((d) => {
           const s = state.branchStaff.find((x) => x.staff_id === d.staff_id);
           return {
@@ -206,6 +206,7 @@ function createMockDb() {
             enrolled_at: d.enrolled_at,
             expires_at: d.expires_at,
             last_seen_at: d.last_seen_at,
+            revoked_at: d.revoked_at,
           };
         });
       return { rowCount: rows.length, rows };
@@ -302,6 +303,25 @@ test("redeem issues a 24h mobile token usable on PDA endpoints", async () => {
   assert.equal(devices.status, 200);
   assert.equal(devices.body.devices.length, 1);
   assert.equal(devices.body.devices[0].deviceId, "device-abc");
+});
+
+test("mobile manager token can mint a new enrollment code without web session csrf", async () => {
+  const { app } = createTestApp();
+  const { start } = await masterStart(app);
+
+  const redeem = await request(app)
+    .post("/api/mobile/enroll/redeem")
+    .send({ code: start.body.code, staffId: "11", deviceId: "mgr-device-1" });
+  assert.equal(redeem.status, 201);
+
+  const mobileStart = await request(app)
+    .post("/api/mobile/enroll/start")
+    .set("authorization", `Bearer ${redeem.body.token}`)
+    .send({});
+
+  assert.equal(mobileStart.status, 201);
+  assert.ok(mobileStart.body.code);
+  assert.equal(mobileStart.body.branchCode, "001");
 });
 
 test("a used code cannot be redeemed twice", async () => {

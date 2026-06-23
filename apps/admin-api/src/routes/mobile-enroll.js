@@ -23,6 +23,63 @@ function notFound(res, req) {
   return res.status(404).json({ error: "Not found", request_id: req.requestId });
 }
 
+function hasBearerAuthorization(req) {
+  const header = String(req.headers?.authorization || "").trim();
+  return /^Bearer\s+\S+/i.test(header);
+}
+
+function createEnrollStartAccessMiddleware(deps) {
+  const {
+    requireAuthMiddleware,
+    requireRoleMiddleware,
+    requireCsrfMiddleware,
+    requireMobileTokenMiddleware,
+    requireMobileRoleMiddleware,
+  } = deps;
+
+  const webBranchFlow = [
+    requireAuthMiddleware,
+    requireRoleMiddleware("branch"),
+    requireCsrfMiddleware,
+  ];
+  const mobileManagerFlow = [
+    requireMobileTokenMiddleware,
+    requireMobileRoleMiddleware("manager"),
+  ];
+
+  return async function enrollStartAccessMiddleware(req, res, next) {
+    const chain = hasBearerAuthorization(req) ? mobileManagerFlow : webBranchFlow;
+    let index = 0;
+
+    const dispatch = async (error) => {
+      if (error) {
+        return next(error);
+      }
+      const middleware = chain[index];
+      index += 1;
+      if (!middleware) {
+        return next();
+      }
+      return middleware(req, res, dispatch);
+    };
+
+    return dispatch();
+  };
+}
+
+function getEnrollStartIdentity(req) {
+  if (req.mobile?.branchCode) {
+    return {
+      branchCode: req.mobile.branchCode,
+      issuedBy: `staff:${req.mobile.staffId}`,
+    };
+  }
+  return {
+    branchCode: req.auth?.effectiveBranchCode || null,
+    issuedBy: req.auth?.userId || null,
+  };
+}
+
 /**
  * Mobile PDA enrollment router (person-lite model).
  * Mounted at /api/mobile and gated by config.featureMobilePda.
@@ -39,6 +96,7 @@ function createMobileEnrollRouter(deps) {
   } = deps;
 
   const router = express.Router();
+  const requireEnrollStartAccess = createEnrollStartAccessMiddleware(deps);
 
   router.use((req, res, next) => {
     if (!config.featureMobilePda) {
@@ -50,11 +108,9 @@ function createMobileEnrollRouter(deps) {
   // POST /api/mobile/enroll/start — branch master mints a single-use QR code.
   router.post(
     "/enroll/start",
-    requireAuthMiddleware,
-    requireRoleMiddleware("branch"),
-    requireCsrfMiddleware,
+    requireEnrollStartAccess,
     async (req, res, next) => {
-      const branchCode = req.auth?.effectiveBranchCode || null;
+      const { branchCode, issuedBy } = getEnrollStartIdentity(req);
       if (!branchCode) {
         return res.status(403).json({
           error: "Branch identity required",
@@ -75,7 +131,7 @@ function createMobileEnrollRouter(deps) {
                 VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval)
                 RETURNING code, expires_at
               `,
-              [code, branchCode, req.auth.userId, String(ttlSeconds)],
+              [code, branchCode, issuedBy, String(ttlSeconds)],
             );
             inserted = result.rows[0];
           } catch (error) {
@@ -310,10 +366,10 @@ function createMobileEnrollRouter(deps) {
           `
             SELECT d.enrollment_id, d.device_id, d.device_label, d.role,
                    d.staff_id, s.display_name AS staff_name,
-                   d.enrolled_at, d.expires_at, d.last_seen_at
+                   d.enrolled_at, d.expires_at, d.last_seen_at, d.revoked_at
             FROM ordering.enrolled_devices d
             LEFT JOIN core.branch_staff s ON s.staff_id = d.staff_id
-            WHERE d.branch_code = $1 AND d.revoked_at IS NULL AND d.expires_at > now()
+            WHERE d.branch_code = $1
             ORDER BY d.enrolled_at DESC
           `,
           [req.mobile.branchCode],
@@ -330,6 +386,7 @@ function createMobileEnrollRouter(deps) {
             enrolledAt: row.enrolled_at,
             expiresAt: row.expires_at,
             lastSeenAt: row.last_seen_at,
+            revokedAt: row.revoked_at,
           })),
         });
       } catch (error) {
