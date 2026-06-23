@@ -96,6 +96,525 @@ function parseApprovedReceiptPayload(body) {
   return { branchCode, records: body.records };
 }
 
+function parseBoolean(value, fallback = false) {
+  if (value == null || value === "") {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const normalized = normalizeText(value).toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function normalizeBranchCode(value) {
+  const normalized = normalizeText(value);
+  if (!normalized || !/^\d{1,3}$/.test(normalized)) {
+    return null;
+  }
+  return normalized.padStart(3, "0");
+}
+
+function normalizePriceChannel(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return normalized === "retail" || normalized === "wholesale" ? normalized : null;
+}
+
+function normalizeUnitSize(value) {
+  const normalized = normalizeText(value).toUpperCase();
+  return normalized === "S" || normalized === "M" || normalized === "L" ? normalized : null;
+}
+
+function normalizeSourceTimestamp(value, fallback = null) {
+  const normalized = normalizeNullableText(value);
+  if (!normalized) {
+    return fallback;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return `${normalized}T00:00:00+07:00`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?$/.test(normalized)) {
+    return `${normalized.replace(" ", "T")}+07:00`;
+  }
+  return normalized;
+}
+
+function normalizePriceLevel(channel, value) {
+  const n = Number(value);
+  if (!Number.isInteger(n)) {
+    return null;
+  }
+  if (channel === "retail" && n >= 1 && n <= 3) {
+    return n;
+  }
+  if (channel === "wholesale" && n >= 1 && n <= 5) {
+    return n;
+  }
+  return null;
+}
+
+function normalizePriceAmount(value) {
+  const n = toNumber(value);
+  if (n == null || n < 0) {
+    return null;
+  }
+  return n;
+}
+
+function parsePriceDefaultsPayload(body) {
+  const { error, records } = parseApiRecords(body);
+  if (error) {
+    return { error };
+  }
+
+  const snapshotId = normalizeNullableText(body?.snapshotId);
+  const isFinal = parseBoolean(body?.isFinal, false);
+  if (isFinal && !snapshotId) {
+    return { error: "snapshotId is required when isFinal=true." };
+  }
+
+  const defaultSourceSyncedAt = normalizeSourceTimestamp(body?.sourceSyncedAt, new Date().toISOString());
+  const normalizedRecords = [];
+
+  for (const record of records) {
+    const productCode = normalizeNullableText(pick(record, ["productCode", "FTPdtCode"]));
+    const channel = normalizePriceChannel(pick(record, ["channel"]));
+    const unitSize = normalizeUnitSize(pick(record, ["unitSize"]));
+    const priceLevel = normalizePriceLevel(channel, pick(record, ["priceLevel"]));
+    const priceAmount = normalizePriceAmount(pick(record, ["priceAmount"]));
+    if (!productCode || !channel || !unitSize || !priceLevel || priceAmount == null) {
+      return {
+        error:
+          "Each default price record requires productCode, channel(retail|wholesale), unitSize(S|M|L), valid priceLevel, and non-negative priceAmount.",
+      };
+    }
+
+    normalizedRecords.push({
+      product_code: productCode,
+      channel,
+      unit_size: unitSize,
+      price_level: priceLevel,
+      price_amount: priceAmount,
+      unit_name: normalizeNullableText(pick(record, ["unitName"])),
+      factor: toNumber(pick(record, ["factor"])),
+      allow_branch_override: parseBoolean(pick(record, ["allowBranchOverride"]), false),
+      source_table: normalizeNullableText(pick(record, ["sourceTable"])) || "TCNMPdt",
+      source_updated_at: normalizeSourceTimestamp(pick(record, ["sourceUpdatedAt"])),
+      source_synced_at: normalizeSourceTimestamp(pick(record, ["sourceSyncedAt", "syncedAt"]), defaultSourceSyncedAt),
+    });
+  }
+
+  return {
+    records: normalizedRecords,
+    snapshotId,
+    isFinal,
+  };
+}
+
+function parseBranchPriceOverridePayload(body) {
+  const { error, records } = parseApiRecords(body);
+  if (error) {
+    return { error };
+  }
+
+  const snapshotId = normalizeNullableText(body?.snapshotId);
+  const isFinal = parseBoolean(body?.isFinal, false);
+  if (isFinal && !snapshotId) {
+    return { error: "snapshotId is required when isFinal=true." };
+  }
+
+  const bodyBranchCode = normalizeBranchCode(body?.branchCode);
+  const defaultSourceSyncedAt = normalizeSourceTimestamp(body?.sourceSyncedAt, new Date().toISOString());
+  const normalizedRecords = [];
+  let resolvedBranchCode = bodyBranchCode;
+
+  for (const record of records) {
+    const branchCode = normalizeBranchCode(pick(record, ["branchCode", "FTBchCode"]) || resolvedBranchCode);
+    const productCode = normalizeNullableText(pick(record, ["productCode", "FTPdtCode"]));
+    const channel = normalizePriceChannel(pick(record, ["channel"]));
+    const unitSize = normalizeUnitSize(pick(record, ["unitSize"]));
+    const priceLevel = normalizePriceLevel(channel, pick(record, ["priceLevel"]));
+    const priceAmount = normalizePriceAmount(pick(record, ["priceAmount"]));
+    if (!branchCode || !productCode || !channel || !unitSize || !priceLevel || priceAmount == null) {
+      return {
+        error:
+          "Each branch override record requires branchCode, productCode, channel(retail|wholesale), unitSize(S|M|L), valid priceLevel, and non-negative priceAmount.",
+      };
+    }
+    if (resolvedBranchCode && branchCode !== resolvedBranchCode) {
+      return { error: "All override records in one payload must belong to the same branchCode." };
+    }
+    resolvedBranchCode = branchCode;
+    normalizedRecords.push({
+      branch_code: branchCode,
+      product_code: productCode,
+      channel,
+      unit_size: unitSize,
+      price_level: priceLevel,
+      price_amount: priceAmount,
+      unit_name: normalizeNullableText(pick(record, ["unitName"])),
+      factor: toNumber(pick(record, ["factor"])),
+      source_table: normalizeNullableText(pick(record, ["sourceTable"])) || "TCNTPdtBchPrice",
+      source_updated_at: normalizeSourceTimestamp(pick(record, ["sourceUpdatedAt"])),
+      source_synced_at: normalizeSourceTimestamp(pick(record, ["sourceSyncedAt", "syncedAt"]), defaultSourceSyncedAt),
+    });
+  }
+
+  if (!resolvedBranchCode) {
+    return { error: "branchCode is required for branch price override payloads." };
+  }
+
+  return {
+    branchCode: resolvedBranchCode,
+    records: normalizedRecords,
+    snapshotId,
+    isFinal,
+  };
+}
+
+function mergeProductCodes(...groups) {
+  return [...new Set(groups.flat().filter(Boolean))];
+}
+
+async function ingestProductPriceDefaults(client, body, records, options = {}) {
+  const sourceSystem = getSourceSystem(body);
+  const snapshotId = options.snapshotId || null;
+  const touchedProductCodes = [];
+  const purgedProductCodes = [];
+
+  if (records.length > 0) {
+    const upsertResult = await client.query(
+      `
+        WITH payload AS (
+          SELECT
+            product_code,
+            channel,
+            unit_size,
+            price_level,
+            price_amount,
+            unit_name,
+            factor,
+            allow_branch_override,
+            source_table,
+            source_updated_at::timestamptz AS source_updated_at,
+            source_synced_at::timestamptz AS source_synced_at
+          FROM jsonb_to_recordset($1::jsonb) AS x(
+            product_code text,
+            channel text,
+            unit_size text,
+            price_level smallint,
+            price_amount numeric,
+            unit_name text,
+            factor numeric,
+            allow_branch_override boolean,
+            source_table text,
+            source_updated_at text,
+            source_synced_at text
+          )
+        )
+        INSERT INTO ada.product_price_defaults
+          (
+            product_code,
+            channel,
+            unit_size,
+            price_level,
+            price_amount,
+            unit_name,
+            factor,
+            allow_branch_override,
+            snapshot_id,
+            source_system,
+            source_table,
+            source_updated_at,
+            source_synced_at,
+            updated_at
+          )
+        SELECT
+          product_code,
+          channel,
+          unit_size,
+          price_level,
+          price_amount,
+          unit_name,
+          factor,
+          COALESCE(allow_branch_override, false),
+          $2,
+          $3,
+          COALESCE(source_table, 'TCNMPdt'),
+          source_updated_at,
+          source_synced_at,
+          now()
+        FROM payload
+        ON CONFLICT (product_code, channel, unit_size, price_level) DO UPDATE SET
+          price_amount = EXCLUDED.price_amount,
+          unit_name = EXCLUDED.unit_name,
+          factor = EXCLUDED.factor,
+          allow_branch_override = EXCLUDED.allow_branch_override,
+          snapshot_id = EXCLUDED.snapshot_id,
+          source_system = EXCLUDED.source_system,
+          source_table = EXCLUDED.source_table,
+          source_updated_at = EXCLUDED.source_updated_at,
+          source_synced_at = EXCLUDED.source_synced_at,
+          updated_at = now()
+        RETURNING product_code
+      `,
+      [JSON.stringify(records), snapshotId, sourceSystem],
+    );
+    touchedProductCodes.push(...upsertResult.rows.map((row) => row.product_code));
+  }
+
+  if (options.isFinal && snapshotId) {
+    const purgeResult = await client.query(
+      `
+        DELETE FROM ada.product_price_defaults
+        WHERE COALESCE(snapshot_id, '') IS DISTINCT FROM $1
+        RETURNING product_code
+      `,
+      [snapshotId],
+    );
+    purgedProductCodes.push(...purgeResult.rows.map((row) => row.product_code));
+  }
+
+  return {
+    touchedProductCodes: mergeProductCodes(touchedProductCodes),
+    purgedProductCodes: mergeProductCodes(purgedProductCodes),
+  };
+}
+
+async function ingestProductBranchPriceOverrides(client, body, branchCode, records, options = {}) {
+  const sourceSystem = getSourceSystem(body);
+  const snapshotId = options.snapshotId || null;
+  const touchedProductCodes = [];
+  const purgedProductCodes = [];
+
+  if (records.length > 0) {
+    const upsertResult = await client.query(
+      `
+        WITH payload AS (
+          SELECT
+            branch_code,
+            product_code,
+            channel,
+            unit_size,
+            price_level,
+            price_amount,
+            unit_name,
+            factor,
+            source_table,
+            source_updated_at::timestamptz AS source_updated_at,
+            source_synced_at::timestamptz AS source_synced_at
+          FROM jsonb_to_recordset($1::jsonb) AS x(
+            branch_code text,
+            product_code text,
+            channel text,
+            unit_size text,
+            price_level smallint,
+            price_amount numeric,
+            unit_name text,
+            factor numeric,
+            source_table text,
+            source_updated_at text,
+            source_synced_at text
+          )
+        )
+        INSERT INTO ada.product_branch_price_overrides
+          (
+            branch_code,
+            product_code,
+            channel,
+            unit_size,
+            price_level,
+            price_amount,
+            unit_name,
+            factor,
+            snapshot_id,
+            source_system,
+            source_table,
+            source_updated_at,
+            source_synced_at,
+            updated_at
+          )
+        SELECT
+          branch_code,
+          product_code,
+          channel,
+          unit_size,
+          price_level,
+          price_amount,
+          unit_name,
+          factor,
+          $2,
+          $3,
+          COALESCE(source_table, 'TCNTPdtBchPrice'),
+          source_updated_at,
+          source_synced_at,
+          now()
+        FROM payload
+        ON CONFLICT (branch_code, product_code, channel, unit_size, price_level) DO UPDATE SET
+          price_amount = EXCLUDED.price_amount,
+          unit_name = EXCLUDED.unit_name,
+          factor = EXCLUDED.factor,
+          snapshot_id = EXCLUDED.snapshot_id,
+          source_system = EXCLUDED.source_system,
+          source_table = EXCLUDED.source_table,
+          source_updated_at = EXCLUDED.source_updated_at,
+          source_synced_at = EXCLUDED.source_synced_at,
+          updated_at = now()
+        RETURNING product_code
+      `,
+      [JSON.stringify(records), snapshotId, sourceSystem],
+    );
+    touchedProductCodes.push(...upsertResult.rows.map((row) => row.product_code));
+  }
+
+  if (options.isFinal && snapshotId) {
+    const purgeResult = await client.query(
+      `
+        DELETE FROM ada.product_branch_price_overrides
+        WHERE branch_code = $1
+          AND COALESCE(snapshot_id, '') IS DISTINCT FROM $2
+        RETURNING product_code
+      `,
+      [branchCode, snapshotId],
+    );
+    purgedProductCodes.push(...purgeResult.rows.map((row) => row.product_code));
+  }
+
+  return {
+    touchedProductCodes: mergeProductCodes(touchedProductCodes),
+    purgedProductCodes: mergeProductCodes(purgedProductCodes),
+  };
+}
+
+async function listEffectivePriceBranchCodes(client) {
+  const result = await client.query(
+    `
+      SELECT DISTINCT branch_code
+      FROM (
+        SELECT branch_code FROM ada.branches
+        UNION
+        SELECT branch_code FROM ordering.enrolled_devices
+        UNION
+        SELECT branch_code FROM ada.product_branch_price_overrides
+      ) branches
+      WHERE branch_code IS NOT NULL
+      ORDER BY branch_code ASC
+    `,
+  );
+  return result.rows.map((row) => row.branch_code).filter(Boolean);
+}
+
+async function refreshEffectiveBranchPrices(client, branchCode, productCodes) {
+  if (!branchCode || !Array.isArray(productCodes) || productCodes.length === 0) {
+    return;
+  }
+
+  await client.query(
+    `
+      DELETE FROM ada.product_effective_branch_prices
+      WHERE branch_code = $1
+        AND product_code = ANY($2::text[])
+    `,
+    [branchCode, productCodes],
+  );
+
+  await client.query(
+    `
+      WITH price_keys AS (
+        SELECT d.product_code, d.channel, d.unit_size, d.price_level
+        FROM ada.product_price_defaults d
+        WHERE d.product_code = ANY($2::text[])
+        UNION
+        SELECT o.product_code, o.channel, o.unit_size, o.price_level
+        FROM ada.product_branch_price_overrides o
+        WHERE o.branch_code = $1
+          AND o.product_code = ANY($2::text[])
+      ),
+      resolved AS (
+        SELECT
+          $1 AS branch_code,
+          keys.product_code,
+          keys.channel,
+          keys.unit_size,
+          keys.price_level,
+          COALESCE(override_row.price_amount, default_row.price_amount) AS price_amount,
+          CASE WHEN override_row.price_amount IS NOT NULL THEN 'override' ELSE 'master' END AS price_source,
+          COALESCE(override_row.unit_name, default_row.unit_name) AS unit_name,
+          COALESCE(override_row.factor, default_row.factor) AS factor,
+          COALESCE(default_row.allow_branch_override, false) AS allow_branch_override,
+          COALESCE(override_row.source_system, default_row.source_system, 'AdaAcc') AS source_system,
+          CASE
+            WHEN override_row.price_amount IS NOT NULL THEN override_row.source_table
+            ELSE default_row.source_table
+          END AS source_table,
+          COALESCE(override_row.source_updated_at, default_row.source_updated_at) AS source_updated_at,
+          CASE
+            WHEN override_row.source_synced_at IS NOT NULL AND default_row.source_synced_at IS NOT NULL
+              THEN GREATEST(override_row.source_synced_at, default_row.source_synced_at)
+            ELSE COALESCE(override_row.source_synced_at, default_row.source_synced_at)
+          END AS source_synced_at
+        FROM price_keys keys
+        LEFT JOIN ada.product_price_defaults default_row
+          ON default_row.product_code = keys.product_code
+         AND default_row.channel = keys.channel
+         AND default_row.unit_size = keys.unit_size
+         AND default_row.price_level = keys.price_level
+        LEFT JOIN ada.product_branch_price_overrides override_row
+          ON override_row.branch_code = $1
+         AND override_row.product_code = keys.product_code
+         AND override_row.channel = keys.channel
+         AND override_row.unit_size = keys.unit_size
+         AND override_row.price_level = keys.price_level
+      )
+      INSERT INTO ada.product_effective_branch_prices
+        (
+          branch_code,
+          product_code,
+          channel,
+          unit_size,
+          price_level,
+          price_amount,
+          price_source,
+          unit_name,
+          factor,
+          allow_branch_override,
+          source_system,
+          source_table,
+          source_updated_at,
+          source_synced_at,
+          refreshed_at,
+          updated_at
+        )
+      SELECT
+        branch_code,
+        product_code,
+        channel,
+        unit_size,
+        price_level,
+        price_amount,
+        price_source,
+        unit_name,
+        factor,
+        allow_branch_override,
+        source_system,
+        source_table,
+        source_updated_at,
+        source_synced_at,
+        now(),
+        now()
+      FROM resolved
+      WHERE price_amount IS NOT NULL
+    `,
+    [branchCode, productCodes],
+  );
+}
+
 function parseRequiredApiKey(config, req) {
   if (!config.posApiKeys || config.posApiKeys.size === 0) {
     return null;
@@ -1468,6 +1987,77 @@ function createAdaSyncRouter(deps) {
     return res.json({ accepted: records.length, syncRunId: getSyncRunId(req.body) });
   });
   router.post("/products", createRecordsHandler(upsertProduct));
+  router.post("/prices/defaults", async (req, res, next) => {
+    const { error, records, snapshotId, isFinal } = parsePriceDefaultsPayload(req.body);
+    if (error) {
+      return res.status(400).json({ message: error });
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await ingestProductPriceDefaults(client, req.body || {}, records, { snapshotId, isFinal });
+      const affectedProductCodes = mergeProductCodes(result.touchedProductCodes, result.purgedProductCodes);
+      let branchRefreshCount = 0;
+      if (affectedProductCodes.length > 0) {
+        const branchCodes = await listEffectivePriceBranchCodes(client);
+        branchRefreshCount = branchCodes.length;
+        for (const branchCode of branchCodes) {
+          // eslint-disable-next-line no-await-in-loop
+          await refreshEffectiveBranchPrices(client, branchCode, affectedProductCodes);
+        }
+      }
+      await client.query("COMMIT");
+      return res.json({
+        accepted: records.length,
+        branchRefreshCount,
+        refreshedProductCount: affectedProductCodes.length,
+        purgedProductCount: result.purgedProductCodes.length,
+        snapshotId,
+        isFinal,
+        syncRunId: getSyncRunId(req.body),
+      });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  });
+  router.post("/prices/branch-overrides", async (req, res, next) => {
+    const { error, branchCode, records, snapshotId, isFinal } = parseBranchPriceOverridePayload(req.body);
+    if (error) {
+      return res.status(400).json({ message: error });
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await ingestProductBranchPriceOverrides(client, req.body || {}, branchCode, records, {
+        snapshotId,
+        isFinal,
+      });
+      const affectedProductCodes = mergeProductCodes(result.touchedProductCodes, result.purgedProductCodes);
+      if (affectedProductCodes.length > 0) {
+        await refreshEffectiveBranchPrices(client, branchCode, affectedProductCodes);
+      }
+      await client.query("COMMIT");
+      return res.json({
+        accepted: records.length,
+        branchCode,
+        refreshedProductCount: affectedProductCodes.length,
+        purgedProductCount: result.purgedProductCodes.length,
+        snapshotId,
+        isFinal,
+        syncRunId: getSyncRunId(req.body),
+      });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  });
   router.post("/sales", async (req, res, next) => {
     if (!req.body || !Array.isArray(req.body.headers) || !Array.isArray(req.body.lines)) {
       return res.status(400).json({ message: "Payload must include headers and lines arrays." });

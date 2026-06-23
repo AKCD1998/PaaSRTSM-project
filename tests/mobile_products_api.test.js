@@ -42,25 +42,71 @@ function buildConfig(overrides = {}) {
   };
 }
 
-// Product fixtures
 const PRODUCT_ROW = {
   barcode: "8850999012345",
-  product_code: "630010001",
-  name_th: "พาราเซตามอล 500 มก.",
-  name_en: "Paracetamol 500mg",
-  unit: "TAB",
-  price_id: 1,
-  retail_price: "12.50",
-  qty_branch_000: "50", qty_branch_001: "120", qty_branch_002: "0",
-  qty_branch_003: "30", qty_branch_004: "15", qty_branch_005: "8",
+  product_code: "IC-005089",
+  name_th: "โค้กกระป๋อง",
+  name_en: "Coke Can",
+  unit_small: "แผง",
+  factor_small: "1",
+  unit_medium: "โหล",
+  factor_medium: "12",
+  unit_large: "กล่อง",
+  factor_large: "48",
+  branch_qty: "120",
   qty_total_all_branches: "223",
-  cost_avg_branch_000: "8.20", cost_avg_branch_001: "8.10", cost_avg_branch_002: null,
-  cost_avg_branch_003: "8.30", cost_avg_branch_004: "8.25", cost_avg_branch_005: "8.15",
+  branch_cost: "8.10",
 };
 
-const TIER_ROWS = [
-  { tier: 2, price: "11.00" },
-  { tier: 3, price: "10.00" },
+const EFFECTIVE_PRICE_ROWS = [
+  {
+    channel: "retail",
+    unit_size: "S",
+    price_level: 1,
+    price_amount: "20.00",
+    price_source: "override",
+    unit_name: "แผง",
+    factor: "1",
+    allow_branch_override: true,
+    source_updated_at: "2026-04-22T20:36:49+07:00",
+    source_synced_at: "2026-06-23T11:48:00.000Z",
+  },
+  {
+    channel: "retail",
+    unit_size: "M",
+    price_level: 1,
+    price_amount: "300.00",
+    price_source: "master",
+    unit_name: "โหล",
+    factor: "12",
+    allow_branch_override: true,
+    source_updated_at: null,
+    source_synced_at: "2026-06-23T11:48:00.000Z",
+  },
+  {
+    channel: "retail",
+    unit_size: "L",
+    price_level: 1,
+    price_amount: "1180.00",
+    price_source: "master",
+    unit_name: "กล่อง",
+    factor: "48",
+    allow_branch_override: true,
+    source_updated_at: null,
+    source_synced_at: "2026-06-23T11:48:00.000Z",
+  },
+  {
+    channel: "wholesale",
+    unit_size: "L",
+    price_level: 4,
+    price_amount: "1100.00",
+    price_source: "master",
+    unit_name: "กล่อง",
+    factor: "48",
+    allow_branch_override: true,
+    source_updated_at: null,
+    source_synced_at: "2026-06-23T11:48:00.000Z",
+  },
 ];
 
 function createMockDb() {
@@ -68,17 +114,19 @@ function createMockDb() {
     const n = String(sql).replace(/\s+/g, " ").trim().toLowerCase();
 
     if (n === "begin" || n === "commit" || n === "rollback") return { rowCount: 0, rows: [] };
-
     if (n.startsWith("insert into public.audit_logs")) return { rowCount: 1, rows: [{ audit_id: 1 }] };
 
-    // enrolled_devices lookup (requireMobileToken)
     if (n.includes("from ordering.enrolled_devices") && n.includes("where enrollment_id = $1")) {
       if (String(params[0]) === "99") {
         return {
           rowCount: 1,
           rows: [{
-            enrollment_id: 99, device_id: "test-device", branch_code: "001",
-            staff_id: 10, role: "sales", revoked_at: null,
+            enrollment_id: 99,
+            device_id: "test-device",
+            branch_code: "001",
+            staff_id: 10,
+            role: "sales",
+            revoked_at: null,
             expires_at: new Date(Date.now() + 86400_000),
           }],
         };
@@ -87,8 +135,12 @@ function createMockDb() {
         return {
           rowCount: 1,
           rows: [{
-            enrollment_id: 88, device_id: "mgr-device", branch_code: "001",
-            staff_id: 11, role: "manager", revoked_at: null,
+            enrollment_id: 88,
+            device_id: "mgr-device",
+            branch_code: "001",
+            staff_id: 11,
+            role: "manager",
+            revoked_at: null,
             expires_at: new Date(Date.now() + 86400_000),
           }],
         };
@@ -96,16 +148,24 @@ function createMockDb() {
       return { rowCount: 0, rows: [] };
     }
 
-    // by-barcode main query
-    if (n.includes("from public.barcodes b") && n.includes("where b.barcode = $1")) {
-      if (params[0] === PRODUCT_ROW.barcode) return { rowCount: 1, rows: [PRODUCT_ROW] };
+    if (n.includes("from ada.product_barcodes pb") && n.includes("where pb.barcode = $1")) {
+      if (params[0] === PRODUCT_ROW.barcode && params[1] === "001") {
+        return { rowCount: 1, rows: [PRODUCT_ROW] };
+      }
       return { rowCount: 0, rows: [] };
     }
 
-    // price tiers
-    if (n.includes("from public.sku_unit_price_tiers") && n.includes("where sku_unit_price_id = $1")) {
-      if (Number(params[0]) === 1) return { rowCount: 2, rows: TIER_ROWS };
-      return { rowCount: 0, rows: [] };
+    if (n.includes("from ada.product_effective_branch_prices") && n.includes("where branch_code = $1")) {
+      if (params[0] !== "001" || params[1] !== PRODUCT_ROW.product_code) {
+        return { rowCount: 0, rows: [] };
+      }
+      const isManager = Boolean(params[2]);
+      return {
+        rowCount: isManager ? EFFECTIVE_PRICE_ROWS.length : 3,
+        rows: isManager
+          ? EFFECTIVE_PRICE_ROWS
+          : EFFECTIVE_PRICE_ROWS.filter((row) => row.channel === "retail"),
+      };
     }
 
     throw new Error(`Unhandled mock query: ${n}`);
@@ -113,19 +173,23 @@ function createMockDb() {
 
   return {
     query,
-    connect() { return { query, async release() {} }; },
+    connect() {
+      return { query, async release() {} };
+    },
     async end() {},
   };
 }
 
-function makeToken(jwt, secret, payload) {
-  return jwt.sign(payload, secret, { expiresIn: "24h" });
-}
-
-function createTestApp() {
-  const config = buildConfig();
+function createTestApp(configOverrides = {}) {
+  const config = buildConfig(configOverrides);
   const db = createMockDb();
-  const { app: baseApp } = createApp({ config, db, runImporter: async () => ({}), runExcelPriceImporter: async () => ({}), runRuleApplication: async () => ({}) });
+  const { app: baseApp } = createApp({
+    config,
+    db,
+    runImporter: async () => ({}),
+    runExcelPriceImporter: async () => ({}),
+    runRuleApplication: async () => ({}),
+  });
   const app = express();
   app.use(express.json({ limit: "1mb" }));
   app.use(cookieParser());
@@ -135,15 +199,37 @@ function createTestApp() {
 
 function salesToken(config) {
   const jwt = require("jsonwebtoken");
-  return jwt.sign({ sub: "10", kind: "mobile", role: "sales", branch_code: "001", enrollment_id: 99, device_id: "test-device" }, config.authJwtSecret, { expiresIn: "24h" });
+  return jwt.sign(
+    {
+      sub: "10",
+      kind: "mobile",
+      role: "sales",
+      branch_code: "001",
+      enrollment_id: 99,
+      device_id: "test-device",
+    },
+    config.authJwtSecret,
+    { expiresIn: "24h" },
+  );
 }
 
 function managerToken(config) {
   const jwt = require("jsonwebtoken");
-  return jwt.sign({ sub: "11", kind: "mobile", role: "manager", branch_code: "001", enrollment_id: 88, device_id: "mgr-device" }, config.authJwtSecret, { expiresIn: "24h" });
+  return jwt.sign(
+    {
+      sub: "11",
+      kind: "mobile",
+      role: "manager",
+      branch_code: "001",
+      enrollment_id: 88,
+      device_id: "mgr-device",
+    },
+    config.authJwtSecret,
+    { expiresIn: "24h" },
+  );
 }
 
-test("GET /api/mobile/products/by-barcode returns product for sales token (no cost)", async () => {
+test("GET /api/mobile/products/by-barcode returns branch-scoped retail prices for sales token", async () => {
   const { app, config } = createTestApp();
   const token = salesToken(config);
 
@@ -153,29 +239,32 @@ test("GET /api/mobile/products/by-barcode returns product for sales token (no co
 
   assert.equal(res.status, 200);
   assert.equal(res.body.barcode, PRODUCT_ROW.barcode);
-  assert.equal(res.body.productCode, "630010001");
-  assert.equal(res.body.nameTh, "พาราเซตามอล 500 มก.");
-  assert.equal(res.body.retailPrice, 12.5);
-  assert.equal(res.body.priceTiers.length, 2);
-  assert.equal(res.body.priceTiers[0].tier, 2);
+  assert.equal(res.body.branchCode, "001");
+  assert.equal(res.body.productCode, PRODUCT_ROW.product_code);
+  assert.equal(res.body.nameTh, PRODUCT_ROW.name_th);
+  assert.equal(res.body.retailPrice, 20);
+  assert.equal(res.body.unitPrices.length, 3);
+  assert.deepEqual(res.body.unitPrices.map((row) => row.unitSize), ["S", "M", "L"]);
+  assert.equal(res.body.unitPrices[0].priceSource, "override");
   assert.equal(res.body.stockByBranch["001"], 120);
-  assert.equal(res.body.stockByBranch.total, 223);
-  // sales must NOT see cost
+  assert.equal(res.body.stockByBranch["000"], undefined);
   assert.equal(res.body.costByBranch, undefined);
 });
 
-test("GET /api/mobile/products/by-barcode returns costByBranch for manager token", async () => {
+test("GET /api/pda/products/scan returns wholesale and branch cost for manager token", async () => {
   const { app, config } = createTestApp();
   const token = managerToken(config);
 
   const res = await request(app)
-    .get(`/api/mobile/products/by-barcode/${PRODUCT_ROW.barcode}`)
+    .get(`/api/pda/products/scan?barcode=${PRODUCT_ROW.barcode}`)
     .set("authorization", `Bearer ${token}`);
 
   assert.equal(res.status, 200);
-  assert.ok(res.body.costByBranch, "manager should see costByBranch");
-  assert.equal(res.body.costByBranch["000"], 8.2);
-  assert.equal(res.body.costByBranch["002"], null);
+  assert.equal(res.body.unitPrices.length, 4);
+  assert.equal(res.body.unitPrices[3].channel, "wholesale");
+  assert.equal(res.body.unitPrices[3].priceLevel, 4);
+  assert.ok(res.body.costByBranch);
+  assert.equal(res.body.costByBranch["001"], 8.1);
 });
 
 test("GET /api/mobile/products/by-barcode returns 404 for unknown barcode", async () => {
@@ -195,15 +284,17 @@ test("GET /api/mobile/products/by-barcode returns 401 without token", async () =
   assert.equal(res.status, 401);
 });
 
-test("mobile endpoint 404 when FEATURE_MOBILE_PDA is off", async () => {
-  const config = buildConfig({ featureMobilePda: false });
-  const db = createMockDb();
-  const { app: baseApp } = createApp({ config, db, runImporter: async () => ({}), runExcelPriceImporter: async () => ({}), runRuleApplication: async () => ({}) });
-  const app = express();
-  app.use(express.json());
-  app.use(cookieParser());
-  app.use(baseApp);
+test("mobile and pda product endpoints 404 when FEATURE_MOBILE_PDA is off", async () => {
+  const { app, config } = createTestApp({ featureMobilePda: false });
+  const token = salesToken(config);
 
-  const res = await request(app).get(`/api/mobile/products/by-barcode/${PRODUCT_ROW.barcode}`);
-  assert.equal(res.status, 404);
+  const mobileRes = await request(app)
+    .get(`/api/mobile/products/by-barcode/${PRODUCT_ROW.barcode}`)
+    .set("authorization", `Bearer ${token}`);
+  assert.equal(mobileRes.status, 404);
+
+  const pdaRes = await request(app)
+    .get(`/api/pda/products/scan?barcode=${PRODUCT_ROW.barcode}`)
+    .set("authorization", `Bearer ${token}`);
+  assert.equal(pdaRes.status, 404);
 });

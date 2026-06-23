@@ -37,8 +37,12 @@ function normalizeSql(sql) {
 function createAdaMockDb() {
   const state = {
     branches: new Map(),
+    knownBranches: new Set(["001", "005"]),
     products: new Map(),
     productBarcodes: new Map(),
+    productPriceDefaults: new Map(),
+    productBranchPriceOverrides: new Map(),
+    productEffectiveBranchPrices: new Map(),
     salesHeaders: new Map(),
     salesLines: new Map(),
     transferHeaders: new Map(),
@@ -129,6 +133,137 @@ function createAdaMockDb() {
           raw_payload: JSON.parse(params[6]),
         });
         return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("with payload as (") && normalized.includes("insert into ada.product_price_defaults")) {
+        const snapshotId = params[1] || null;
+        const sourceSystem = params[2];
+        const records = JSON.parse(params[0]);
+        const rows = [];
+        for (const record of records) {
+          const key = `${record.product_code}|${record.channel}|${record.unit_size}|${record.price_level}`;
+          state.productPriceDefaults.set(key, {
+            ...record,
+            snapshot_id: snapshotId,
+            source_system: sourceSystem,
+          });
+          rows.push({ product_code: record.product_code });
+        }
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.startsWith("delete from ada.product_price_defaults")) {
+        const snapshotId = params[0];
+        const rows = [];
+        for (const [key, record] of [...state.productPriceDefaults.entries()]) {
+          if ((record.snapshot_id || "") !== snapshotId) {
+            state.productPriceDefaults.delete(key);
+            rows.push({ product_code: record.product_code });
+          }
+        }
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.startsWith("with payload as (") &&
+        normalized.includes("insert into ada.product_branch_price_overrides")
+      ) {
+        const snapshotId = params[1] || null;
+        const sourceSystem = params[2];
+        const records = JSON.parse(params[0]);
+        const rows = [];
+        for (const record of records) {
+          const key =
+            `${record.branch_code}|${record.product_code}|${record.channel}|${record.unit_size}|${record.price_level}`;
+          state.productBranchPriceOverrides.set(key, {
+            ...record,
+            snapshot_id: snapshotId,
+            source_system: sourceSystem,
+          });
+          rows.push({ product_code: record.product_code });
+        }
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.startsWith("delete from ada.product_branch_price_overrides")) {
+        const branchCode = params[0];
+        const snapshotId = params[1];
+        const rows = [];
+        for (const [key, record] of [...state.productBranchPriceOverrides.entries()]) {
+          if (record.branch_code === branchCode && (record.snapshot_id || "") !== snapshotId) {
+            state.productBranchPriceOverrides.delete(key);
+            rows.push({ product_code: record.product_code });
+          }
+        }
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.startsWith("select distinct branch_code from (")) {
+        const branchCodes = new Set(state.knownBranches);
+        for (const branchCode of state.branches.keys()) {
+          branchCodes.add(branchCode);
+        }
+        for (const record of state.productBranchPriceOverrides.values()) {
+          branchCodes.add(record.branch_code);
+        }
+        return {
+          rowCount: branchCodes.size,
+          rows: [...branchCodes].sort().map((branch_code) => ({ branch_code })),
+        };
+      }
+
+      if (normalized.startsWith("delete from ada.product_effective_branch_prices")) {
+        const branchCode = params[0];
+        const productCodes = new Set(params[1] || []);
+        for (const key of [...state.productEffectiveBranchPrices.keys()]) {
+          const record = state.productEffectiveBranchPrices.get(key);
+          if (record.branch_code === branchCode && productCodes.has(record.product_code)) {
+            state.productEffectiveBranchPrices.delete(key);
+          }
+        }
+        return { rowCount: 0, rows: [] };
+      }
+
+      if (normalized.startsWith("with price_keys as (") && normalized.includes("insert into ada.product_effective_branch_prices")) {
+        const branchCode = params[0];
+        const productCodes = new Set(params[1] || []);
+        for (const productCode of productCodes) {
+          const keys = new Set();
+          for (const record of state.productPriceDefaults.values()) {
+            if (record.product_code === productCode) {
+              keys.add(`${record.product_code}|${record.channel}|${record.unit_size}|${record.price_level}`);
+            }
+          }
+          for (const record of state.productBranchPriceOverrides.values()) {
+            if (record.branch_code === branchCode && record.product_code === productCode) {
+              keys.add(`${record.product_code}|${record.channel}|${record.unit_size}|${record.price_level}`);
+            }
+          }
+
+          for (const compositeKey of keys) {
+            const [resolvedProductCode, channel, unitSize, priceLevel] = compositeKey.split("|");
+            const defaultRow = state.productPriceDefaults.get(compositeKey) || null;
+            const overrideKey = `${branchCode}|${compositeKey}`;
+            const overrideRow = state.productBranchPriceOverrides.get(overrideKey) || null;
+            const priceAmount = overrideRow?.price_amount ?? defaultRow?.price_amount ?? null;
+            if (priceAmount == null) {
+              continue;
+            }
+            state.productEffectiveBranchPrices.set(overrideKey, {
+              branch_code: branchCode,
+              product_code: resolvedProductCode,
+              channel,
+              unit_size: unitSize,
+              price_level: Number(priceLevel),
+              price_amount: priceAmount,
+              price_source: overrideRow ? "override" : "master",
+              unit_name: overrideRow?.unit_name ?? defaultRow?.unit_name ?? null,
+              factor: overrideRow?.factor ?? defaultRow?.factor ?? null,
+              allow_branch_override: overrideRow?.allow_branch_override ?? defaultRow?.allow_branch_override ?? false,
+            });
+          }
+        }
+        return { rowCount: 0, rows: [] };
       }
 
       if (normalized.startsWith("insert into ada.transfer_headers")) {
@@ -627,4 +762,113 @@ test("ADA run-log route records sync runs and writes sync_errors for failed runs
   assert.equal(db.state.syncErrors[0].sync_run_id, 2);
   assert.equal(db.state.syncErrors[0].error_code, "SQL_TIMEOUT");
   assert.deepEqual(db.state.syncErrors[0].error_details, { retryable: true });
+});
+
+test("ADA price defaults route upserts snapshot rows and refreshes effective prices for known branches", async () => {
+  const { app, db } = createTestApp();
+
+  const response = await request(app)
+    .post("/api/sync/ada/prices/defaults")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      snapshotId: "defaults-2026-06-23T12:00",
+      isFinal: true,
+      records: [
+        {
+          productCode: "IC-005089",
+          channel: "retail",
+          unitSize: "S",
+          priceLevel: 1,
+          priceAmount: 25,
+          unitName: "แผง",
+          factor: 1,
+          allowBranchOverride: true,
+          sourceUpdatedAt: "2026-06-23T10:00:00",
+          syncedAt: "2026-06-23T12:00:00.000Z",
+        },
+        {
+          productCode: "IC-005089",
+          channel: "retail",
+          unitSize: "M",
+          priceLevel: 1,
+          priceAmount: 300,
+          unitName: "โหล",
+          factor: 12,
+          allowBranchOverride: true,
+          syncedAt: "2026-06-23T12:00:00.000Z",
+        },
+      ],
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.accepted, 2);
+  assert.equal(db.state.productPriceDefaults.size, 2);
+  assert.equal(db.state.productEffectiveBranchPrices.get("001|IC-005089|retail|S|1").price_amount, 25);
+  assert.equal(db.state.productEffectiveBranchPrices.get("005|IC-005089|retail|M|1").price_amount, 300);
+});
+
+test("ADA branch price overrides route refreshes override price and falls back to master after final purge", async () => {
+  const { app, db } = createTestApp();
+
+  await request(app)
+    .post("/api/sync/ada/prices/defaults")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      snapshotId: "defaults-2026-06-23T13:00",
+      isFinal: true,
+      records: [
+        {
+          productCode: "IC-005089",
+          channel: "retail",
+          unitSize: "S",
+          priceLevel: 1,
+          priceAmount: 25,
+          unitName: "แผง",
+          factor: 1,
+          allowBranchOverride: true,
+          syncedAt: "2026-06-23T13:00:00.000Z",
+        },
+      ],
+    });
+
+  const overrideResponse = await request(app)
+    .post("/api/sync/ada/prices/branch-overrides")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "005",
+      snapshotId: "override-005-2026-06-23T13:05",
+      isFinal: true,
+      records: [
+        {
+          productCode: "IC-005089",
+          channel: "retail",
+          unitSize: "S",
+          priceLevel: 1,
+          priceAmount: 20,
+          unitName: "แผง",
+          factor: 1,
+          sourceUpdatedAt: "2026-04-22T20:36:49",
+          syncedAt: "2026-06-23T13:05:00.000Z",
+        },
+      ],
+    });
+
+  assert.equal(overrideResponse.status, 200);
+  assert.equal(db.state.productEffectiveBranchPrices.get("005|IC-005089|retail|S|1").price_amount, 20);
+  assert.equal(db.state.productEffectiveBranchPrices.get("005|IC-005089|retail|S|1").price_source, "override");
+
+  const purgeResponse = await request(app)
+    .post("/api/sync/ada/prices/branch-overrides")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "005",
+      snapshotId: "override-005-2026-06-23T13:10",
+      isFinal: true,
+      records: [],
+    });
+
+  assert.equal(purgeResponse.status, 200);
+  assert.equal(db.state.productBranchPriceOverrides.size, 0);
+  assert.equal(db.state.productEffectiveBranchPrices.get("005|IC-005089|retail|S|1").price_amount, 25);
+  assert.equal(db.state.productEffectiveBranchPrices.get("005|IC-005089|retail|S|1").price_source, "master");
 });

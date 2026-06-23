@@ -2,113 +2,174 @@
 
 const { Router } = require("express");
 
-/**
- * Mounted at /api/mobile. Requires requireMobileTokenMiddleware on the parent.
- * GET /api/mobile/products/by-barcode/:barcode
- */
-function createMobileProductsRouter({ db, requireMobileRoleMiddleware }) {
+function notFound(res, req) {
+  return res.status(404).json({ error: "Not found", request_id: req.requestId });
+}
+
+function toNumber(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function groupUnitPrices(rows) {
+  return rows.map((row) => ({
+    channel: row.channel,
+    unitSize: row.unit_size,
+    priceLevel: Number(row.price_level),
+    priceAmount: toNumber(row.price_amount),
+    priceSource: row.price_source,
+    unitName: row.unit_name || null,
+    factor: toNumber(row.factor),
+    allowBranchOverride: Boolean(row.allow_branch_override),
+    sourceUpdatedAt: row.source_updated_at || null,
+    sourceSyncedAt: row.source_synced_at || null,
+  }));
+}
+
+function pickRetailPrice(unitPrices) {
+  const exact = unitPrices.find((row) => row.channel === "retail" && row.priceLevel === 1 && row.unitSize === "S");
+  if (exact) {
+    return exact.priceAmount;
+  }
+  const fallback = unitPrices.find((row) => row.channel === "retail" && row.priceLevel === 1);
+  return fallback ? fallback.priceAmount : null;
+}
+
+function createMobileProductsRouter({ config, db, requireMobileTokenMiddleware }) {
   const router = Router();
 
-  router.get(
-    "/products/by-barcode/:barcode",
-    async (req, res, next) => {
-      const barcode = String(req.params.barcode || "").trim();
-      if (!barcode) {
-        return res.status(400).json({ error: "barcode is required", request_id: req.requestId });
+  router.use((req, res, next) => {
+    if (!config.featureMobilePda) {
+      return notFound(res, req);
+    }
+    return next();
+  });
+
+  router.use(requireMobileTokenMiddleware);
+
+  async function handleScan(req, res, next, barcode) {
+    const normalizedBarcode = String(barcode || "").trim();
+    if (!normalizedBarcode) {
+      return res.status(400).json({ error: "barcode is required", request_id: req.requestId });
+    }
+
+    try {
+      const productResult = await db.query(
+        `
+          SELECT
+            pb.barcode,
+            p.product_code,
+            COALESCE(NULLIF(p.product_name_th, ''), NULLIF(p.product_name, ''), bss.product_name_thai) AS name_th,
+            COALESCE(NULLIF(p.product_name, ''), bss.product_name_eng) AS name_en,
+            p.unit_small,
+            p.factor_small,
+            p.unit_medium,
+            p.factor_medium,
+            p.unit_large,
+            p.factor_large,
+            CASE $2
+              WHEN '000' THEN bss.qty_branch_000
+              WHEN '001' THEN bss.qty_branch_001
+              WHEN '002' THEN bss.qty_branch_002
+              WHEN '003' THEN bss.qty_branch_003
+              WHEN '004' THEN bss.qty_branch_004
+              WHEN '005' THEN bss.qty_branch_005
+              ELSE NULL
+            END AS branch_qty,
+            bss.qty_total_all_branches,
+            CASE $2
+              WHEN '000' THEN bss.cost_avg_branch_000
+              WHEN '001' THEN bss.cost_avg_branch_001
+              WHEN '002' THEN bss.cost_avg_branch_002
+              WHEN '003' THEN bss.cost_avg_branch_003
+              WHEN '004' THEN bss.cost_avg_branch_004
+              WHEN '005' THEN bss.cost_avg_branch_005
+              ELSE NULL
+            END AS branch_cost
+          FROM ada.product_barcodes pb
+          JOIN ada.products p ON p.product_code = pb.product_code
+          LEFT JOIN ada.branch_stock_snapshots bss ON bss.product_code = p.product_code
+          WHERE pb.barcode = $1
+          LIMIT 1
+        `,
+        [normalizedBarcode, req.mobile.branchCode],
+      );
+
+      if (!productResult.rows.length) {
+        return res.status(404).json({ error: "Product not found", request_id: req.requestId });
       }
 
-      try {
-        const productResult = await db.query(
-          `
-            SELECT
-              b.barcode,
-              s.company_code   AS product_code,
-              s.display_name   AS name_th,
-              i.generic_name   AS name_en,
-              s.uom            AS unit,
-              sup.id           AS price_id,
-              sup.retail_price,
-              bss.qty_branch_000, bss.qty_branch_001, bss.qty_branch_002,
-              bss.qty_branch_003, bss.qty_branch_004, bss.qty_branch_005,
-              bss.qty_total_all_branches,
-              bss.cost_avg_branch_000, bss.cost_avg_branch_001, bss.cost_avg_branch_002,
-              bss.cost_avg_branch_003, bss.cost_avg_branch_004, bss.cost_avg_branch_005
-            FROM public.barcodes b
-            JOIN public.skus s ON s.sku_id = b.sku_id
-            JOIN public.items i ON i.item_id = s.item_id
-            LEFT JOIN public.sku_unit_prices sup
-              ON sup.sku_id = s.sku_id AND sup.is_active = true
-            LEFT JOIN ada.branch_stock_snapshots bss
-              ON bss.product_code = s.company_code
-            WHERE b.barcode = $1
-            LIMIT 1
-          `,
-          [barcode],
-        );
+      const row = productResult.rows[0];
+      const isManager = req.mobile?.role === "manager";
+      const priceResult = await db.query(
+        `
+          SELECT
+            channel,
+            unit_size,
+            price_level,
+            price_amount,
+            price_source,
+            unit_name,
+            factor,
+            allow_branch_override,
+            source_updated_at,
+            source_synced_at
+          FROM ada.product_effective_branch_prices
+          WHERE branch_code = $1
+            AND product_code = $2
+            AND ($3 OR channel = 'retail')
+          ORDER BY
+            channel ASC,
+            price_level ASC,
+            CASE unit_size WHEN 'S' THEN 1 WHEN 'M' THEN 2 WHEN 'L' THEN 3 ELSE 9 END ASC
+        `,
+        [req.mobile.branchCode, row.product_code, isManager],
+      );
 
-        if (!productResult.rows.length) {
-          return res.status(404).json({ error: "Product not found", request_id: req.requestId });
-        }
+      const unitPrices = groupUnitPrices(priceResult.rows);
+      const stockByBranch = {
+        [req.mobile.branchCode]: toNumber(row.branch_qty),
+        total: toNumber(row.qty_total_all_branches),
+      };
 
-        const row = productResult.rows[0];
-
-        let priceTiers = [];
-        if (row.price_id) {
-          const tiersResult = await db.query(
-            `
-              SELECT tier, price
-              FROM public.sku_unit_price_tiers
-              WHERE sku_unit_price_id = $1 AND is_active = true
-              ORDER BY tier ASC
-            `,
-            [row.price_id],
-          );
-          priceTiers = tiersResult.rows.map((t) => ({
-            tier: t.tier,
-            price: t.price !== null ? Number(t.price) : null,
-          }));
-        }
-
-        const toNum = (v) => (v !== null && v !== undefined ? Number(v) : null);
-
-        const stockByBranch = {
-          "000": toNum(row.qty_branch_000),
-          "001": toNum(row.qty_branch_001),
-          "002": toNum(row.qty_branch_002),
-          "003": toNum(row.qty_branch_003),
-          "004": toNum(row.qty_branch_004),
-          "005": toNum(row.qty_branch_005),
-          total: toNum(row.qty_total_all_branches),
-        };
-
-        const isManager = req.mobile?.role === "manager";
-        const costByBranch = isManager
+      return res.json({
+        barcode: row.barcode,
+        branchCode: req.mobile.branchCode,
+        productCode: row.product_code || null,
+        nameTh: row.name_th || null,
+        nameEn: row.name_en || null,
+        units: {
+          small: { code: row.unit_small || null, factor: toNumber(row.factor_small) },
+          medium: { code: row.unit_medium || null, factor: toNumber(row.factor_medium) },
+          large: { code: row.unit_large || null, factor: toNumber(row.factor_large) },
+        },
+        retailPrice: pickRetailPrice(unitPrices),
+        priceTiers: [],
+        unitPrices,
+        stockByBranch,
+        ...(isManager
           ? {
-              "000": toNum(row.cost_avg_branch_000),
-              "001": toNum(row.cost_avg_branch_001),
-              "002": toNum(row.cost_avg_branch_002),
-              "003": toNum(row.cost_avg_branch_003),
-              "004": toNum(row.cost_avg_branch_004),
-              "005": toNum(row.cost_avg_branch_005),
+              costByBranch: {
+                [req.mobile.branchCode]: toNumber(row.branch_cost),
+              },
             }
-          : undefined;
+          : {}),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  }
 
-        return res.json({
-          barcode: row.barcode,
-          productCode: row.product_code || null,
-          nameTh: row.name_th || null,
-          nameEn: row.name_en || null,
-          unit: row.unit || null,
-          retailPrice: toNum(row.retail_price),
-          priceTiers,
-          stockByBranch,
-          ...(costByBranch !== undefined && { costByBranch }),
-        });
-      } catch (error) {
-        return next(error);
-      }
-    },
-  );
+  router.get("/products/by-barcode/:barcode", async (req, res, next) => {
+    return handleScan(req, res, next, req.params.barcode);
+  });
+
+  router.get("/products/scan", async (req, res, next) => {
+    return handleScan(req, res, next, req.query.barcode);
+  });
 
   return router;
 }

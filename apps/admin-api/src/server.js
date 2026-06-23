@@ -303,10 +303,18 @@ function createApp(overrides = {}) {
   );
   app.use(
     "/api/mobile",
-    requireMobileTokenMiddleware,
     createMobileProductsRouter({
+      config,
       db,
-      requireMobileRoleMiddleware: requireMobileRole,
+      requireMobileTokenMiddleware,
+    }),
+  );
+  app.use(
+    "/api/pda",
+    createMobileProductsRouter({
+      config,
+      db,
+      requireMobileTokenMiddleware,
     }),
   );
   app.use(
