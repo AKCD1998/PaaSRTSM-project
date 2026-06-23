@@ -865,17 +865,17 @@ async function getPendingReceipts(db, { branchCode = null, search = "", page = 1
   };
 }
 
-async function getApprovedReceipts(db, { branchCode, date = null, search = "", sort = "desc", page = 1, pageSize = 10 } = {}) {
+async function getApprovedReceipts(db, { branchCode = null, date = null, search = "", sort = "desc", page = 1, pageSize = 10 } = {}) {
   const normalizedSearch = String(search || "").trim().toLowerCase() || null;
   const normalizedSort = String(sort || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
   const safePage = Math.max(1, Number(page) || 1);
   const safePageSize = Math.min(100, Math.max(1, Number(pageSize) || 10));
   const offset = (safePage - 1) * safePageSize;
 
-  const branchWhere = `(
+  const branchWhere = `($1::text IS NULL OR (
     h.branch_code = $1
     OR h.branch_code IN (SELECT branch_code FROM core.branches WHERE is_hq = true)
-  )`;
+  ))`;
   const dateWhere = `($2::text IS NULL OR CAST(h.doc_date AS DATE) = $2::date)`;
   const searchWhere = `($3::text IS NULL
     OR LOWER(COALESCE(h.doc_no, '')) LIKE '%' || $3 || '%'
@@ -1290,14 +1290,9 @@ function createOrderingRouter(deps) {
   });
 
   router.get("/admin/approved-receipts", requireAuthMiddleware, async (req, res, next) => {
-    const branchCode = String(req.query.branchCode || "").trim();
-    if (!branchCode) {
-      return res.status(400).json({ error: "branchCode required" });
-    }
-
     try {
       const result = await getApprovedReceipts(db, {
-        branchCode,
+        branchCode: req.query.branchCode ? String(req.query.branchCode).trim() : null,
         date: req.query.date ? String(req.query.date) : null,
         search: req.query.search || "",
         sort: req.query.sort || "desc",

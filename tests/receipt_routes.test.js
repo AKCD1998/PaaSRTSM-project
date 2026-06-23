@@ -204,7 +204,7 @@ function createReceiptMockDb() {
         const date = params[1];
         const rows = [];
         for (const header of state.approvedHeaders.values()) {
-          if (header.branch_code !== branchCode && !state.hqBranches.has(header.branch_code)) continue;
+          if (branchCode && header.branch_code !== branchCode && !state.hqBranches.has(header.branch_code)) continue;
           if (date && String(header.doc_date) !== String(date)) continue;
           const lines = state.approvedLines.get(header.doc_no) || [];
           if (!lines.length) {
@@ -436,4 +436,38 @@ test("viewer-vs-owner: branch 005 viewer sees own receipts plus HQ receipts", as
   // branchCode on returned records is the real owner, not overwritten
   const apprHq = appr005.body.records.find((r) => r.docNo === "AR-HQ-001");
   assert.equal(apprHq.branchCode, "000");
+});
+
+test("approved receipts admin route accepts an empty branch filter", async () => {
+  const { app } = createTestApp();
+
+  await request(app)
+    .post("/api/sync/ada/approved-receipts")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      branchCode: "000",
+      sourceSyncedAt: "2026-05-22T02:00:00.000Z",
+      records: [
+        {
+          docNo: "AR-HQ-EMPTY-001",
+          docType: "2",
+          docDate: "2026-05-22",
+          supplierCode: "SUP-HQ",
+          supplierName: "HQ Supplier",
+          grand: 500,
+          staPrcDoc: "1",
+          lines: [{ seqNo: 1, productCode: "P-HQ-001", productName: "HQ Product", qty: 5, qtyBase: 5 }],
+        },
+      ],
+    })
+    .expect(200);
+
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent.get("/api/admin/approved-receipts?branchCode=&date=2026-05-22");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.records.length, 1);
+  assert.equal(response.body.records[0].docNo, "AR-HQ-EMPTY-001");
 });
