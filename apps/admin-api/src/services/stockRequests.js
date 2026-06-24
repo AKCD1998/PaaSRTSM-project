@@ -1,6 +1,7 @@
 "use strict";
 
 const { normalizeBranchCode } = require("../auth/users");
+const { markDraftSubmitted } = require("./stockRequestDrafts");
 
 const BATCH_NOTE_MAX_CHARS = 2000;
 const EVENT_NOTE_MAX_CHARS = 2000;
@@ -181,10 +182,19 @@ function normalizeSubmitPayload(body) {
     });
   }
 
+  const draftPublicId = normalizeNullableText(source.draftPublicId, 256);
+  const rawDraftVersion = source.draftVersion;
+  const draftVersion = rawDraftVersion != null ? Number(rawDraftVersion) : null;
+  if (draftPublicId && (draftVersion == null || !Number.isFinite(draftVersion) || !Number.isInteger(draftVersion) || draftVersion < 0)) {
+    throw createHttpError("draftVersion must be a non-negative integer when draftPublicId is provided.", 400);
+  }
+
   return {
     idempotencyKey,
     note,
     groups,
+    draftPublicId: draftPublicId || null,
+    draftVersion: draftPublicId ? draftVersion : null,
   };
 }
 
@@ -1096,6 +1106,15 @@ async function submitStockRequestBatch({ db, auth, body, requestId }) {
         message: `สาขา ${auth.effectiveBranchCode} ส่งคำขอ ${requestRecord.publicId}`,
         linkTarget: `/incoming/${encodeURIComponent(requestRecord.publicId)}`,
         dedupKey: `request-submitted:${requestRecord.publicId}`,
+      });
+    }
+
+    if (payload.draftPublicId) {
+      await markDraftSubmitted(client, {
+        draftPublicId: payload.draftPublicId,
+        draftVersion: payload.draftVersion,
+        submittedBatchPublicId: batch.publicId,
+        auth,
       });
     }
 

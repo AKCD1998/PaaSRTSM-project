@@ -26,6 +26,7 @@ const { createLoyaltyRouter } = require("./routes/loyalty");
 const { createMembersRouter } = require("./routes/members");
 const { createOrderingRouter } = require("./routes/ordering");
 const { createStockRequestsRouter } = require("./routes/stock-requests");
+const { createStockRequestDraftsRouter } = require("./routes/stock-request-drafts");
 const { createSupplierLogosRouter } = require("./routes/supplier-logos");
 const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
@@ -257,6 +258,15 @@ function createApp(overrides = {}) {
   app.use(
     "/api",
     createStockRequestsRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api",
+    createStockRequestDraftsRouter({
       config,
       db,
       requireAuthMiddleware,
