@@ -18,6 +18,7 @@ const {
 const { createHealthRouter } = require("./routes/health");
 const { createAuthRouter } = require("./routes/auth");
 const { createMeRouter } = require("./routes/me");
+const { createCipdataRouter } = require("./routes/cipdata");
 const { createProductsRouter } = require("./routes/products");
 const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
@@ -183,6 +184,13 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/cipdata",
+    createCipdataRouter({
+      config,
+      fetchImpl: overrides.fetchImpl,
     }),
   );
   app.use(

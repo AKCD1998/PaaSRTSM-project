@@ -159,6 +159,8 @@ function loadConfig(env = process.env) {
     nodeEnv,
     port: parseIntWithFallback(env.PORT, 3001),
     databaseUrl: env.DATABASE_URL || "",
+    cipdataSupabaseUrl: env.CIPDATA_SUPABASE_URL || "",
+    cipdataSupabaseServiceRoleKey: env.CIPDATA_SUPABASE_SERVICE_ROLE_KEY || "",
     authJwtSecret: env.AUTH_JWT_SECRET || "",
     cookieName: env.COOKIE_NAME || "admin_session",
     cookieSecure,
