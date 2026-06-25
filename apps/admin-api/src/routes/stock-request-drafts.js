@@ -9,19 +9,11 @@ const {
 } = require("../services/stockRequestDrafts");
 
 function createStockRequestDraftsRouter(deps) {
-  const { config, db, requireAuthMiddleware, requireCsrfMiddleware } = deps;
+  const { db, requireAuthMiddleware, requireCsrfMiddleware } = deps;
   const router = express.Router();
-
-  const requireFeatureEnabled = (req, res, next) => {
-    if (!config.featureStockRequests) {
-      return res.status(404).json({ error: "Not found", request_id: req.requestId || null });
-    }
-    return next();
-  };
 
   router.get(
     "/stock-request-draft/me",
-    requireFeatureEnabled,
     requireAuthMiddleware,
     async (req, res, next) => {
       try {
@@ -35,7 +27,6 @@ function createStockRequestDraftsRouter(deps) {
 
   router.put(
     "/stock-request-draft/me",
-    requireFeatureEnabled,
     requireAuthMiddleware,
     requireCsrfMiddleware,
     requireBranchIdentity,
@@ -59,7 +50,6 @@ function createStockRequestDraftsRouter(deps) {
 
   router.delete(
     "/stock-request-draft/me",
-    requireFeatureEnabled,
     requireAuthMiddleware,
     requireCsrfMiddleware,
     async (req, res, next) => {
