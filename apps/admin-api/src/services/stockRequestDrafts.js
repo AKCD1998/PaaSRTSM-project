@@ -1,5 +1,7 @@
 "use strict";
 
+const { randomBytes } = require("node:crypto");
+
 const DRAFT_NOTE_MAX_CHARS = 2000;
 const DRAFT_LINE_NOTE_MAX_CHARS = 500;
 const ALLOWED_SUBMITTER_ROLES = new Set(["admin", "branch", "staff"]);
@@ -290,26 +292,25 @@ async function putActiveDraft({ db, auth, body }) {
         throw createHttpError("Draft was updated elsewhere.", 409, { code: "DRAFT_VERSION_CONFLICT" });
       }
 
-      // Use a CTE to get the sequence value and build draft_public_id in one statement,
-      // avoiding a temporary SRQD-PENDING placeholder that would violate the UNIQUE constraint
-      // under concurrent inserts from different users/tabs.
+      // Use a cryptographically random temp ID so concurrent inserts from different users/tabs
+      // never collide on the UNIQUE constraint; the UPDATE below replaces it with the real ID.
+      const tempPublicId = `SRQD-T-${randomBytes(12).toString("hex")}`;
       const insertResult = await client.query(
-        `WITH seq AS (
-           SELECT nextval('ordering.stock_request_drafts_draft_id_seq') AS seq_id
-         )
-         INSERT INTO ordering.stock_request_drafts
-           (draft_id, draft_public_id, owner_user_id, owner_username, branch_code, note, status, version)
-         SELECT
-           seq.seq_id,
-           'SRQD-' || to_char(now() AT TIME ZONE 'UTC', 'YYYYMMDD') || '-' || $3 || '-' || lpad(seq.seq_id::text, 6, '0'),
-           $1, $2, $3, $4, 'ACTIVE', 1
-         FROM seq
-         RETURNING draft_id, draft_public_id, created_at`,
-        [auth.userId || null, ownerUsername, branchCode, payload.note],
+        `INSERT INTO ordering.stock_request_drafts
+           (draft_public_id, owner_user_id, owner_username, branch_code, note, status, version)
+         VALUES ($1, $2, $3, $4, $5, 'ACTIVE', 1)
+         RETURNING draft_id, created_at`,
+        [tempPublicId, auth.userId || null, ownerUsername, branchCode, payload.note],
       );
       const savedDraftId = Number(insertResult.rows[0].draft_id);
-      responseDraftPublicId = insertResult.rows[0].draft_public_id;
+      const createdAt = insertResult.rows[0].created_at;
+      responseDraftPublicId = formatDraftPublicId(createdAt, branchCode, savedDraftId);
       responseVersion = 1;
+
+      await client.query(
+        `UPDATE ordering.stock_request_drafts SET draft_public_id = $2 WHERE draft_id = $1`,
+        [savedDraftId, responseDraftPublicId],
+      );
 
       await insertDraftLines(client, savedDraftId, payload.lines);
     } else {
