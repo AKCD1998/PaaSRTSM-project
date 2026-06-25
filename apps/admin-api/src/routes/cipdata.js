@@ -190,8 +190,11 @@ function createSupabaseClient({ config, fetchImpl }) {
     }
 
     return {
-      ...response,
+      ok: response.ok,
+      status: response.status,
       headers: createHeadersAccessor(response.headers),
+      json: () => response.json(),
+      text: () => response.text(),
     };
   }
 

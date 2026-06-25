@@ -64,24 +64,14 @@ function createMockDb() {
 }
 
 function createJsonResponse(status, body, headers = {}) {
-  return {
-    ok: status >= 200 && status < 300,
+  const payload = typeof body === "string" ? body : JSON.stringify(body);
+  return new Response(payload, {
     status,
     headers: {
-      get(name) {
-        const key = Object.keys(headers).find(
-          (candidate) => candidate.toLowerCase() === String(name || "").toLowerCase(),
-        );
-        return key ? headers[key] : null;
-      },
+      "content-type": "application/json",
+      ...headers,
     },
-    async json() {
-      return body;
-    },
-    async text() {
-      return typeof body === "string" ? body : JSON.stringify(body);
-    },
-  };
+  });
 }
 
 function buildEncounterRow(overrides = {}) {
