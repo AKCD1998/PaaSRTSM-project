@@ -247,33 +247,30 @@ function createDraftMockDb() {
       return { rowCount: row ? 1 : 0, rows: row ? [row] : [] };
     }
 
-    // INSERT draft
-    if (normalized.startsWith("insert into ordering.stock_request_drafts")) {
+    // INSERT draft (CTE form: WITH seq AS (SELECT nextval(...)) INSERT INTO ... SELECT ...)
+    // params: [$1=owner_user_id, $2=owner_username, $3=branch_code, $4=note]
+    if (normalized.includes("insert into ordering.stock_request_drafts") && normalized.includes("with seq as")) {
       const draftId = state.nextDraftId++;
-      const now = new Date().toISOString();
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const branchCode = String(params[2] || "");
+      const draftPublicId = formatDraftPublicId(now, branchCode, draftId);
       const row = {
         draft_id: draftId,
-        draft_public_id: params[0], // placeholder initially
-        owner_user_id: params[1] || null,
-        owner_username: params[2],
-        branch_code: params[3],
-        note: params[4],
+        draft_public_id: draftPublicId,
+        owner_user_id: params[0] || null,
+        owner_username: String(params[1] || ""),
+        branch_code: branchCode,
+        note: String(params[3] || ""),
         status: "ACTIVE",
         version: 1,
         submitted_batch_public_id: null,
-        created_at: now,
-        updated_at: now,
+        created_at: nowIso,
+        updated_at: nowIso,
         submitted_at: null,
       };
       state.drafts.push(row);
-      return { rowCount: 1, rows: [{ draft_id: draftId, created_at: now }] };
-    }
-
-    // UPDATE draft_public_id
-    if (normalized.startsWith("update ordering.stock_request_drafts set draft_public_id = $2 where draft_id = $1")) {
-      const d = state.drafts.find((r) => r.draft_id === Number(params[0]));
-      if (d) d.draft_public_id = params[1];
-      return { rowCount: d ? 1 : 0, rows: [] };
+      return { rowCount: 1, rows: [{ draft_id: draftId, draft_public_id: draftPublicId, created_at: nowIso }] };
     }
 
     // UPDATE draft note + version
