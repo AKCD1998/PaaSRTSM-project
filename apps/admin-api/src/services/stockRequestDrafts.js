@@ -295,12 +295,14 @@ async function putActiveDraft({ db, auth, body }) {
       // Use a cryptographically random temp ID so concurrent inserts from different users/tabs
       // never collide on the UNIQUE constraint; the UPDATE below replaces it with the real ID.
       const tempPublicId = `SRQD-T-${randomBytes(12).toString("hex")}`;
+      // owner_user_id is bigint but our auth.userId is a string username — always NULL here.
+      // owner_username (text) already captures the identity uniquely.
       const insertResult = await client.query(
         `INSERT INTO ordering.stock_request_drafts
            (draft_public_id, owner_user_id, owner_username, branch_code, note, status, version)
          VALUES ($1, $2, $3, $4, $5, 'ACTIVE', 1)
          RETURNING draft_id, created_at`,
-        [tempPublicId, auth.userId || null, ownerUsername, branchCode, payload.note],
+        [tempPublicId, null, ownerUsername, branchCode, payload.note],
       );
       const savedDraftId = Number(insertResult.rows[0].draft_id);
       const createdAt = insertResult.rows[0].created_at;
