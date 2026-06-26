@@ -394,6 +394,52 @@ function createIngredientAdminRouter(deps) {
     }
   });
 
+  // ── BULK SYNONYM CHECK (pre-seed duplicate checker) ─────────────────────────
+  router.post("/synonyms/check-bulk", auth, async (req, res, next) => {
+    try {
+      const raw = Array.isArray(req.body?.synonyms) ? req.body.synonyms : [];
+      if (raw.length === 0) return badRequest(res, req, "synonyms[] is required");
+      if (raw.length > 300) return badRequest(res, req, "Too many synonyms (max 300)");
+
+      const cleaned = raw.map((s) => String(s ?? "").trim()).filter(Boolean);
+      if (cleaned.length === 0) return badRequest(res, req, "synonyms[] contains no non-empty values");
+
+      const rows = await db.query(
+        `SELECT s.synonym_id, s.ingredient_id, s.synonym_text, s.status,
+                i.canonical_name, i.display_name
+         FROM knowledge.ingredient_synonyms s
+         JOIN knowledge.ingredients i ON i.ingredient_id = s.ingredient_id
+         WHERE LOWER(BTRIM(s.synonym_text)) = ANY($1::text[])`,
+        [cleaned.map((s) => s.toLowerCase())],
+      );
+
+      const found = new Map();
+      for (const row of rows.rows) {
+        found.set(row.synonym_text.trim().toLowerCase(), row);
+      }
+
+      const results = cleaned.map((synonymText) => {
+        const row = found.get(synonymText.toLowerCase());
+        if (row) {
+          return {
+            synonymText,
+            exists: true,
+            synonymId: Number(row.synonym_id),
+            ingredientId: Number(row.ingredient_id),
+            ingredientCanonical: row.canonical_name,
+            ingredientDisplay: row.display_name,
+            status: row.status,
+          };
+        }
+        return { synonymText, exists: false };
+      });
+
+      return res.json({ ok: true, total: cleaned.length, foundCount: results.filter((r) => r.exists).length, results });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   router.patch("/synonyms/:synonymId", write, async (req, res, next) => {
     try {
       const synonymId = toIntOrNull(req.params.synonymId);
