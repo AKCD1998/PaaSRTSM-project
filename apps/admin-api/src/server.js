@@ -35,6 +35,7 @@ const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
 const { createReviewQueueRouter } = require("./routes/review-queue");
+const { createMovementAnalyticsRouter } = require("./routes/movement-analytics");
 const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowledge");
 const { createIngredientAdminRouter } = require("./routes/ingredient-admin");
 const {
@@ -262,6 +263,13 @@ function createApp(overrides = {}) {
       db,
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
+    }),
+  );
+  app.use(
+    "/api/admin",
+    createMovementAnalyticsRouter({
+      db,
+      requireAuthMiddleware,
     }),
   );
   app.use(
