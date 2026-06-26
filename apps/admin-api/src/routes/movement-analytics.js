@@ -69,6 +69,8 @@ function createMovementAnalyticsRouter(deps) {
           JOIN ada.sales_headers sh
             ON  sh.branch_code = sl.branch_code
             AND sh.doc_no      = sl.doc_no
+          -- only real SKUs from the master product list; filters out test data
+          JOIN public.skus s ON s.company_code = sl.product_code
           WHERE ($1::date IS NULL OR sh.doc_date >= $1::date)
             AND ($2::date IS NULL OR sh.doc_date <= $2::date)
           GROUP BY sl.product_code, sh.branch_code
