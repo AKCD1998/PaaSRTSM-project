@@ -20,6 +20,7 @@ const { createAuthRouter } = require("./routes/auth");
 const { createMeRouter } = require("./routes/me");
 const { createCipdataRouter } = require("./routes/cipdata");
 const { createProductsRouter } = require("./routes/products");
+const { createTaxonomyRouter } = require("./routes/taxonomy");
 const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
 const { createSearchRouter } = require("./routes/search");
@@ -217,6 +218,15 @@ function createApp(overrides = {}) {
       requireCsrfMiddleware: requireCsrf,
       embeddingProvider: searchEmbeddingProvider,
       embeddingSyncJobRunner: searchEmbeddingSyncJobRunner,
+    }),
+  );
+  app.use(
+    "/api/products",
+    createTaxonomyRouter({
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
     }),
   );
   app.use(

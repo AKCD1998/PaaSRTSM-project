@@ -11,6 +11,7 @@ import { ProductDetailPage } from "./pages/ProductDetailPage";
 import { ImportProductsPage } from "./pages/ImportProductsPage";
 import { ImportPricesPage } from "./pages/ImportPricesPage";
 import { TopSellersPage } from "./pages/TopSellersPage";
+import { ProductTaxonomyPage } from "./pages/ProductTaxonomyPage";
 import { ApplyRulesPage } from "./pages/ApplyRulesPage";
 import { EmbeddingSyncPage } from "./pages/EmbeddingSyncPage";
 import { ReconciliationPage } from "./pages/ReconciliationPage";
@@ -22,6 +23,7 @@ function PrivateRoutes() {
         <Route path="/" element={<DashboardPage />} />
         <Route path="/products" element={<ProductsPage />} />
         <Route path="/products/:sku_id" element={<ProductDetailPage />} />
+        <Route path="/taxonomy" element={<ProductTaxonomyPage />} />
         <Route
           path="/imports/products"
           element={

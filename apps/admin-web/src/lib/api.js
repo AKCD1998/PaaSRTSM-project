@@ -135,6 +135,28 @@ export const api = {
       query: params,
     });
   },
+  getTaxonomyStats() {
+    return request("/api/products/taxonomy/stats");
+  },
+  listProductTaxonomy(params) {
+    return request("/api/products/taxonomy", {
+      query: params,
+    });
+  },
+  updateProductTaxonomy(skuCode, payload, csrfToken) {
+    return request(`/api/products/${encodeURIComponent(skuCode)}/taxonomy`, {
+      method: "PATCH",
+      body: payload,
+      csrfToken,
+    });
+  },
+  bulkClassifyTaxonomy(payload, csrfToken) {
+    return request("/api/products/taxonomy/bulk-classify", {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    });
+  },
   applyRules(payload, csrfToken) {
     return request("/admin/enrichment/apply-rules", {
       method: "POST",

@@ -31,6 +31,9 @@ export function AppShell({ children }) {
           <NavLink to="/products" className={navClass}>
             Product Search
           </NavLink>
+          <NavLink to="/taxonomy" className={navClass}>
+            Product Taxonomy
+          </NavLink>
           {isAdmin && (
             <>
               <NavLink to="/imports/products" className={navClass}>

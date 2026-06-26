@@ -633,6 +633,66 @@ ul {
   gap: 10px;
 }
 
+.taxonomy-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.taxonomy-chip {
+  min-width: 132px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+  background: #fff;
+}
+
+.taxonomy-chip strong {
+  font-size: 1.2rem;
+}
+
+.tone-drug {
+  background: #eef3ff;
+}
+
+.tone-herb {
+  background: #edf9f1;
+}
+
+.tone-supplement {
+  background: #fff8e5;
+}
+
+.tone-antiseptic {
+  background: #eef8fb;
+}
+
+.tone-cosmeceutical {
+  background: #fff1eb;
+}
+
+.tone-cosmetic {
+  background: #fff2f7;
+}
+
+.tone-device {
+  background: #f0f3f8;
+}
+
+.tone-service {
+  background: #f8f1ff;
+}
+
+.tone-other {
+  background: #f6f4ef;
+}
+
+.tone-unclassified {
+  background: #fff7d7;
+}
+
 .empty-cell {
   text-align: center;
   color: var(--ink-muted);
