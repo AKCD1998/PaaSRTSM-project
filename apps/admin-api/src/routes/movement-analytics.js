@@ -147,6 +147,335 @@ function createMovementAnalyticsRouter(deps) {
     }
   });
 
+  // ── GET /api/admin/branch-product-sales ─────────────────────────────────────
+  // Branch-specific sold-quantity reporting with POS split and zero-sale rows.
+  // Reads from raw ada.sales_headers / ada.sales_lines so bill/POS drilldown can
+  // be reconstructed exactly, unlike the older summary-only analytics table.
+  router.get("/branch-product-sales", requireAuthMiddleware, async (req, res, next) => {
+    const branchCode = normalizeText(req.query.branch_code);
+    const dateFrom = normalizeText(req.query.date_from) || null;
+    const dateTo = normalizeText(req.query.date_to) || null;
+    const search = normalizeQuery(req.query.product_search || "");
+    const sortBy = normalizeText(req.query.sort_by) || "qty_total";
+    const sortDir = normalizeText(req.query.sort_dir).toLowerCase() === "asc" ? "ASC" : "DESC";
+    const limit = parsePositiveInt(req.query.limit, 10000);
+    const offset = parseNonNegativeInt(req.query.offset, 0);
+
+    if (!branchCode) {
+      return res.status(400).json({ message: "branch_code is required." });
+    }
+    if (limit == null) return res.status(400).json({ message: "limit must be a positive integer." });
+    if (offset == null) return res.status(400).json({ message: "offset must be a non-negative integer." });
+
+    const allowedSortCols = new Set(["product_code", "product_name", "qty_total", "bill_count_total", "first_sale_date", "last_sale_date"]);
+    const effectiveSortBy = allowedSortCols.has(sortBy) ? sortBy : "qty_total";
+    const effectiveLimit = Math.min(limit, 20000);
+
+    try {
+      const filteredSalesSql = `
+        WITH filtered_sales AS (
+          SELECT
+            sh.branch_code,
+            sh.doc_no,
+            sh.doc_date,
+            sh.doc_time,
+            sh.customer_code,
+            sh.cashier_code,
+            COALESCE(NULLIF(sh.terminal_code, ''), 'unknown') AS pos_code,
+            sl.product_code,
+            COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0)) AS qty,
+            COALESCE(sl.line_amount, 0) AS line_amount
+          FROM ada.sales_headers sh
+          JOIN ada.sales_lines sl
+            ON  sl.branch_code = sh.branch_code
+            AND sl.doc_no = sh.doc_no
+          WHERE sh.branch_code = $1
+            AND ($2::date IS NULL OR sh.doc_date >= $2::date)
+            AND ($3::date IS NULL OR sh.doc_date <= $3::date)
+            AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
+            AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
+        ),
+        barcode_choice AS (
+          SELECT product_code, MIN(barcode) AS barcode
+          FROM ada.product_barcodes
+          GROUP BY product_code
+        ),
+        product_rollup AS (
+          SELECT
+            product_code,
+            SUM(qty) AS qty_total,
+            SUM(line_amount) AS net_amount_total,
+            COUNT(DISTINCT doc_no) AS bill_count_total,
+            MIN(doc_date) AS first_sale_date,
+            MAX(doc_date) AS last_sale_date
+          FROM filtered_sales
+          GROUP BY product_code
+        ),
+        product_pos_rollup AS (
+          SELECT
+            product_code,
+            pos_code,
+            SUM(qty) AS qty_total,
+            SUM(line_amount) AS net_amount_total,
+            COUNT(DISTINCT doc_no) AS bill_count_total
+          FROM filtered_sales
+          GROUP BY product_code, pos_code
+        ),
+        product_pos_json AS (
+          SELECT
+            product_code,
+            jsonb_object_agg(
+              pos_code,
+              jsonb_build_object(
+                'qty_total', qty_total,
+                'net_amount_total', net_amount_total,
+                'bill_count_total', bill_count_total
+              )
+              ORDER BY pos_code
+            ) AS sales_by_pos
+          FROM product_pos_rollup
+          GROUP BY product_code
+        ),
+        product_master AS (
+          SELECT
+            p.product_code,
+            COALESCE(NULLIF(p.product_name_th, ''), NULLIF(p.product_name, ''), s.display_name, p.product_code) AS product_name,
+            p.product_name_th,
+            p.product_name AS product_name_eng,
+            COALESCE(bc.barcode, bss.barcode, NULL) AS barcode,
+            COALESCE(p.unit_small, s.uom, bss.unit, NULL) AS unit,
+            COALESCE(p.category_name, s.category_name, '') AS category
+          FROM ada.products p
+          LEFT JOIN barcode_choice bc ON bc.product_code = p.product_code
+          LEFT JOIN public.skus s ON s.company_code = p.product_code
+          LEFT JOIN ada.branch_stock_snapshots bss ON bss.product_code = p.product_code
+        ),
+        enriched AS (
+          SELECT
+            pm.product_code,
+            pm.product_name,
+            pm.product_name_th,
+            pm.product_name_eng,
+            pm.barcode,
+            pm.unit,
+            pm.category,
+            COALESCE(pr.qty_total, 0) AS qty_total,
+            COALESCE(pr.net_amount_total, 0) AS net_amount_total,
+            COALESCE(pr.bill_count_total, 0) AS bill_count_total,
+            pr.first_sale_date,
+            pr.last_sale_date,
+            COALESCE(ppj.sales_by_pos, '{}'::jsonb) AS sales_by_pos
+          FROM product_master pm
+          LEFT JOIN product_rollup pr ON pr.product_code = pm.product_code
+          LEFT JOIN product_pos_json ppj ON ppj.product_code = pm.product_code
+          WHERE (
+            $4::text = ''
+            OR pm.product_code ILIKE '%' || $4 || '%'
+            OR COALESCE(pm.product_name, '') ILIKE '%' || $4 || '%'
+            OR COALESCE(pm.product_name_th, '') ILIKE '%' || $4 || '%'
+            OR COALESCE(pm.product_name_eng, '') ILIKE '%' || $4 || '%'
+            OR COALESCE(pm.barcode, '') ILIKE '%' || $4 || '%'
+          )
+        )
+        SELECT
+          product_code,
+          product_name,
+          product_name_th,
+          product_name_eng,
+          barcode,
+          unit,
+          category,
+          qty_total,
+          net_amount_total,
+          bill_count_total,
+          first_sale_date,
+          last_sale_date,
+          sales_by_pos,
+          COUNT(*) OVER()::int AS total_count
+        FROM enriched
+        ORDER BY ${effectiveSortBy} ${sortDir}, product_code ASC
+        LIMIT $5 OFFSET $6
+      `;
+
+      const summarySql = `
+        WITH filtered_sales AS (
+          SELECT
+            sh.doc_no,
+            COALESCE(NULLIF(sh.terminal_code, ''), 'unknown') AS pos_code,
+            sl.product_code,
+            COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0)) AS qty,
+            COALESCE(sl.line_amount, 0) AS line_amount
+          FROM ada.sales_headers sh
+          JOIN ada.sales_lines sl
+            ON  sl.branch_code = sh.branch_code
+            AND sl.doc_no = sh.doc_no
+          WHERE sh.branch_code = $1
+            AND ($2::date IS NULL OR sh.doc_date >= $2::date)
+            AND ($3::date IS NULL OR sh.doc_date <= $3::date)
+            AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
+            AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
+        ),
+        products_with_sales AS (
+          SELECT COUNT(DISTINCT product_code)::int AS count
+          FROM filtered_sales
+        ),
+        all_products AS (
+          SELECT COUNT(*)::int AS count
+          FROM ada.products
+        ),
+        pos_rollup AS (
+          SELECT
+            pos_code,
+            SUM(qty) AS qty_total,
+            SUM(line_amount) AS net_amount_total,
+            COUNT(DISTINCT doc_no) AS bill_count_total
+          FROM filtered_sales
+          GROUP BY pos_code
+        )
+        SELECT
+          (SELECT count FROM all_products) AS product_count,
+          (SELECT count FROM products_with_sales) AS products_with_sales,
+          COALESCE(SUM(qty), 0) AS qty_total,
+          COALESCE(SUM(line_amount), 0) AS net_amount_total,
+          COUNT(DISTINCT doc_no)::int AS bill_count_total,
+          COALESCE(
+            (
+              SELECT jsonb_object_agg(
+                pos_code,
+                jsonb_build_object(
+                  'qty_total', qty_total,
+                  'net_amount_total', net_amount_total,
+                  'bill_count_total', bill_count_total
+                )
+                ORDER BY pos_code
+              )
+              FROM pos_rollup
+            ),
+            '{}'::jsonb
+          ) AS totals_by_pos
+        FROM filtered_sales
+      `;
+
+      const [rowsResult, summaryResult] = await Promise.all([
+        db.query(filteredSalesSql, [branchCode, dateFrom || null, dateTo || null, search, effectiveLimit, offset]),
+        db.query(summarySql, [branchCode, dateFrom || null, dateTo || null]),
+      ]);
+
+      const total = Number(rowsResult.rows[0]?.total_count || 0);
+      const summaryRow = summaryResult.rows[0] || {};
+      const totalsByPos = summaryRow.totals_by_pos || {};
+      const posCodes = Object.keys(totalsByPos).filter(Boolean).sort();
+      const productCount = Number(summaryRow.product_count || 0);
+      const productsWithSales = Number(summaryRow.products_with_sales || 0);
+
+      const products = rowsResult.rows.map((row) => ({
+        product_code: row.product_code,
+        product_name: row.product_name || row.product_code,
+        product_name_th: row.product_name_th || null,
+        product_name_eng: row.product_name_eng || null,
+        barcode: row.barcode || null,
+        unit: row.unit || null,
+        category: row.category || "",
+        qty_total: Number(row.qty_total || 0),
+        net_amount_total: Number(row.net_amount_total || 0),
+        bill_count_total: Number(row.bill_count_total || 0),
+        first_sale_date: row.first_sale_date || null,
+        last_sale_date: row.last_sale_date || null,
+        sales_by_pos: row.sales_by_pos || {},
+      }));
+
+      return res.json({
+        branch_code: branchCode,
+        date_from: dateFrom,
+        date_to: dateTo,
+        pos_codes: posCodes,
+        summary: {
+          product_count: productCount,
+          products_with_sales: productsWithSales,
+          products_without_sales: Math.max(0, productCount - productsWithSales),
+          qty_total: Number(summaryRow.qty_total || 0),
+          net_amount_total: Number(summaryRow.net_amount_total || 0),
+          bill_count_total: Number(summaryRow.bill_count_total || 0),
+          totals_by_pos: totalsByPos,
+        },
+        products,
+        total,
+        offset,
+        limit: effectiveLimit,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // ── GET /api/admin/branch-product-sales/:product_code/bills ─────────────────
+  // Drilldown for one product: one row per bill with POS/date/time/qty.
+  router.get("/branch-product-sales/:product_code/bills", requireAuthMiddleware, async (req, res, next) => {
+    const productCode = normalizeText(req.params.product_code);
+    const branchCode = normalizeText(req.query.branch_code);
+    const dateFrom = normalizeText(req.query.date_from) || null;
+    const dateTo = normalizeText(req.query.date_to) || null;
+
+    if (!productCode) return res.status(400).json({ message: "product_code is required." });
+    if (!branchCode) return res.status(400).json({ message: "branch_code is required." });
+
+    try {
+      const sql = `
+        SELECT
+          sh.branch_code,
+          sh.doc_no AS bill_no,
+          sh.doc_date AS sale_date,
+          sh.doc_time AS sale_time,
+          COALESCE(NULLIF(sh.terminal_code, ''), 'unknown') AS pos_code,
+          sh.cashier_code,
+          sh.customer_code,
+          COUNT(sl.line_no)::int AS line_count,
+          SUM(COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0))) AS qty_total,
+          SUM(COALESCE(sl.line_amount, 0)) AS net_amount_total,
+          MIN(COALESCE(NULLIF(sl.raw_payload->>'unitName', ''), NULLIF(sl.raw_payload->>'FTSdtUnitName', ''), NULL)) AS unit_name,
+          MIN(COALESCE(NULLIF(sl.raw_payload->>'FTPdtName', ''), NULLIF(sl.raw_payload->>'productNameThai', ''), NULL)) AS product_name
+        FROM ada.sales_headers sh
+        JOIN ada.sales_lines sl
+          ON  sl.branch_code = sh.branch_code
+          AND sl.doc_no = sh.doc_no
+        WHERE sh.branch_code = $1
+          AND sl.product_code = $2
+          AND ($3::date IS NULL OR sh.doc_date >= $3::date)
+          AND ($4::date IS NULL OR sh.doc_date <= $4::date)
+          AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
+          AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
+        GROUP BY sh.branch_code, sh.doc_no, sh.doc_date, sh.doc_time, sh.terminal_code, sh.cashier_code, sh.customer_code
+        ORDER BY sh.doc_date DESC, sh.doc_time DESC, sh.doc_no DESC
+      `;
+
+      const result = await db.query(sql, [branchCode, productCode, dateFrom || null, dateTo || null]);
+      const bills = result.rows.map((row) => ({
+        branch_code: row.branch_code,
+        bill_no: row.bill_no,
+        sale_date: row.sale_date,
+        sale_time: row.sale_time || null,
+        pos_code: row.pos_code || null,
+        cashier_code: row.cashier_code || null,
+        customer_code: row.customer_code || null,
+        line_count: Number(row.line_count || 0),
+        qty_total: Number(row.qty_total || 0),
+        net_amount_total: Number(row.net_amount_total || 0),
+        unit_name: row.unit_name || null,
+        product_name: row.product_name || null,
+      }));
+
+      return res.json({
+        branch_code: branchCode,
+        product_code: productCode,
+        date_from: dateFrom,
+        date_to: dateTo,
+        bills,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   // ── GET /api/admin/movement-transactions ─────────────────────────────────────
   // Ledger: one row per product-line event.
   // Sources: ada.transfer_lines, ada.approved_receipt_lines, ada.sales_lines
