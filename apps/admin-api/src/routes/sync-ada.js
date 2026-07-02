@@ -2074,15 +2074,31 @@ function createAdaSyncRouter(deps) {
         await upsertSalesLine(client, req.body, record);
       }
       await client.query("COMMIT");
-      const { sales, refunds } = buildMirroredSalesPayload(req.body);
-      if (crmMirrorClient?.enabled) {
-        if (sales.length > 0) {
-          await crmMirrorClient.mirrorSales(sales);
+
+      // The primary raw-evidence write above is already committed at this point.
+      // The CRM mirror is a best-effort secondary side-effect (loyalty-point
+      // bookkeeping on a separate, unrelated backend) — it must never turn an
+      // already-successful sync into a reported failure, and it must never
+      // trigger a rollback of a transaction that has already committed. Any
+      // mirror failure (including body-size 413s from the CRM backend) is
+      // logged and swallowed here.
+      try {
+        const { sales, refunds } = buildMirroredSalesPayload(req.body);
+        if (crmMirrorClient?.enabled) {
+          if (sales.length > 0) {
+            await crmMirrorClient.mirrorSales(sales);
+          }
+          if (refunds.length > 0) {
+            await crmMirrorClient.mirrorRefunds(refunds);
+          }
         }
-        if (refunds.length > 0) {
-          await crmMirrorClient.mirrorRefunds(refunds);
-        }
+      } catch (mirrorError) {
+        console.error(
+          `CRM mirror failed for branch ${req.body?.headers?.[0]?.FTBchCode ?? req.body?.headers?.[0]?.branchCode ?? "?"} ` +
+          `(headers=${req.body.headers.length}, lines=${req.body.lines.length}): ${mirrorError.message}`,
+        );
       }
+
       return res.json({ acceptedHeaders: req.body.headers.length, acceptedLines: req.body.lines.length });
     } catch (e) {
       await client.query("ROLLBACK");

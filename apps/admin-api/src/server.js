@@ -132,6 +132,11 @@ function createApp(overrides = {}) {
     next();
   });
   app.use(createCorsMiddleware(config));
+  // Raw AdaAcc sync payloads (bulk sales/transfer/receipt backfills) run well past
+  // the 1mb default used everywhere else — scope a larger limit to just this path
+  // instead of raising it app-wide. Body-parser marks the request body as already
+  // parsed, so the app-wide express.json() below is a no-op for these requests.
+  app.use("/api/sync/ada", express.json({ limit: "10mb" }));
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: false, limit: "1mb" }));
   app.use(cookieParser());

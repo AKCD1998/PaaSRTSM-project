@@ -718,6 +718,53 @@ test("ADA sales route mirrors committed sale and refund documents to the CRM bac
   assert.equal(crmMirrorClient.refunds[0].original_doc_no, "S2606005002-0001588");
 });
 
+test("ADA sales route still commits and returns success when the CRM mirror fails", async () => {
+  const { app, db, crmMirrorClient } = createTestApp();
+  crmMirrorClient.mirrorSales = async () => {
+    const error = new Error("CRM mirror request failed: 413");
+    error.status = 413;
+    throw error;
+  };
+
+  const response = await request(app)
+    .post("/api/sync/ada/sales")
+    .set("x-api-key", "test-pos-key")
+    .send({
+      sourceSystem: "AdaAcc",
+      sourceSyncedAt: "2026-06-02T13:30:00.000Z",
+      headers: [
+        {
+          FTBchCode: "005",
+          FTShdDocNo: "S2606005002-0002000",
+          FTShdDocType: "1",
+          FDShdDocDate: "2026-06-02",
+          FTShdDocTime: "13:24:32",
+          FTUsrCode: "dao1",
+          FTPosCode: "002",
+          FCShdGrand: 100,
+          FTCstCode: "0",
+        },
+      ],
+      lines: [
+        {
+          FTBchCode: "005",
+          FTShdDocNo: "S2606005002-0002000",
+          FNSdtSeqNo: 1,
+          FTPdtCode: "IC-001572",
+          FCSdtQty: 1,
+          FCSdtNet: 100,
+        },
+      ],
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.acceptedHeaders, 1);
+  assert.equal(response.body.acceptedLines, 1);
+  // The primary write must be committed, not rolled back, despite the mirror throwing.
+  assert.ok(db.state.salesHeaders.has("005|S2606005002-0002000"));
+  assert.deepEqual(db.state.txLog.slice(-2), ["begin", "commit"]);
+});
+
 test("ADA run-log route records sync runs and writes sync_errors for failed runs", async () => {
   const { app, db } = createTestApp();
 
