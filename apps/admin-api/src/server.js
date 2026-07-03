@@ -43,6 +43,10 @@ const {
   createBranchStaffRouter,
 } = require("./routes/mobile-enroll");
 const { createMobileProductsRouter } = require("./routes/mobile-products");
+const { createVideoContentRouter } = require("./routes/video-content");
+const { getVideoProvider } = require("./services/video-providers/providerRegistry");
+const { getStorageProvider } = require("./services/storage/storageRegistry");
+const { createVideoJobRunner } = require("./services/videoJobRunner");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -115,6 +119,16 @@ function createApp(overrides = {}) {
   const searchEmbeddingSyncJobRunner = overrides.searchEmbeddingSyncJobRunner || null;
   const crmMirrorClient =
     overrides.crmMirrorClient || createCrmMirrorClient(config, overrides.fetchImpl || global.fetch);
+  const videoStorageProvider = overrides.videoStorageProvider || getStorageProvider(config);
+  const videoJobRunner =
+    overrides.videoJobRunner ||
+    createVideoJobRunner({
+      db,
+      config,
+      getVideoProviderFn: getVideoProvider,
+      storageProvider: videoStorageProvider,
+      logger: console,
+    });
 
   const requireAuthMiddleware = requireAuth(config);
   const loginRateLimitMiddleware =
@@ -365,6 +379,17 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/content",
+    createVideoContentRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
+      videoJobRunner,
+      storageProvider: videoStorageProvider,
     }),
   );
   app.use(
