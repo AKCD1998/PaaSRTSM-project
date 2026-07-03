@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createOpenAiVideoProvider } = require("../apps/admin-api/src/services/video-providers/openaiVideoProvider");
+const { createOpenAiVideoProvider, estimateCostUsd } = require("../apps/admin-api/src/services/video-providers/openaiVideoProvider");
 
 function buildConfig(overrides = {}) {
   return {
@@ -49,6 +49,8 @@ test("createGenerationJob (no image) posts JSON with the correct fields and norm
 
   assert.equal(result.providerJobId, "video_123");
   assert.equal(result.status, "queued");
+  // sora-2 @ 1280x720 = $0.10/sec * 8s
+  assert.equal(result.estimatedCost, 0.8);
 });
 
 test("createGenerationJob uses the pro size when model is sora-2-pro", async () => {
@@ -69,6 +71,12 @@ test("createGenerationJob uses the pro size when model is sora-2-pro", async () 
   const body = JSON.parse(calls[0].options.body);
   assert.equal(body.size, "1080x1920");
   assert.equal(result.status, "processing");
+  // sora-2-pro @ 1080x1920 = $0.70/sec * 4s
+  assert.equal(result.estimatedCost, 2.8);
+});
+
+test("estimateCostUsd returns null for an unpriced model/size combination rather than guessing", () => {
+  assert.equal(estimateCostUsd("some-future-model", "1280x720", 8), null);
 });
 
 test("createGenerationJob sends multipart form data when an input image is present", async () => {

@@ -54,6 +54,7 @@ function buildConfig(overrides = {}) {
     videoMaxRetries: 2,
     videoPollIntervalMs: 10_000,
     videoMaxPollMinutes: 30,
+    usdToThbRate: 36.5,
     ...overrides,
   };
 }
@@ -351,6 +352,54 @@ function createVideoStudioMockDb() {
       return { rowCount: 1, rows: [{ audit_id: 1, event_time: nowIso() }] };
     }
 
+    // --- usage summary aggregates ---------------------------------------------
+    if (normalized.includes("job_count") && normalized.includes("from content.video_jobs")) {
+      function aggregate(rows) {
+        return {
+          job_count: rows.length,
+          total_estimated_cost_usd: rows.reduce((sum, row) => sum + Number(row.estimated_cost || 0), 0),
+          total_actual_cost_usd: rows.reduce((sum, row) => sum + Number(row.actual_cost || 0), 0),
+        };
+      }
+
+      if (normalized.includes("group by provider, model")) {
+        const groups = new Map();
+        for (const row of state.videoJobs) {
+          const key = `${row.provider}::${row.model}`;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(row);
+        }
+        const rows = [...groups.entries()].map(([key, groupRows]) => {
+          const [provider, model] = key.split("::");
+          return { provider, model, ...aggregate(groupRows) };
+        });
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.includes("group by created_by")) {
+        const groups = new Map();
+        for (const row of state.videoJobs) {
+          if (!groups.has(row.created_by)) groups.set(row.created_by, []);
+          groups.get(row.created_by).push(row);
+        }
+        const rows = [...groups.entries()].map(([createdBy, groupRows]) => ({
+          created_by: createdBy,
+          ...aggregate(groupRows),
+        }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.includes("date_trunc('month', now())")) {
+        const startOfMonth = new Date();
+        startOfMonth.setUTCDate(1);
+        startOfMonth.setUTCHours(0, 0, 0, 0);
+        const rows = state.videoJobs.filter((row) => new Date(row.created_at) >= startOfMonth);
+        return { rowCount: 1, rows: [aggregate(rows)] };
+      }
+
+      return { rowCount: 1, rows: [aggregate(state.videoJobs)] };
+    }
+
     throw new Error(`Unhandled mock query: ${normalized}`);
   }
 
@@ -550,6 +599,51 @@ test("GET /assets/binary rejects a tampered token with 403", async () => {
     .get("/api/content/assets/binary")
     .query({ key: "content/x.mp4", exp: String(Math.floor(Date.now() / 1000) + 300), token: "0".repeat(64) });
   assert.equal(response.status, 403);
+});
+
+// ---------------------------------------------------------------------------
+// Duration allow-list is per model, not just per provider
+// ---------------------------------------------------------------------------
+
+test("a duration valid for sora-2-pro is rejected for sora-2 (model-specific allow-list)", async () => {
+  const { app } = createTestApp({ videoProviderEnabled: new Set(["mock", "openai"]) });
+  const agent = request.agent(app);
+  const csrfToken = await login(agent, { username: "staff@example.com", password: "staff-pass-123" });
+  // 15s is valid for sora-2-pro but not sora-2.
+  const response = await createDraftJob(agent, csrfToken, { provider: "openai", model: "sora-2", durationSeconds: 15 });
+  assert.equal(response.status, 400);
+});
+
+// ---------------------------------------------------------------------------
+// Usage summary
+// ---------------------------------------------------------------------------
+
+test("usage summary requires admin role", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  const csrfToken = await login(agent, { username: "staff@example.com", password: "staff-pass-123" });
+  const response = await agent.get("/api/content/usage-summary").set("x-csrf-token", csrfToken);
+  assert.equal(response.status, 403);
+});
+
+test("usage summary aggregates estimated cost across jobs and converts to THB", async () => {
+  const { app, db } = createTestApp({ usdToThbRate: 35 });
+  const agent = request.agent(app);
+  const csrfToken = await login(agent, { username: "admin@example.com", password: "admin-pass-123" });
+
+  const createResponse = await createDraftJob(agent, csrfToken);
+  const jobId = createResponse.body.job.jobId;
+  const row = db.state.videoJobs.find((item) => item.job_id === jobId);
+  row.estimated_cost = 2;
+  row.actual_cost = null;
+
+  const response = await agent.get("/api/content/usage-summary").set("x-csrf-token", csrfToken);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.usdToThbRate, 35);
+  assert.equal(response.body.allTime.totalEstimatedCostUsd, 2);
+  assert.equal(response.body.allTime.totalEstimatedCostThb, 70);
+  assert.ok(Array.isArray(response.body.byProviderModel));
+  assert.ok(Array.isArray(response.body.byUser));
 });
 
 test("GET /assets/binary rejects an expired token with 403", async () => {

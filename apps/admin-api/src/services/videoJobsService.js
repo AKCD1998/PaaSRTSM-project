@@ -3,7 +3,7 @@
 const crypto = require("crypto");
 const {
   ASPECT_RATIOS,
-  ALLOWED_DURATIONS_BY_PROVIDER,
+  ALLOWED_DURATIONS_BY_PROVIDER_MODEL,
   ALLOWED_PROVIDER_MODELS,
 } = require("./video-providers/videoStudioConstants");
 const { getVideoProvider } = require("./video-providers/providerRegistry");
@@ -102,20 +102,22 @@ function validateJobInput(config, { prompt, negativePrompt, aspectRatio, duratio
     throw createHttpError(`provider must be one of: ${[...enabledProviders].join(", ")}.`, 400);
   }
 
-  const allowedDurations = ALLOWED_DURATIONS_BY_PROVIDER[normalizedProvider] || [];
-  const normalizedDuration = Number(durationSeconds);
-  if (!allowedDurations.includes(normalizedDuration)) {
-    throw createHttpError(
-      `durationSeconds must be one of: ${allowedDurations.join(", ")} for provider "${normalizedProvider}".`,
-      400,
-    );
-  }
-
   const allowedModels = ALLOWED_PROVIDER_MODELS[normalizedProvider] || [];
   const normalizedModel = normalizeText(model);
   if (!allowedModels.includes(normalizedModel)) {
     throw createHttpError(
       `model must be one of: ${allowedModels.join(", ")} for provider "${normalizedProvider}".`,
+      400,
+    );
+  }
+
+  // Allowed durations depend on the specific model (e.g. sora-2 vs sora-2-pro), not
+  // just the provider, so this check must run after the model is validated.
+  const allowedDurations = ALLOWED_DURATIONS_BY_PROVIDER_MODEL[normalizedProvider]?.[normalizedModel] || [];
+  const normalizedDuration = Number(durationSeconds);
+  if (!allowedDurations.includes(normalizedDuration)) {
+    throw createHttpError(
+      `durationSeconds must be one of: ${allowedDurations.join(", ")} for model "${normalizedModel}".`,
       400,
     );
   }
@@ -677,6 +679,61 @@ async function getVideoJobEvents({ db, auth, jobId }) {
   return result.rows.map(mapEventRow);
 }
 
+function mapUsageAggregateRow(row) {
+  return {
+    jobCount: Number(row.job_count || 0),
+    totalEstimatedCostUsd: Number(row.total_estimated_cost_usd || 0),
+    totalActualCostUsd: Number(row.total_actual_cost_usd || 0),
+  };
+}
+
+// Admin-only cost/usage rollup. estimated_cost is populated at submit time from the
+// provider's published pricing (see openaiVideoProvider.js) — actual_cost stays NULL
+// until a provider genuinely reports real billed usage, which none do today, so the
+// two totals are currently identical in practice. THB conversion happens at the
+// route layer using config.usdToThbRate, not here, so this stays a pure USD rollup.
+async function getUsageSummary({ db, auth }) {
+  if (auth.role !== "admin") {
+    throw createHttpError("Forbidden", 403);
+  }
+
+  const usageColumnsSql = `
+       count(*)::int AS job_count,
+       coalesce(sum(estimated_cost), 0) AS total_estimated_cost_usd,
+       coalesce(sum(actual_cost), 0) AS total_actual_cost_usd`;
+
+  const allTimeResult = await db.query(`SELECT ${usageColumnsSql} FROM content.video_jobs`);
+  const thisMonthResult = await db.query(
+    `SELECT ${usageColumnsSql} FROM content.video_jobs WHERE created_at >= date_trunc('month', now())`,
+  );
+  const byProviderModelResult = await db.query(
+    `SELECT provider, model, ${usageColumnsSql}
+     FROM content.video_jobs
+     GROUP BY provider, model
+     ORDER BY provider, model`,
+  );
+  const byUserResult = await db.query(
+    `SELECT created_by, ${usageColumnsSql}
+     FROM content.video_jobs
+     GROUP BY created_by
+     ORDER BY total_estimated_cost_usd DESC`,
+  );
+
+  return {
+    allTime: mapUsageAggregateRow(allTimeResult.rows[0] || {}),
+    thisMonth: mapUsageAggregateRow(thisMonthResult.rows[0] || {}),
+    byProviderModel: byProviderModelResult.rows.map((row) => ({
+      provider: row.provider,
+      model: row.model,
+      ...mapUsageAggregateRow(row),
+    })),
+    byUser: byUserResult.rows.map((row) => ({
+      createdBy: row.created_by,
+      ...mapUsageAggregateRow(row),
+    })),
+  };
+}
+
 module.exports = {
   validateJobInput,
   createVideoJob,
@@ -688,6 +745,7 @@ module.exports = {
   listVideoJobs,
   getVideoJobDetail,
   getVideoJobEvents,
+  getUsageSummary,
   mapJobRow,
   mapEventRow,
   loadJobRow,

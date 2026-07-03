@@ -9,7 +9,7 @@ const multer = require("multer");
 const { requirePermission } = require("../auth/permissions");
 const {
   ASPECT_RATIOS,
-  ALLOWED_DURATIONS_BY_PROVIDER,
+  ALLOWED_DURATIONS_BY_PROVIDER_MODEL,
   ALLOWED_PROVIDER_MODELS,
   MAX_UPLOAD_MIME_TYPES,
 } = require("../services/video-providers/videoStudioConstants");
@@ -23,6 +23,7 @@ const {
   listVideoJobs,
   getVideoJobDetail,
   getVideoJobEvents,
+  getUsageSummary,
 } = require("../services/videoJobsService");
 const {
   initAssetUpload,
@@ -107,9 +108,11 @@ function createVideoContentRouter(deps) {
           ok: true,
           request_id: req.requestId,
           aspectRatios: ASPECT_RATIOS,
-          durationsByProvider: ALLOWED_DURATIONS_BY_PROVIDER,
+          durationsByProviderModel: ALLOWED_DURATIONS_BY_PROVIDER_MODEL,
           providerModels: ALLOWED_PROVIDER_MODELS,
           providers,
+          promptMaxLength: config.videoMaxPromptLength,
+          usdToThbRate: config.usdToThbRate,
         });
       } catch (error) {
         return next(error);
@@ -284,6 +287,38 @@ function createVideoContentRouter(deps) {
         const { storageKey } = await getAssetForDownload({ db, auth: req.auth, assetId: job.outputAssetId });
         const url = await storageProvider.getSignedDownloadUrl({ key: storageKey, expiresInSeconds: 300 });
         return res.json({ ok: true, request_id: req.requestId, url });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  function withThb(usageRow, usdToThbRate) {
+    return {
+      ...usageRow,
+      totalEstimatedCostThb: Number((usageRow.totalEstimatedCostUsd * usdToThbRate).toFixed(2)),
+      totalActualCostThb: Number((usageRow.totalActualCostUsd * usdToThbRate).toFixed(2)),
+    };
+  }
+
+  router.get(
+    "/usage-summary",
+    requireFeatureEnabled,
+    requireAuthMiddleware,
+    requirePermission("content.video.admin"),
+    async (req, res, next) => {
+      try {
+        const summary = await getUsageSummary({ db, auth: req.auth });
+        const rate = config.usdToThbRate;
+        return res.json({
+          ok: true,
+          request_id: req.requestId,
+          usdToThbRate: rate,
+          allTime: withThb(summary.allTime, rate),
+          thisMonth: withThb(summary.thisMonth, rate),
+          byProviderModel: summary.byProviderModel.map((row) => withThb(row, rate)),
+          byUser: summary.byUser.map((row) => withThb(row, rate)),
+        });
       } catch (error) {
         return next(error);
       }

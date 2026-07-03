@@ -4,7 +4,7 @@
 // to shut down 2026-09-24. Re-verify this adapter against current docs
 // (https://platform.openai.com/docs/guides/video-generation) before that date.
 
-const { ASPECT_RATIO_TO_OPENAI_SIZE } = require("./videoStudioConstants");
+const { ASPECT_RATIO_TO_OPENAI_SIZE, OPENAI_PRICE_PER_SECOND_USD } = require("./videoStudioConstants");
 
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
@@ -22,6 +22,19 @@ function resolveSize(aspectRatio, model) {
     throw createHttpError(`Unsupported aspect ratio for openai provider: ${aspectRatio}`, 400);
   }
   return model === "sora-2-pro" ? entry.pro : entry.default;
+}
+
+// Estimate USD cost from OpenAI's published per-second pricing (see
+// videoStudioConstants.js) — this is a cost *estimate* computed from the request
+// parameters, not a real billed amount reported by the API (OpenAI's Videos API
+// does not return usage/cost data). Returns null if the size isn't in the pricing
+// table rather than guessing, per the "never assume cost" rule.
+function estimateCostUsd(model, size, durationSeconds) {
+  const pricePerSecond = OPENAI_PRICE_PER_SECOND_USD[model]?.[size];
+  if (typeof pricePerSecond !== "number" || !Number.isFinite(Number(durationSeconds))) {
+    return null;
+  }
+  return Number((pricePerSecond * Number(durationSeconds)).toFixed(4));
 }
 
 function normalizeStatus(rawStatus) {
@@ -114,7 +127,7 @@ function createOpenAiVideoProvider(config) {
       return {
         providerJobId: data.id,
         status: normalizeStatus(data.status),
-        estimatedCost: null,
+        estimatedCost: estimateCostUsd(model, size, durationSeconds),
       };
     },
 
@@ -180,4 +193,5 @@ module.exports = {
   createOpenAiVideoProvider,
   resolveSize,
   normalizeStatus,
+  estimateCostUsd,
 };

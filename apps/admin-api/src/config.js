@@ -1,6 +1,7 @@
 "use strict";
 
 const { inferEmbeddingDimension } = require("./embeddings/provider");
+const { DEFAULT_USD_TO_THB_RATE } = require("./services/video-providers/videoStudioConstants");
 
 function parseBool(value, fallback) {
   if (value == null || value === "") {
@@ -22,6 +23,14 @@ function parseIntWithFallback(value, fallback) {
     return fallback;
   }
   return Math.floor(n);
+}
+
+function parseFloatWithFallback(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    return fallback;
+  }
+  return n;
 }
 
 function parseAllowlist(value) {
@@ -230,6 +239,9 @@ function loadConfig(env = process.env) {
     videoMaxRetries: parseIntWithFallback(env.VIDEO_MAX_RETRIES, 3),
     videoPollIntervalMs: parseIntWithFallback(env.VIDEO_POLL_INTERVAL_MS, 10000),
     videoMaxPollMinutes: parseIntWithFallback(env.VIDEO_MAX_POLL_MINUTES, 30),
+    // Display-only conversion for the Usage & Cost dashboard — not a live FX rate,
+    // update manually via env var when it drifts too far from reality.
+    usdToThbRate: parseFloatWithFallback(env.USD_TO_THB_RATE, DEFAULT_USD_TO_THB_RATE),
   };
 }
 
