@@ -45,7 +45,7 @@ test("createGenerationJob (no image) posts JSON with the correct fields and norm
   assert.equal(body.prompt, "a dog surfing");
   assert.equal(body.model, "sora-2");
   assert.equal(body.size, "1280x720");
-  assert.equal(body.seconds, 8);
+  assert.equal(body.seconds, "8"); // OpenAI requires this as a string, not a number
 
   assert.equal(result.providerJobId, "video_123");
   assert.equal(result.status, "queued");

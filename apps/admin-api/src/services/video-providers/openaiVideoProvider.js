@@ -110,7 +110,11 @@ function createOpenAiVideoProvider(config) {
             prompt,
             model,
             size,
-            seconds: durationSeconds,
+            // OpenAI's API expects `seconds` as a string ("4"/"8"/"12"...), not a
+            // number — confirmed by a live 400 ("expected one of '4', '8', or '12',
+            // but got an integer instead"). The multipart branch above already got
+            // this right; this JSON branch didn't.
+            seconds: String(durationSeconds),
           }),
         });
       }
