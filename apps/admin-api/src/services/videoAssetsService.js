@@ -151,22 +151,31 @@ async function getAssetForDownload({ db, auth, assetId }) {
     throw createHttpError("Not found", 404);
   }
 
-  if (assetRow.created_by === auth.userId || auth.role === "admin") {
-    return { asset: mapAssetRow(assetRow), storageKey: assetRow.storage_key };
+  const visible =
+    assetRow.created_by === auth.userId ||
+    auth.role === "admin" ||
+    (assetRow.asset_type === "generated_video" &&
+      (
+        await db.query(`SELECT status FROM content.video_jobs WHERE output_asset_id = $1 LIMIT 1`, [
+          normalizedAssetId,
+        ])
+      ).rows[0]?.status === "approved");
+
+  if (!visible) {
+    throw createHttpError("Not found", 404);
   }
 
-  if (assetRow.asset_type === "generated_video") {
-    const jobResult = await db.query(
-      `SELECT status FROM content.video_jobs WHERE output_asset_id = $1 LIMIT 1`,
-      [normalizedAssetId],
+  // The periodic asset-cleanup sweep clears storage_key (but keeps the row) once a
+  // local file passes its retention window — surface that plainly instead of a
+  // confusing 404/500 from downstream trying to read a file that no longer exists.
+  if (!assetRow.storage_key) {
+    throw createHttpError(
+      "This file has been automatically removed from the server after its retention period. Retry the job to regenerate it.",
+      410,
     );
-    const job = jobResult.rows[0];
-    if (job && job.status === "approved") {
-      return { asset: mapAssetRow(assetRow), storageKey: assetRow.storage_key };
-    }
   }
 
-  throw createHttpError("Not found", 404);
+  return { asset: mapAssetRow(assetRow), storageKey: assetRow.storage_key };
 }
 
 module.exports = {

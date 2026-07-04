@@ -47,6 +47,7 @@ const { createVideoContentRouter } = require("./routes/video-content");
 const { getVideoProvider } = require("./services/video-providers/providerRegistry");
 const { getStorageProvider } = require("./services/storage/storageRegistry");
 const { createVideoJobRunner } = require("./services/videoJobRunner");
+const { startAssetCleanupSchedule } = require("./services/videoAssetCleanup");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -437,7 +438,19 @@ async function startServer() {
     console.log(`admin-api listening on port ${config.port}`);
   });
 
+  // Only scheduled for the real running process (never for createApp() calls made
+  // directly by tests) — periodically deletes old video-studio files from local
+  // disk since it isn't durable storage. No-ops if the feature flag is off, the
+  // storage provider isn't "local", or the interval is set to 0.
+  const assetCleanupTimer = startAssetCleanupSchedule({
+    db,
+    storageProvider: getStorageProvider(config),
+    config,
+    logger: console,
+  });
+
   const shutdown = async () => {
+    if (assetCleanupTimer) clearInterval(assetCleanupTimer);
     server.close(async () => {
       if (db && typeof db.end === "function") {
         await db.end();

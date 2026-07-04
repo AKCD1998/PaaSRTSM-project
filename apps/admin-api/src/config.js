@@ -242,6 +242,11 @@ function loadConfig(env = process.env) {
     // Display-only conversion for the Usage & Cost dashboard — not a live FX rate,
     // update manually via env var when it drifts too far from reality.
     usdToThbRate: parseFloatWithFallback(env.USD_TO_THB_RATE, DEFAULT_USD_TO_THB_RATE),
+    // No R2/S3 adapter yet — local disk is the only storage, and it's not
+    // durable, so old files get swept off disk automatically after this many
+    // days (DB row + job history stay, only the bytes on disk are removed).
+    videoLocalAssetRetentionDays: parseIntWithFallback(env.VIDEO_LOCAL_ASSET_RETENTION_DAYS, 3),
+    videoAssetCleanupIntervalMs: parseIntWithFallback(env.VIDEO_ASSET_CLEANUP_INTERVAL_MS, 6 * 60 * 60 * 1000),
   };
 }
 
