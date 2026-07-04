@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const request = require("supertest");
 const os = require("os");
+const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
@@ -599,6 +600,31 @@ test("GET /assets/binary rejects a tampered token with 403", async () => {
     .get("/api/content/assets/binary")
     .query({ key: "content/x.mp4", exp: String(Math.floor(Date.now() / 1000) + 300), token: "0".repeat(64) });
   assert.equal(response.status, 403);
+});
+
+test("GET /assets/binary serves inline by default and as an attachment with ?download=1", async () => {
+  const localDir = path.join(os.tmpdir(), `video-studio-download-test-${crypto.randomUUID()}`);
+  const config = buildConfig({ videoStorageLocalDir: localDir });
+  const { app } = createTestApp({ videoStorageLocalDir: localDir });
+
+  const key = "content/generated_video/test-clip.mp4";
+  fs.mkdirSync(path.dirname(path.join(localDir, key)), { recursive: true });
+  fs.writeFileSync(path.join(localDir, key), Buffer.from("fake-mp4-bytes"));
+
+  const exp = Math.floor(Date.now() / 1000) + 300;
+  const token = crypto.createHmac("sha256", config.videoSignedUrlSecret).update(`${key}:${exp}`).digest("hex");
+
+  const inlineResponse = await request(app).get("/api/content/assets/binary").query({ key, exp: String(exp), token });
+  assert.equal(inlineResponse.status, 200);
+  assert.match(inlineResponse.headers["content-disposition"], /^inline;/);
+
+  const attachmentResponse = await request(app)
+    .get("/api/content/assets/binary")
+    .query({ key, exp: String(exp), token, download: "1" });
+  assert.equal(attachmentResponse.status, 200);
+  assert.match(attachmentResponse.headers["content-disposition"], /^attachment;/);
+
+  fs.rmSync(localDir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------

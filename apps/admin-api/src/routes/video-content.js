@@ -398,6 +398,11 @@ function createVideoContentRouter(deps) {
 
       await fsPromises.access(filePath, fs.constants.R_OK);
       res.setHeader("Content-Type", guessContentTypeFromKey(String(key)));
+      // ?download=1 -> real "Save As" prompt (used by the download link/button).
+      // Without it -> inline, so the <video> preview player can still stream it.
+      const disposition = req.query.download === "1" ? "attachment" : "inline";
+      const filename = path.basename(String(key));
+      res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
       const stream = fs.createReadStream(filePath);
       stream.on("error", (error) => next(error));
       stream.pipe(res);
