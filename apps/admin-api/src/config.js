@@ -232,7 +232,7 @@ function loadConfig(env = process.env) {
     videoStorageBucket: env.VIDEO_STORAGE_BUCKET || "",
     videoStoragePublicBaseUrl: env.VIDEO_STORAGE_PUBLIC_BASE_URL || "",
     videoSignedUrlSecret: env.VIDEO_SIGNED_URL_SECRET || env.AUTH_JWT_SECRET || "",
-    videoMaxPromptLength: parseIntWithFallback(env.VIDEO_MAX_PROMPT_LENGTH, 2000),
+    videoMaxPromptLength: parseIntWithFallback(env.VIDEO_MAX_PROMPT_LENGTH, 4000),
     videoMaxUploadBytes: parseIntWithFallback(env.VIDEO_MAX_UPLOAD_MB, 50) * 1024 * 1024,
     videoMaxJobsPerUserPerDay: parseIntWithFallback(env.VIDEO_MAX_JOBS_PER_USER_PER_DAY, 20),
     videoMaxConcurrentJobsPerUser: parseIntWithFallback(env.VIDEO_MAX_CONCURRENT_JOBS_PER_USER, 3),
