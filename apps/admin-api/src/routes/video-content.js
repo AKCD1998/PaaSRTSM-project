@@ -12,6 +12,7 @@ const {
   ALLOWED_DURATIONS_BY_PROVIDER_MODEL,
   ALLOWED_PROVIDER_MODELS,
   MAX_UPLOAD_MIME_TYPES,
+  ASPECT_RATIO_TO_OPENAI_SIZE,
 } = require("../services/video-providers/videoStudioConstants");
 const {
   createVideoJob,
@@ -113,6 +114,11 @@ function createVideoContentRouter(deps) {
           providers,
           promptMaxLength: config.videoMaxPromptLength,
           usdToThbRate: config.usdToThbRate,
+          // OpenAI's image-to-video requires the input image to be EXACTLY this
+          // pixel size (confirmed by a live 400: "Inpaint image must match the
+          // requested width and height") — the frontend uses this to resize the
+          // uploaded image before sending it, rather than let every upload fail.
+          aspectRatioToOpenAiSize: ASPECT_RATIO_TO_OPENAI_SIZE,
         });
       } catch (error) {
         return next(error);
