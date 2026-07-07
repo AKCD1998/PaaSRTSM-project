@@ -1427,6 +1427,67 @@ function createBranchStockRouter(deps) {
     }
   });
 
+  // Accumulate-mode history: reads ada.stock_snapshots, an insert-only ledger
+  // (unique key includes snapshot_at) populated by the branch_stock_history sync
+  // dataset. Distinct from the overwrite-mode ada.branch_stock_snapshots table
+  // above, which stays the "current" view and is untouched by this route.
+  router.get("/branch-stock/history", requireAuthMiddleware, async (req, res, next) => {
+    const branchCode = normalizeNullableText(req.query.branch_code);
+    if (!branchCode) {
+      return res.status(400).json({ message: "branch_code is required." });
+    }
+    const productCode = normalizeNullableText(req.query.product_code);
+    const dateFrom = normalizeNullableText(req.query.date_from);
+    const dateTo = normalizeNullableText(req.query.date_to);
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({ message: "date_from and date_to are required (YYYY-MM-DD)." });
+    }
+
+    const params = [branchCode, dateFrom, dateTo];
+    let productFilter = "";
+    if (productCode) {
+      params.push(productCode);
+      productFilter = `AND ss.product_code = $${params.length}`;
+    }
+
+    try {
+      const result = await db.query(
+        `
+          SELECT
+            ss.snapshot_at,
+            ss.product_code,
+            COALESCE(p.product_name_th, ss.raw_payload->>'productNameThai') AS product_name_thai,
+            ss.qty_on_hand,
+            ss.unit_code
+          FROM ada.stock_snapshots ss
+          LEFT JOIN ada.products p ON p.product_code = ss.product_code
+          WHERE ss.branch_code = $1
+            AND ss.snapshot_at::date >= $2::date
+            AND ss.snapshot_at::date <= $3::date
+            ${productFilter}
+          ORDER BY ss.snapshot_at ASC, ss.product_code ASC
+        `,
+        params,
+      );
+
+      return res.json({
+        branchCode,
+        productCode: productCode || null,
+        dateFrom,
+        dateTo,
+        records: result.rows.map((row) => ({
+          snapshotAt: row.snapshot_at,
+          productCode: row.product_code,
+          productNameThai: row.product_name_thai || null,
+          qty: Number(row.qty_on_hand || 0),
+          unit: row.unit_code || null,
+        })),
+      });
+    } catch (routeError) {
+      return next(routeError);
+    }
+  });
+
   router.get(
     "/branch-stock/inventory-value",
     requireAuthMiddleware,

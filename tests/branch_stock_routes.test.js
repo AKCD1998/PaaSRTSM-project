@@ -89,6 +89,7 @@ function createBranchStockMockDb() {
     categoryStates: new Map(),
     productBarcodes: new Map(),
     uploads: new Map(),
+    stockSnapshots: [],
     txLog: [],
     auditActions: [],
   };
@@ -175,6 +176,26 @@ function createBranchStockMockDb() {
       if (normalized.startsWith("select product_code, product_name_thai, product_name_eng, barcode, unit, qty_branch_000")) {
         const row = state.snapshots.get(params[0]) || null;
         return { rowCount: row ? 1 : 0, rows: row ? [row] : [] };
+      }
+
+      if (normalized.startsWith("select ss.snapshot_at, ss.product_code")) {
+        const [branchCode, dateFrom, dateTo, productCode] = params;
+        const rows = state.stockSnapshots
+          .filter((row) => row.branch_code === branchCode)
+          .filter((row) => row.snapshot_at.slice(0, 10) >= dateFrom && row.snapshot_at.slice(0, 10) <= dateTo)
+          .filter((row) => !productCode || row.product_code === productCode)
+          .sort((a, b) => a.snapshot_at.localeCompare(b.snapshot_at) || a.product_code.localeCompare(b.product_code))
+          .map((row) => {
+            const product = state.products.get(row.product_code) || null;
+            return {
+              snapshot_at: row.snapshot_at,
+              product_code: row.product_code,
+              product_name_thai: product?.product_name_th || row.raw_payload?.productNameThai || null,
+              qty_on_hand: row.qty_on_hand,
+              unit_code: row.unit_code || null,
+            };
+          });
+        return { rowCount: rows.length, rows };
       }
 
       if (normalized.startsWith("select branch_stock_upload_id, accepted_rows, rejected_rows, warnings from ada.branch_stock_uploads")) {
@@ -645,6 +666,32 @@ test("branch stock listing falls back to synced product metadata when snapshot f
   assert.equal(listResponse.body.records[0].barcode, "885000009999");
   assert.equal(listResponse.body.records[0].unit, "BOX");
   assert.equal(listResponse.body.records[0].qtyBranch000, 7);
+});
+
+test("branch stock history returns accumulated snapshots across dates without touching the current overwrite snapshot", async () => {
+  const { app, db } = createTestApp();
+  db.state.products.set("IC-002604", { product_name_th: "เภสัช ดูโอเซท 10 เม็ด" });
+  db.state.stockSnapshots.push(
+    { branch_code: "005", product_code: "IC-002604", snapshot_at: "2026-07-06T01:20:00.000Z", qty_on_hand: 24, unit_code: "แผง" },
+    { branch_code: "005", product_code: "IC-002604", snapshot_at: "2026-07-07T01:20:00.000Z", qty_on_hand: 23, unit_code: "แผง" },
+    { branch_code: "001", product_code: "IC-002604", snapshot_at: "2026-07-07T01:20:00.000Z", qty_on_hand: 5, unit_code: "แผง" },
+  );
+
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent.get(
+    "/api/branch-stock/history?branch_code=005&product_code=IC-002604&date_from=2026-07-01&date_to=2026-07-07",
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.body.records.length, 2);
+  assert.equal(response.body.records[0].qty, 24);
+  assert.equal(response.body.records[1].qty, 23);
+  assert.equal(response.body.records[1].productNameThai, "เภสัช ดูโอเซท 10 เม็ด");
+
+  // branch_code is required
+  const missingBranch = await agent.get("/api/branch-stock/history?date_from=2026-07-01&date_to=2026-07-07");
+  assert.equal(missingBranch.status, 400);
 });
 
 test("branch stock inventory value detail returns per-product average cost and inventory value for admins only", async () => {
