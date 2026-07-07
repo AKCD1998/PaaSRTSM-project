@@ -178,23 +178,39 @@ function createBranchStockMockDb() {
         return { rowCount: row ? 1 : 0, rows: row ? [row] : [] };
       }
 
-      if (normalized.startsWith("select ss.snapshot_at, ss.product_code")) {
-        const [branchCode, dateFrom, dateTo, productCode] = params;
-        const rows = state.stockSnapshots
-          .filter((row) => row.branch_code === branchCode)
-          .filter((row) => row.snapshot_at.slice(0, 10) >= dateFrom && row.snapshot_at.slice(0, 10) <= dateTo)
-          .filter((row) => !productCode || row.product_code === productCode)
-          .sort((a, b) => a.snapshot_at.localeCompare(b.snapshot_at) || a.product_code.localeCompare(b.product_code))
-          .map((row) => {
-            const product = state.products.get(row.product_code) || null;
-            return {
-              snapshot_at: row.snapshot_at,
-              product_code: row.product_code,
-              product_name_thai: product?.product_name_th || row.raw_payload?.productNameThai || null,
-              qty_on_hand: row.qty_on_hand,
-              unit_code: row.unit_code || null,
-            };
-          });
+      if (normalized.startsWith("select distinct on (ss.product_code, ss.branch_code)")) {
+        let paramIdx = 0;
+        const productCode = normalized.includes("ss.product_code = $") ? params[paramIdx++] : null;
+        const atFrom = normalized.includes("ss.snapshot_at >= $") ? params[paramIdx++] : null;
+        const atTo = normalized.includes("ss.snapshot_at <= $") ? params[paramIdx++] : null;
+        const sortDesc = normalized.trim().endsWith("desc");
+
+        let candidates = state.stockSnapshots.slice();
+        if (productCode) candidates = candidates.filter((row) => row.product_code === productCode);
+        if (atFrom) candidates = candidates.filter((row) => row.snapshot_at >= atFrom);
+        if (atTo) candidates = candidates.filter((row) => row.snapshot_at <= atTo);
+
+        const nearestByKey = new Map();
+        for (const row of candidates) {
+          const key = `${row.product_code}|${row.branch_code}`;
+          const existing = nearestByKey.get(key);
+          if (!existing || (sortDesc ? row.snapshot_at > existing.snapshot_at : row.snapshot_at < existing.snapshot_at)) {
+            nearestByKey.set(key, row);
+          }
+        }
+
+        const rows = [...nearestByKey.values()].map((row) => {
+          const product = state.products.get(row.product_code) || null;
+          return {
+            product_code: row.product_code,
+            branch_code: row.branch_code,
+            qty_on_hand: row.qty_on_hand,
+            unit_code: row.unit_code || null,
+            snapshot_at: row.snapshot_at,
+            product_name_thai: product?.product_name_th || row.raw_payload?.productNameThai || null,
+            barcode: null,
+          };
+        });
         return { rowCount: rows.length, rows };
       }
 
@@ -668,7 +684,7 @@ test("branch stock listing falls back to synced product metadata when snapshot f
   assert.equal(listResponse.body.records[0].qtyBranch000, 7);
 });
 
-test("branch stock history returns accumulated snapshots across dates without touching the current overwrite snapshot", async () => {
+test("branch stock history returns a wide per-product row across branches, without touching the current overwrite snapshot", async () => {
   const { app, db } = createTestApp();
   db.state.products.set("IC-002604", { product_name_th: "เภสัช ดูโอเซท 10 เม็ด" });
   db.state.stockSnapshots.push(
@@ -680,18 +696,22 @@ test("branch stock history returns accumulated snapshots across dates without to
   const agent = request.agent(app);
   await loginAsAdmin(agent);
 
-  const response = await agent.get(
-    "/api/branch-stock/history?branch_code=005&product_code=IC-002604&date_from=2026-07-01&date_to=2026-07-07",
-  );
-  assert.equal(response.status, 200);
-  assert.equal(response.body.records.length, 2);
-  assert.equal(response.body.records[0].qty, 24);
-  assert.equal(response.body.records[1].qty, 23);
-  assert.equal(response.body.records[1].productNameThai, "เภสัช ดูโอเซท 10 เม็ด");
+  // No at_from/at_to (cleared) -> latest snapshot per branch.
+  const latest = await agent.get("/api/branch-stock/history?product_code=IC-002604");
+  assert.equal(latest.status, 200);
+  assert.equal(latest.body.records.length, 1);
+  assert.equal(latest.body.records[0].qtyBranch005, 23);
+  assert.equal(latest.body.records[0].qtyBranch001, 5);
+  assert.equal(latest.body.records[0].qtyBranch003, null);
+  assert.equal(latest.body.records[0].qtyTotalAllBranches, 28);
+  assert.equal(latest.body.records[0].productNameThai, "เภสัช ดูโอเซท 10 เม็ด");
 
-  // branch_code is required
-  const missingBranch = await agent.get("/api/branch-stock/history?date_from=2026-07-01&date_to=2026-07-07");
-  assert.equal(missingBranch.status, 400);
+  // at_from anchors to the nearest snapshot at/after that point -> the older one.
+  const nearestAfter = await agent.get(
+    "/api/branch-stock/history?product_code=IC-002604&at_from=2026-07-05T00:00:00.000Z",
+  );
+  assert.equal(nearestAfter.status, 200);
+  assert.equal(nearestAfter.body.records[0].qtyBranch005, 24);
 });
 
 test("branch stock inventory value detail returns per-product average cost and inventory value for admins only", async () => {

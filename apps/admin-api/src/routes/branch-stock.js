@@ -1431,57 +1431,114 @@ function createBranchStockRouter(deps) {
   // (unique key includes snapshot_at) populated by the branch_stock_history sync
   // dataset. Distinct from the overwrite-mode ada.branch_stock_snapshots table
   // above, which stays the "current" view and is untouched by this route.
+  //
+  // Returns one row per product, wide across all branches (qty_branch_000..005
+  // + total) — same shape as the current-stock table above — rather than a
+  // per-branch list over a date range, so the two pages are directly
+  // comparable at a glance.
+  //
+  // Point-in-time semantics (not a literal date-range listing):
+  //   - at_from given: nearest snapshot AT OR AFTER at_from, capped at at_to
+  //     if also given (i.e. "closest to what I asked for, but not past my
+  //     upper bound").
+  //   - at_from omitted, at_to given: latest snapshot AT OR BEFORE at_to.
+  //   - neither given (cleared/cancelled): latest snapshot overall, per branch.
   router.get("/branch-stock/history", requireAuthMiddleware, async (req, res, next) => {
-    const branchCode = normalizeNullableText(req.query.branch_code);
-    if (!branchCode) {
-      return res.status(400).json({ message: "branch_code is required." });
-    }
     const productCode = normalizeNullableText(req.query.product_code);
-    const dateFrom = normalizeNullableText(req.query.date_from);
-    const dateTo = normalizeNullableText(req.query.date_to);
-    if (!dateFrom || !dateTo) {
-      return res.status(400).json({ message: "date_from and date_to are required (YYYY-MM-DD)." });
-    }
+    const atFrom = parseTimestamp(req.query.at_from);
+    const atTo = parseTimestamp(req.query.at_to);
 
-    const params = [branchCode, dateFrom, dateTo];
+    const params = [];
     let productFilter = "";
     if (productCode) {
       params.push(productCode);
       productFilter = `AND ss.product_code = $${params.length}`;
     }
+    let atFromFilter = "";
+    if (atFrom) {
+      params.push(atFrom);
+      atFromFilter = `AND ss.snapshot_at >= $${params.length}`;
+    }
+    let atToFilter = "";
+    if (atTo) {
+      params.push(atTo);
+      atToFilter = `AND ss.snapshot_at <= $${params.length}`;
+    }
+    // "Nearest after" wants the earliest qualifying snapshot; without a lower
+    // bound there's no "after" to be nearest to, so fall back to "latest
+    // qualifying snapshot" instead. Fixed literal, not user input.
+    const sortDirection = atFrom ? "ASC" : "DESC";
 
     try {
       const result = await db.query(
         `
-          SELECT
-            ss.snapshot_at,
+          SELECT DISTINCT ON (ss.product_code, ss.branch_code)
             ss.product_code,
-            COALESCE(p.product_name_th, ss.raw_payload->>'productNameThai') AS product_name_thai,
+            ss.branch_code,
             ss.qty_on_hand,
-            ss.unit_code
+            ss.unit_code,
+            ss.snapshot_at,
+            COALESCE(p.product_name_th, ss.raw_payload->>'productNameThai') AS product_name_thai,
+            COALESCE(pb.barcode, ss.raw_payload->>'barcode') AS barcode
           FROM ada.stock_snapshots ss
           LEFT JOIN ada.products p ON p.product_code = ss.product_code
-          WHERE ss.branch_code = $1
-            AND ss.snapshot_at::date >= $2::date
-            AND ss.snapshot_at::date <= $3::date
+          LEFT JOIN LATERAL (
+            SELECT barcode FROM ada.product_barcodes pb
+            WHERE pb.product_code = ss.product_code
+            ORDER BY CASE pb.barcode_role WHEN 'primary' THEN 0 ELSE 1 END, pb.updated_at DESC
+            LIMIT 1
+          ) pb ON TRUE
+          WHERE 1=1
             ${productFilter}
-          ORDER BY ss.snapshot_at ASC, ss.product_code ASC
+            ${atFromFilter}
+            ${atToFilter}
+          ORDER BY ss.product_code, ss.branch_code, ss.snapshot_at ${sortDirection}
         `,
         params,
       );
 
+      const byProduct = new Map();
+      for (const row of result.rows) {
+        const code = row.product_code;
+        if (!byProduct.has(code)) {
+          byProduct.set(code, {
+            productCode: code,
+            productNameThai: row.product_name_thai || null,
+            barcode: row.barcode || null,
+            unit: null,
+            branches: {},
+            total: 0,
+          });
+        }
+        const entry = byProduct.get(code);
+        const qty = Number(row.qty_on_hand || 0);
+        entry.branches[row.branch_code] = { qty, snapshotAt: row.snapshot_at };
+        entry.total += qty;
+        if (!entry.unit && row.unit_code) {
+          entry.unit = row.unit_code;
+        }
+      }
+
+      const records = [...byProduct.values()]
+        .map((entry) => ({
+          productCode: entry.productCode,
+          productNameThai: entry.productNameThai,
+          barcode: entry.barcode,
+          unit: entry.unit,
+          qtyBranch000: entry.branches["000"]?.qty ?? null,
+          qtyBranch001: entry.branches["001"]?.qty ?? null,
+          qtyBranch003: entry.branches["003"]?.qty ?? null,
+          qtyBranch004: entry.branches["004"]?.qty ?? null,
+          qtyBranch005: entry.branches["005"]?.qty ?? null,
+          qtyTotalAllBranches: entry.total,
+        }))
+        .sort((a, b) => a.productCode.localeCompare(b.productCode));
+
       return res.json({
-        branchCode,
         productCode: productCode || null,
-        dateFrom,
-        dateTo,
-        records: result.rows.map((row) => ({
-          snapshotAt: row.snapshot_at,
-          productCode: row.product_code,
-          productNameThai: row.product_name_thai || null,
-          qty: Number(row.qty_on_hand || 0),
-          unit: row.unit_code || null,
-        })),
+        atFrom: atFrom || null,
+        atTo: atTo || null,
+        records,
       });
     } catch (routeError) {
       return next(routeError);
