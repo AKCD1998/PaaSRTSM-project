@@ -450,6 +450,40 @@ function createSyncRouter(deps) {
     }
   });
 
+  // GET /api/sync/today-status?branchCode=005&datasetTag=branch_stock_history
+  // Lets the sync agent self-check before an evening (e.g. 19:20) run: "did a
+  // run for this branch already succeed today that included this dataset?"
+  // datasetTag matches against run-log message text (see runOnce() in
+  // adapos-sync/src/index.js, which includes the dataset list it ran in the
+  // message) since ingest.sync_runs has no structured per-dataset column.
+  // Used to skip a redundant full stock resync when the morning run already
+  // landed today's data — not to skip datasets that change throughout the day
+  // (e.g. sales_detail), which should always run regardless of this check.
+  router.get("/today-status", async (req, res, next) => {
+    try {
+      const branchCode = normalizeText(req.query?.branchCode);
+      const datasetTag = normalizeText(req.query?.datasetTag);
+      if (!branchCode || !datasetTag) {
+        return res.status(400).json({ message: "branchCode and datasetTag are required." });
+      }
+      const result = await db.query(
+        `
+          SELECT 1
+          FROM ingest.sync_runs
+          WHERE sync_type = $1
+            AND status = 'success'
+            AND (started_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+            AND message LIKE '%' || $2 || '%'
+          LIMIT 1
+        `,
+        [`adapos_branch_${branchCode}`, datasetTag],
+      );
+      return res.json({ branchCode, datasetTag, hasSuccessToday: result.rows.length > 0 });
+    } catch (e) {
+      return next(e);
+    }
+  });
+
   // POST /api/sync/heartbeat
   // Branch laptop's PS1 wrapper calls this when it wakes up at 22:00.
   // Records a row in ingest.laptop_heartbeats so the dashboard can tell
