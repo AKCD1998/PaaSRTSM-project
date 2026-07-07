@@ -103,6 +103,9 @@ function createInitialState() {
     receiptLines: [],
     events: [],
     txLog: [],
+    // key: `${branchCode}|${productCode}` -> current qty, simulating
+    // ada.branch_stock_snapshots for the packing-document live-stock lookup.
+    currentStock: new Map(),
     nextBatchId: 1,
     nextRequestId: 1,
     nextLineId: 1,
@@ -135,6 +138,7 @@ function cloneState(state) {
     receiptLines: state.receiptLines.map((row) => ({ ...row })),
     events: state.events.map((row) => ({ ...row })),
     txLog: [...state.txLog],
+    currentStock: new Map(state.currentStock),
     nextBatchId: state.nextBatchId,
     nextRequestId: state.nextRequestId,
     nextLineId: state.nextLineId,
@@ -808,6 +812,19 @@ function createStockRequestMockDb() {
       return { rowCount: 1, rows: [] };
     }
 
+    if (normalized.startsWith("select product_code,") && normalized.includes("from ada.branch_stock_snapshots")) {
+      const columnMatch = normalized.match(/select product_code, (qty_branch_\d{3}) as qty/);
+      const branchCode = columnMatch ? columnMatch[1].replace("qty_branch_", "") : null;
+      const productCodes = params[0] || [];
+      const rows = productCodes
+        .map((productCode) => {
+          const qty = state.currentStock.get(`${branchCode}|${productCode}`);
+          return qty == null ? null : { product_code: productCode, qty };
+        })
+        .filter(Boolean);
+      return { rowCount: rows.length, rows };
+    }
+
     throw new Error(`Unhandled mock query: ${normalized}`);
   }
 
@@ -1349,6 +1366,42 @@ test("cross-branch detail access is forbidden while admin can still read", async
   const adminIncoming = await adminAgent.get(`/api/stock-requests/incoming/${source003Request.publicId}`);
   assert.equal(adminIncoming.status, 200);
   assert.equal(adminIncoming.body.request.publicId, source003Request.publicId);
+});
+
+test("incoming request detail shows live current stock alongside the frozen ask-time snapshot", async () => {
+  const { app, db } = createTestApp();
+  const requesterAgent = request.agent(app);
+  const requesterCsrf = await login(requesterAgent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+  const submitResponse = await submitSampleBatch(requesterAgent, requesterCsrf, {
+    idempotencyKey: "stock-request:001:live-stock",
+  });
+  const source003Request = submitResponse.body.requests.find((item) => item.sourceBranchCode === "003");
+
+  // Stock at branch 003 moved on since the request was created (snapshotQty
+  // was 6 for 630010002 at creation time) — simulate it now sitting at 40,
+  // e.g. after a delivery, matching the "requested yesterday, picking today"
+  // scenario that motivated this fix.
+  db.state.currentStock.set("003|630010002", 40);
+
+  const sourceAgent = request.agent(app);
+  await login(sourceAgent, {
+    username: "branch003@example.com",
+    password: "branch-pass-003",
+  });
+  const detail = await sourceAgent.get(`/api/stock-requests/incoming/${source003Request.publicId}`);
+  assert.equal(detail.status, 200);
+
+  const line = detail.body.request.lines.find((item) => item.productCode === "630010002");
+  assert.equal(line.snapshotQty, 6, "frozen ask-time value must be preserved for admin audit");
+  assert.equal(line.currentQty, 40, "packing document should reflect live stock, not the stale snapshot");
+
+  // A product with no branch_stock_snapshots row yet (not synced) reports null,
+  // not zero or the stale snapshot — the frontend shows "-" for that.
+  const unsyncedLine = detail.body.request.lines.find((item) => item.productCode === "630010003");
+  assert.equal(unsyncedLine.currentQty, null);
 });
 
 async function setupIncomingForBranch003() {

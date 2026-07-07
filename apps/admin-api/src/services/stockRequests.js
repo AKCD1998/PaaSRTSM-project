@@ -441,6 +441,35 @@ async function loadBatchRowsByIds(dbLike, batchIds) {
   return result.rows;
 }
 
+// Fixed whitelist mapping branch code -> column name in the wide
+// ada.branch_stock_snapshots table. Only ever indexed by this literal object
+// (never by raw user input), so interpolating the resolved column name into
+// SQL below is safe.
+const CURRENT_STOCK_BRANCH_COLUMNS = {
+  "000": "qty_branch_000",
+  "001": "qty_branch_001",
+  "002": "qty_branch_002",
+  "003": "qty_branch_003",
+  "004": "qty_branch_004",
+  "005": "qty_branch_005",
+};
+
+// Live stock lookup for the packing-preview document: "how much does the
+// fulfilling branch actually have right now," as opposed to the frozen
+// snapshotQty captured when the request was created (see mapLineRow).
+async function loadCurrentStockQtyByProductCodes(dbLike, branchCode, productCodes) {
+  const column = CURRENT_STOCK_BRANCH_COLUMNS[branchCode];
+  const codes = [...new Set((productCodes || []).filter(Boolean))];
+  if (!column || codes.length === 0) {
+    return new Map();
+  }
+  const result = await dbLike.query(
+    `SELECT product_code, ${column} AS qty FROM ada.branch_stock_snapshots WHERE product_code = ANY($1::text[])`,
+    [codes],
+  );
+  return new Map(result.rows.map((row) => [row.product_code, row.qty == null ? null : Number(row.qty)]));
+}
+
 async function loadLineRowsByRequestIds(dbLike, requestIds) {
   const normalizedIds = [...new Set((requestIds || []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0))];
   if (!normalizedIds.length) {
@@ -808,7 +837,7 @@ function mapResponseRow(row) {
   };
 }
 
-function mapLineRow(row, responseRow) {
+function mapLineRow(row, responseRow, currentStockMap) {
   return {
     lineId: Number(row.line_id),
     productCode: row.product_code,
@@ -817,15 +846,20 @@ function mapLineRow(row, responseRow) {
     barcode: row.barcode || null,
     unit: row.unit,
     requestedQty: Number(row.requested_qty || 0),
+    // Frozen at request-creation time — kept for admin audit only ("what stock
+    // did the requester see when they decided to ask for this much"). The
+    // packing document shows currentQty instead, since staff picking stock
+    // days later need what's on the shelf NOW, not what it was when asked.
     snapshotQty: row.snapshot_qty == null ? null : Number(row.snapshot_qty),
     snapshotSyncedAt: row.snapshot_synced_at || null,
+    currentQty: currentStockMap ? currentStockMap.get(row.product_code) ?? null : null,
     status: row.status,
     createdAt: row.created_at,
     response: mapResponseRow(responseRow),
   };
 }
 
-function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId) {
+function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId, currentStockMap) {
   const requestMode = requestRow.request_mode || "STANDARD";
   return {
     requestId: Number(requestRow.request_id),
@@ -846,7 +880,7 @@ function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId) {
     version: Number(requestRow.version || 1),
     createdAt: requestRow.created_at,
     updatedAt: requestRow.updated_at,
-    lines: lineRows.map((lineRow) => mapLineRow(lineRow, responseMap.get(Number(lineRow.line_id)) || null)),
+    lines: lineRows.map((lineRow) => mapLineRow(lineRow, responseMap.get(Number(lineRow.line_id)) || null, currentStockMap)),
   };
 }
 
@@ -1250,12 +1284,18 @@ async function getIncomingStockRequestDetail({ db, auth, publicId }) {
     lineRows.map((row) => row.line_id),
   );
   const responseMap = new Map(responseRows.map((row) => [Number(row.line_id), row]));
+  const currentStockMap = await loadCurrentStockQtyByProductCodes(
+    db,
+    requestRow.source_branch_code,
+    lineRows.map((row) => row.product_code),
+  );
 
   return mapRequestDetailRow(
     requestRow,
     lineRows,
     responseMap,
     batchRow?.public_id || null,
+    currentStockMap,
   );
 }
 
