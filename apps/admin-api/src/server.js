@@ -21,6 +21,7 @@ const { createMeRouter } = require("./routes/me");
 const { createCipdataRouter } = require("./routes/cipdata");
 const { createProductsRouter } = require("./routes/products");
 const { createTaxonomyRouter } = require("./routes/taxonomy");
+const { createTaxonomyReviewRouter } = require("./routes/taxonomy-review");
 const { createImportsRouter } = require("./routes/imports");
 const { createEnrichmentRouter } = require("./routes/enrichment");
 const { createSearchRouter } = require("./routes/search");
@@ -290,6 +291,15 @@ function createApp(overrides = {}) {
     createMovementAnalyticsRouter({
       db,
       requireAuthMiddleware,
+    }),
+  );
+  app.use(
+    "/api/admin",
+    createTaxonomyReviewRouter({
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
     }),
   );
   app.use(
