@@ -94,7 +94,27 @@ function createMockDb() {
       }
 
       if (normalized.startsWith("select sh.branch_code, sh.doc_no as bill_no")) {
-        const [branchCode, productCode] = params;
+        const [branchCode, productCode, , , sqlLimit] = params;
+        if (productCode === "IC-MANYBILLS") {
+          // Simulate a hot-selling product with more bills than the cap —
+          // the mock DB honors LIMIT $5 just like real Postgres would, so
+          // the route's own truncation logic (slice to BILLS_CAP, set
+          // truncated=true) is what's actually under test here.
+          const manyRows = Array.from({ length: 600 }, (_, i) => ({
+            branch_code: "005",
+            bill_no: `S${String(i).padStart(4, "0")}`,
+            sale_date: "2026-07-01",
+            sale_time: "10:00:00",
+            cashier_code: null,
+            customer_code: null,
+            line_count: 1,
+            qty_total: 1,
+            net_amount_total: 10,
+            unit_name: null,
+            product_name: null,
+          })).slice(0, sqlLimit);
+          return { rowCount: manyRows.length, rows: manyRows };
+        }
         assert.equal(productCode, "IC-002604");
         const allBills = [
           { branch_code: "001", bill_no: "S001-01", sale_date: "2026-07-05", sale_time: "10:00:00", cashier_code: "u1", customer_code: null, line_count: 1, qty_total: 5, net_amount_total: 100, unit_name: "แผง", product_name: "เภสัช ดูโอเซท 10 เม็ด" },
@@ -145,4 +165,16 @@ test("branch-product-sales bills drilldown shows all branches when branch_code i
   assert.equal(oneBranch.status, 200);
   assert.equal(oneBranch.body.bills.length, 1);
   assert.equal(oneBranch.body.bills[0].branch_code, "005");
+});
+
+test("branch-product-sales bills drilldown caps at 500 rows for a hot-selling product", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent.get("/api/admin/branch-product-sales/IC-MANYBILLS/bills?date_from=2026-07-01&date_to=2026-07-07");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.bills.length, 500);
+  assert.equal(response.body.truncated, true);
+  assert.equal(response.body.cap, 500);
 });

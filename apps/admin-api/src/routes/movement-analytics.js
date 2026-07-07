@@ -286,6 +286,10 @@ function createMovementAnalyticsRouter(deps) {
     const branchCode = normalizeText(req.query.branch_code) || null;
     const dateFrom = normalizeText(req.query.date_from) || null;
     const dateTo = normalizeText(req.query.date_to) || null;
+    // Drilldown is for eyeballing recent activity, not exporting full
+    // history — cap it so a hot-selling product over a wide date range
+    // can't hand the browser thousands of rows to render in one table.
+    const BILLS_CAP = 500;
 
     if (!productCode) return res.status(400).json({ message: "product_code is required." });
 
@@ -315,10 +319,13 @@ function createMovementAnalyticsRouter(deps) {
           AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
         GROUP BY sh.branch_code, sh.doc_no, sh.doc_date, sh.doc_time, sh.cashier_code, sh.customer_code
         ORDER BY sh.doc_date DESC, sh.doc_time DESC, sh.doc_no DESC
+        LIMIT $5
       `;
 
-      const result = await db.query(sql, [branchCode, productCode, dateFrom || null, dateTo || null]);
-      const bills = result.rows.map((row) => ({
+      const result = await db.query(sql, [branchCode, productCode, dateFrom || null, dateTo || null, BILLS_CAP + 1]);
+      const truncated = result.rows.length > BILLS_CAP;
+      const limitedRows = truncated ? result.rows.slice(0, BILLS_CAP) : result.rows;
+      const bills = limitedRows.map((row) => ({
         branch_code: row.branch_code,
         bill_no: row.bill_no,
         sale_date: row.sale_date,
@@ -338,6 +345,8 @@ function createMovementAnalyticsRouter(deps) {
         date_from: dateFrom,
         date_to: dateTo,
         bills,
+        truncated,
+        cap: BILLS_CAP,
       });
     } catch (error) {
       return next(error);
