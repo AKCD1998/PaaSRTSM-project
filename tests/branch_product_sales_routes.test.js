@@ -93,6 +93,14 @@ function createMockDb() {
         return { rowCount: rows.length, rows };
       }
 
+      if (normalized.startsWith("select branch_code, min(doc_date)")) {
+        const rows = [
+          { branch_code: "001", earliest_date: "2026-05-01", latest_date: "2026-07-07", bill_count: 100 },
+          { branch_code: "005", earliest_date: "2026-05-01", latest_date: "2026-07-07", bill_count: 5034 },
+        ];
+        return { rowCount: rows.length, rows };
+      }
+
       if (normalized.startsWith("select sh.branch_code, sh.doc_no as bill_no")) {
         const [branchCode, productCode, , , sqlLimit] = params;
         if (productCode === "IC-MANYBILLS") {
@@ -150,6 +158,13 @@ test("branch-product-sales returns a wide row per product across branches, no br
   // Zero-sale product still shows up as an explicit 0, not omitted.
   const zeroSale = response.body.products.find((p) => p.product_code === "630010001");
   assert.equal(zeroSale.qty_total, 0);
+
+  // Sync coverage is reported per branch and is NOT scoped by date_from/date_to
+  // above (2026-07-01..07) — it always reflects the true earliest/latest
+  // synced date, e.g. from the mock's 2026-05-01..07-07 range.
+  const coverage005 = response.body.data_coverage_by_branch.find((c) => c.branch_code === "005");
+  assert.equal(coverage005.earliest_date, "2026-05-01");
+  assert.equal(coverage005.latest_date, "2026-07-07");
 });
 
 test("branch-product-sales bills drilldown shows all branches when branch_code is omitted, or one branch when given", async () => {

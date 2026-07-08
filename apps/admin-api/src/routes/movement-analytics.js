@@ -246,8 +246,29 @@ function createMovementAnalyticsRouter(deps) {
         LIMIT $4 OFFSET $5
       `;
 
-      const result = await db.query(sql, [dateFrom || null, dateTo || null, search, effectiveLimit, offset]);
+      // Sync coverage per branch — deliberately NOT scoped by dateFrom/dateTo,
+      // so "what date range has actually synced in" stays answerable
+      // regardless of whatever window the user currently has selected.
+      const coverageSql = `
+        SELECT branch_code, MIN(doc_date) AS earliest_date, MAX(doc_date) AS latest_date, COUNT(*)::int AS bill_count
+        FROM ada.sales_headers
+        WHERE COALESCE(NULLIF(raw_payload->>'FTShdDocType', ''), '1') = '1'
+          AND COALESCE(NULLIF(raw_payload->>'FTShdStaPaid', ''), paid_status, '') = '3'
+        GROUP BY branch_code
+        ORDER BY branch_code
+      `;
+
+      const [result, coverageResult] = await Promise.all([
+        db.query(sql, [dateFrom || null, dateTo || null, search, effectiveLimit, offset]),
+        db.query(coverageSql),
+      ]);
       const total = Number(result.rows[0]?.total_count || 0);
+      const dataCoverageByBranch = coverageResult.rows.map((row) => ({
+        branch_code: row.branch_code,
+        earliest_date: row.earliest_date,
+        latest_date: row.latest_date,
+        bill_count: Number(row.bill_count || 0),
+      }));
 
       const products = result.rows.map((row) => ({
         product_code: row.product_code,
@@ -271,6 +292,7 @@ function createMovementAnalyticsRouter(deps) {
         total,
         offset,
         limit: effectiveLimit,
+        data_coverage_by_branch: dataCoverageByBranch,
       });
     } catch (error) {
       return next(error);
