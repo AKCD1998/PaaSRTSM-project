@@ -158,13 +158,19 @@ test("branch-product-sales returns a wide row per product across branches, no br
   // Zero-sale product still shows up as an explicit 0, not omitted.
   const zeroSale = response.body.products.find((p) => p.product_code === "630010001");
   assert.equal(zeroSale.qty_total, 0);
+});
 
-  // Sync coverage is reported per branch and is NOT scoped by date_from/date_to
-  // above (2026-07-01..07) — it always reflects the true earliest/latest
-  // synced date, e.g. from the mock's 2026-05-01..07-07 range.
+test("sales-sync-coverage reports per-branch earliest/latest synced date, independent of any date filter", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+  await loginAsAdmin(agent);
+
+  const response = await agent.get("/api/admin/sales-sync-coverage");
+  assert.equal(response.status, 200);
   const coverage005 = response.body.data_coverage_by_branch.find((c) => c.branch_code === "005");
   assert.equal(coverage005.earliest_date, "2026-05-01");
   assert.equal(coverage005.latest_date, "2026-07-07");
+  assert.equal(coverage005.bill_count, 5034);
 });
 
 test("branch-product-sales bills drilldown shows all branches when branch_code is omitted, or one branch when given", async () => {
