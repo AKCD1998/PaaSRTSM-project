@@ -1256,7 +1256,7 @@ test("submit rolls back atomically when a later line insert fails", async () => 
 });
 
 test("requesting branch can list mine, read batch detail, and read batch events", async () => {
-  const { app } = createTestApp();
+  const { app, db } = createTestApp();
   const requesterAgent = request.agent(app);
   const csrfToken = await login(requesterAgent, {
     username: "branch001@example.com",
@@ -1267,6 +1267,12 @@ test("requesting branch can list mine, read batch detail, and read batch events"
     idempotencyKey: "stock-request:001:read-mine",
   });
   const batchPublicId = submitResponse.body.batchPublicId;
+
+  // Live current-stock lookup for two different source branches within the
+  // same batch — the requester should see each source branch's own live
+  // number, not the frozen ask-time snapshot.
+  db.state.currentStock.set("000|630010001", 9);
+  db.state.currentStock.set("003|630010002", 40);
 
   const mineResponse = await requesterAgent.get("/api/stock-requests/mine");
   assert.equal(mineResponse.status, 200);
@@ -1283,6 +1289,15 @@ test("requesting branch can list mine, read batch detail, and read batch events"
   assert.equal(detailResponse.body.batch.requests.length, 2);
   assert.equal(detailResponse.body.batch.requests[1].lines.length, 2);
   assert.equal(detailResponse.body.batch.requests[1].lines[0].response, null);
+  assert.equal(detailResponse.body.batch.requests[0].sourceBranchCode, "000");
+  assert.equal(detailResponse.body.batch.requests[0].lines[0].currentQty, 9);
+  assert.equal(detailResponse.body.batch.requests[1].sourceBranchCode, "003");
+  assert.equal(detailResponse.body.batch.requests[1].lines[0].currentQty, 40);
+  assert.equal(
+    detailResponse.body.batch.requests[1].lines[1].currentQty,
+    null,
+    "product with no branch_stock_snapshots row reports null, not the frozen snapshot",
+  );
 
   const eventsResponse = await requesterAgent.get(`/api/stock-requests/${batchPublicId}/events`);
   assert.equal(eventsResponse.status, 200);

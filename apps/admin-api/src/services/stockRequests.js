@@ -884,7 +884,7 @@ function mapRequestDetailRow(requestRow, lineRows, responseMap, batchPublicId, c
   };
 }
 
-function mapBatchDetail(batchRow, requestRows, lineRows, responseRows) {
+function mapBatchDetail(batchRow, requestRows, lineRows, responseRows, currentStockMapByBranch) {
   const lineRowsByRequestId = new Map();
   for (const lineRow of lineRows) {
     const requestId = Number(lineRow.request_id);
@@ -901,6 +901,7 @@ function mapBatchDetail(batchRow, requestRows, lineRows, responseRows) {
       lineRowsByRequestId.get(Number(requestRow.request_id)) || [],
       responseMap,
       batchRow.public_id,
+      currentStockMapByBranch ? currentStockMapByBranch.get(requestRow.source_branch_code) : null,
     ),
   );
 
@@ -1228,7 +1229,39 @@ async function getStockRequestBatchDetail({ db, auth, publicId }) {
     lineRows.map((row) => row.line_id),
   );
 
-  return mapBatchDetail(batchRow, requestRows, lineRows, responseRows);
+  // Each child request can target a different source (fulfilling) branch, so
+  // the live stock lookup is done per branch, over just that branch's lines —
+  // same reasoning as getIncomingStockRequestDetail: the requester needs to
+  // see what the fulfilling branch has on the shelf NOW, not the ask-time
+  // snapshot (see mapLineRow).
+  const productCodesByBranch = new Map();
+  const lineRowsByRequestIdForStock = new Map();
+  for (const lineRow of lineRows) {
+    const requestId = Number(lineRow.request_id);
+    if (!lineRowsByRequestIdForStock.has(requestId)) {
+      lineRowsByRequestIdForStock.set(requestId, []);
+    }
+    lineRowsByRequestIdForStock.get(requestId).push(lineRow);
+  }
+  for (const requestRow of requestRows) {
+    const branchCode = requestRow.source_branch_code;
+    if (!productCodesByBranch.has(branchCode)) {
+      productCodesByBranch.set(branchCode, new Set());
+    }
+    const requestLines = lineRowsByRequestIdForStock.get(Number(requestRow.request_id)) || [];
+    for (const lineRow of requestLines) {
+      productCodesByBranch.get(branchCode).add(lineRow.product_code);
+    }
+  }
+  const currentStockMapByBranch = new Map();
+  for (const [branchCode, codesSet] of productCodesByBranch) {
+    currentStockMapByBranch.set(
+      branchCode,
+      await loadCurrentStockQtyByProductCodes(db, branchCode, [...codesSet]),
+    );
+  }
+
+  return mapBatchDetail(batchRow, requestRows, lineRows, responseRows, currentStockMapByBranch);
 }
 
 async function listIncomingStockRequests({ db, auth, search, filterBranchCode }) {
