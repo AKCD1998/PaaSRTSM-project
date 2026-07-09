@@ -288,7 +288,13 @@ function createSyncRouter(deps) {
     const client = await db.connect();
     try {
       await client.query("BEGIN");
-      for (const record of records) {
+      // Process in a stable, deterministic order so concurrent sync requests
+      // that touch overlapping products lock rows in the same order and
+      // don't deadlock against each other.
+      const sortedRecords = [...records].sort((a, b) =>
+        normalizeText(a.productCode).localeCompare(normalizeText(b.productCode)),
+      );
+      for (const record of sortedRecords) {
         // eslint-disable-next-line no-await-in-loop
         await upsertProductRecord(client, record);
       }
