@@ -217,7 +217,7 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
   const unfrozenRows = focusRows.filter((row) => !row.frozen_at);
   const rangeGroups = new Map(); // "dateFrom|dateTo" -> Set<productCode>
   for (const row of unfrozenRows) {
-    const key = `${row.date_from}|${row.date_to}`;
+    const key = `${toIsoDateOnly(row.date_from)}|${toIsoDateOnly(row.date_to)}`;
     if (!rangeGroups.has(key)) rangeGroups.set(key, new Set());
     rangeGroups.get(key).add(row.product_code);
   }
@@ -238,7 +238,7 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
       soldByBranch = row.frozen_sold_by_branch || {};
       isFrozen = true;
     } else {
-      const key = `${row.date_from}|${row.date_to}`;
+      const key = `${toIsoDateOnly(row.date_from)}|${toIsoDateOnly(row.date_to)}`;
       soldByBranch = batchByRange.get(key)?.get(row.product_code) || {};
       if (toIsoDateOnly(row.date_to) < today) {
         const totalSold = Object.values(soldByBranch).reduce((sum, v) => sum + v, 0);
