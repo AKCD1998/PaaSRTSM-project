@@ -124,26 +124,32 @@ async function fetchProductNames(db, productCodes) {
   return map;
 }
 
-// Sold qty per branch for a product within a date range, from raw AdaPOS evidence.
-async function fetchSoldQtyByBranch(db, productCode, dateFrom, dateTo) {
+// Sold qty per branch for a batch of products sharing one date range, from raw
+// AdaPOS evidence — one query per distinct date range rather than one per row,
+// since sequential per-row queries (the original design) took minutes once
+// dozens of focus rows existed. Returns Map<productCode, {branchCode: qty}>.
+async function fetchSoldQtyBatch(db, productCodes, dateFrom, dateTo) {
+  if (!productCodes.length) return new Map();
   const result = await db.query(
     `SELECT
+       sl.product_code,
        sh.branch_code,
        SUM(COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0)))::numeric AS sold_qty
      FROM ada.sales_lines sl
      JOIN ada.sales_headers sh
        ON sh.branch_code = sl.branch_code
       AND sh.doc_no = sl.doc_no
-     WHERE sl.product_code = $1
+     WHERE sl.product_code = ANY($1)
        AND sh.doc_date BETWEEN $2 AND $3
        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
-     GROUP BY sh.branch_code`,
-    [productCode, dateFrom, dateTo],
+     GROUP BY sl.product_code, sh.branch_code`,
+    [productCodes, dateFrom, dateTo],
   );
-  const map = {};
+  const map = new Map();
   for (const row of result.rows) {
-    map[row.branch_code] = Number(row.sold_qty);
+    if (!map.has(row.product_code)) map.set(row.product_code, {});
+    map.get(row.product_code)[row.branch_code] = Number(row.sold_qty);
   }
   return map;
 }
@@ -204,6 +210,23 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
   const nameMap = await fetchProductNames(db, productCodes);
   const today = todayBangkokIso();
 
+  // Frozen rows never need a live sales query. Unfrozen rows are grouped by
+  // (dateFrom, dateTo) — usually just one group, since most focus rows share
+  // a month's date range — so we run one batched query per distinct range
+  // instead of one query per row.
+  const unfrozenRows = focusRows.filter((row) => !row.frozen_at);
+  const rangeGroups = new Map(); // "dateFrom|dateTo" -> Set<productCode>
+  for (const row of unfrozenRows) {
+    const key = `${row.date_from}|${row.date_to}`;
+    if (!rangeGroups.has(key)) rangeGroups.set(key, new Set());
+    rangeGroups.get(key).add(row.product_code);
+  }
+  const batchByRange = new Map(); // "dateFrom|dateTo" -> Map<productCode, {branchCode: qty}>
+  for (const [key, codes] of rangeGroups) {
+    const [dateFrom, dateTo] = key.split("|");
+    batchByRange.set(key, await fetchSoldQtyBatch(db, [...codes], dateFrom, dateTo));
+  }
+
   const results = [];
   for (const row of focusRows) {
     const branchCodes = normalizeBranchCodes(row.branch_codes) || allActiveBranchCodes;
@@ -215,7 +238,8 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
       soldByBranch = row.frozen_sold_by_branch || {};
       isFrozen = true;
     } else {
-      soldByBranch = await fetchSoldQtyByBranch(db, row.product_code, row.date_from, row.date_to);
+      const key = `${row.date_from}|${row.date_to}`;
+      soldByBranch = batchByRange.get(key)?.get(row.product_code) || {};
       if (toIsoDateOnly(row.date_to) < today) {
         const totalSold = Object.values(soldByBranch).reduce((sum, v) => sum + v, 0);
         const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold);

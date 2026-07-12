@@ -84,7 +84,14 @@ function createMockDb() {
         return { rowCount: 1, rows: [{ product_code: params[0][0], product_name: "สาบัญ ทูน่า วิ๊ส" }] };
       }
       if (q.includes("from ada.sales_lines sl")) {
-        return { rowCount: 2, rows: [{ branch_code: "001", sold_qty: "10" }, { branch_code: "003", sold_qty: "5" }] };
+        // Batched query: WHERE sl.product_code = ANY($1) — echo the same fixed
+        // sold-qty shape (001:10, 003:5) for every requested product code.
+        const codes = Array.isArray(params[0]) ? params[0] : [params[0]];
+        const rows = codes.flatMap((code) => [
+          { product_code: code, branch_code: "001", sold_qty: "10" },
+          { product_code: code, branch_code: "003", sold_qty: "5" },
+        ]);
+        return { rowCount: rows.length, rows };
       }
       if (q.startsWith("insert into focus.focus_products")) {
         const id = state.nextId++;
