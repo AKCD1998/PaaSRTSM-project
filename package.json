@@ -9,6 +9,7 @@
     "derive:ada-foundations": "node scripts/derive_ada_foundations.js",
     "derive:ada-analytics": "node scripts/derive_ada_analytics.js",
     "derive:ada-analytics:standard": "node scripts/derive_ada_analytics_standard.js",
+    "derive:stock-recommendations": "node scripts/derive_stock_recommendations.js",
     "derive:ada-reconciliation": "node scripts/derive_ada_reconciliation.js",
     "sync:ada-agent": "node scripts/ada_sync_agent.js",
     "import:adapos": "node scripts/import_adapos_csv.js",

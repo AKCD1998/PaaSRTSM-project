@@ -273,8 +273,103 @@ async function resolveAnchorDate(db, filters) {
   return normalizedLatestDate;
 }
 
-async function loadCurrentStockByProduct(db, { search }) {
-  const normalizedSearch = normalizeLowerText(search || "");
+function buildBranchQtyPositiveSql(branchCodes, alias = "bs") {
+  const parts = branchCodes
+    .filter((branchCode) => BRANCH_SNAPSHOT_COLUMNS[branchCode])
+    .map((branchCode) => `COALESCE(${alias}.${BRANCH_SNAPSHOT_COLUMNS[branchCode].qty}, 0) > 0`);
+  return parts.length ? `(${parts.join(" OR ")})` : "FALSE";
+}
+
+async function loadCandidateProductCodes(db, { scope, search, anchorDate }) {
+  const normalizedSearch = normalizeText(search || "");
+  const productCodes = new Set();
+
+  if (normalizedSearch) {
+    const searchResult = await db.query(
+      `
+        SELECT DISTINCT bs.product_code
+        FROM ada.branch_stock_snapshots bs
+        LEFT JOIN ada.products p
+          ON p.product_code = bs.product_code
+        LEFT JOIN LATERAL (
+          SELECT barcode
+          FROM ada.product_barcodes pb
+          WHERE pb.product_code = bs.product_code
+          ORDER BY
+            CASE pb.barcode_role
+              WHEN 'primary' THEN 0
+              ELSE 1
+            END,
+            pb.updated_at DESC,
+            pb.barcode ASC
+          LIMIT 1
+        ) pb ON TRUE
+        WHERE bs.product_code ILIKE '%' || $1 || '%'
+           OR COALESCE(bs.product_name_thai, p.product_name_th, bs.product_name_eng, p.product_name, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(bs.barcode, pb.barcode, '') ILIKE '%' || $1 || '%'
+        ORDER BY bs.product_code ASC
+      `,
+      [normalizedSearch],
+    );
+    for (const row of searchResult.rows) {
+      if (row.product_code) productCodes.add(String(row.product_code));
+    }
+  }
+
+  const stockResult = await db.query(
+    `
+      SELECT bs.product_code
+      FROM ada.branch_stock_snapshots bs
+      WHERE ${buildBranchQtyPositiveSql(scope.branchCodes)}
+      ORDER BY bs.product_code ASC
+    `,
+  );
+  for (const row of stockResult.rows) {
+    if (row.product_code) productCodes.add(String(row.product_code));
+  }
+
+  const salesResult = await db.query(
+    `
+      SELECT DISTINCT product_code
+      FROM analytics.product_sales_summary_periods
+      WHERE branch_code = ANY($1::text[])
+        AND period_end = $2::date
+        AND period_days IN (30, 90)
+        AND sold_qty_base > 0
+    `,
+    [scope.activeBranchCodes, anchorDate],
+  );
+  for (const row of salesResult.rows) {
+    if (row.product_code) productCodes.add(String(row.product_code));
+  }
+
+  const incomingResult = await db.query(
+    `
+      SELECT DISTINCT product_code
+      FROM (
+        SELECT l.product_code
+        FROM ada.pending_receipt_lines l
+        JOIN ada.pending_receipt_headers h
+          ON h.doc_no = l.doc_no
+        UNION
+        SELECT l.product_code
+        FROM ada.approved_receipt_lines l
+        JOIN ada.approved_receipt_headers h
+          ON h.doc_no = l.doc_no
+      ) incoming
+    `,
+  );
+  for (const row of incomingResult.rows) {
+    if (row.product_code) productCodes.add(String(row.product_code));
+  }
+
+  return [...productCodes].sort();
+}
+
+async function loadCurrentStockByProduct(db, { productCodes }) {
+  if (!Array.isArray(productCodes) || productCodes.length === 0) {
+    return [];
+  }
   const result = await db.query(
     `
       SELECT
@@ -312,15 +407,10 @@ async function loadCurrentStockByProduct(db, { search }) {
           pb.barcode ASC
         LIMIT 1
       ) pb ON TRUE
-      WHERE (
-        $1::text = ''
-        OR bs.product_code ILIKE '%' || $1 || '%'
-        OR COALESCE(bs.product_name_thai, p.product_name_th, bs.product_name_eng, p.product_name, '') ILIKE '%' || $1 || '%'
-        OR COALESCE(bs.barcode, pb.barcode, '') ILIKE '%' || $1 || '%'
-      )
+      WHERE bs.product_code = ANY($1::text[])
       ORDER BY bs.product_code ASC
     `,
-    [normalizedSearch],
+    [productCodes],
   );
 
   return result.rows.map((row) => ({
@@ -426,6 +516,48 @@ async function loadIncomingReceiptAggByProduct(db, { productCodes, mode = "pendi
     map.set(row.product_code, numberOrZero(row.incoming_qty_total));
   }
   return map;
+}
+
+function mapSnapshotRow(row) {
+  return {
+    branchCode: row.branch_code,
+    branchLabel: row.branch_label || `สาขา ${row.branch_code}`,
+    productCode: row.product_code,
+    productNameThai: row.product_name_thai || row.product_code,
+    productNameEng: row.product_name_eng || row.product_code,
+    barcode: row.barcode || null,
+    unit: row.unit || null,
+    currentStock: numberOrZero(row.current_stock),
+    unitCostAvg: numberOrNull(row.unit_cost_avg),
+    inventoryValue: numberOrZero(row.inventory_value),
+    soldQty30d: numberOrZero(row.sold_qty_30d),
+    soldQty90d: numberOrZero(row.sold_qty_90d),
+    soldQtySamePeriodLastYear: row.sold_qty_same_period_last_year == null ? null : numberOrZero(row.sold_qty_same_period_last_year),
+    adu30: numberOrZero(row.adu_30),
+    adu90: numberOrZero(row.adu_90),
+    trendRatio30Vs90: numberOrNull(row.trend_ratio_30_vs_90),
+    adjustedAdu: numberOrZero(row.adjusted_adu),
+    incomingPoQtyTotal: numberOrZero(row.incoming_po_qty_total),
+    incomingPoAllocationQty: numberOrZero(row.incoming_po_allocation_qty),
+    effectiveStock: numberOrZero(row.effective_stock),
+    currentDaysCover: numberOrNull(row.current_days_cover),
+    effectiveDaysCover: numberOrNull(row.effective_days_cover),
+    targetDays: Number(row.target_days || 90),
+    targetQty: numberOrZero(row.target_qty),
+    surplusQty: numberOrZero(row.surplus_qty),
+    shortageQty: numberOrZero(row.shortage_qty),
+    transferPlanQty: numberOrZero(row.transfer_plan_qty),
+    purchaseQty: numberOrZero(row.purchase_qty),
+    priorityScore: numberOrZero(row.priority_score),
+    action: row.action,
+    reason: row.recommendation_reason || "",
+    recommendationReason: row.recommendation_reason || "",
+    flags: Array.isArray(row.recommendation_flags) ? row.recommendation_flags : [],
+    donors: Array.isArray(row.donors_json) ? row.donors_json : [],
+    primarySuggestedDonorBranchCode: row.primary_suggested_donor_branch_code || null,
+    syncedAt: row.synced_at || null,
+    generatedAt: row.generated_at || null,
+  };
 }
 
 function buildBranchMetricsByProduct({ stockRow, salesAggByProductBranch, incomingByProduct, scope, policy }) {
@@ -754,14 +886,204 @@ function buildBranchSummaries(rows, activeBranches) {
   });
 }
 
-async function computeRecommendationDataset(db, auth, filters = {}) {
+function buildSnapshotOrderBy(sort) {
+  switch (sort) {
+    case "days_cover_asc":
+      return "effective_days_cover ASC NULLS LAST, product_code ASC, branch_code ASC";
+    case "inventory_value_desc":
+      return "inventory_value DESC NULLS LAST, product_code ASC, branch_code ASC";
+    case "product_code_asc":
+      return "product_code ASC, branch_code ASC";
+    case "priority_desc":
+    default:
+      return "priority_score DESC NULLS LAST, shortage_qty DESC NULLS LAST, product_code ASC, branch_code ASC";
+  }
+}
+
+async function resolveSnapshotMeta(db, { scope, targetDays, anchorDate }) {
+  const result = await db.query(
+    `
+      SELECT
+        anchor_date,
+        target_days,
+        COUNT(*)::int AS row_count,
+        MAX(generated_at) AS generated_at
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = ANY($1::text[])
+        AND target_days = $2
+        AND anchor_date = $3::date
+      GROUP BY anchor_date, target_days
+      LIMIT 1
+    `,
+    [scope.branchCodes, targetDays, anchorDate],
+  );
+  return result.rows[0] || null;
+}
+
+async function listPrecomputedStockRecommendations(db, dataset) {
+  const { scope, filters, anchorDate, policy } = dataset;
+  const search = normalizeText(filters.search || "");
+  const action = filters.action || null;
+  const orderBy = buildSnapshotOrderBy(filters.sort);
+
+  const summaryResult = await db.query(
+    `
+      WITH filtered AS (
+        SELECT *
+        FROM ordering.stock_recommendation_snapshots
+        WHERE branch_code = ANY($1::text[])
+          AND target_days = $2
+          AND anchor_date = $3::date
+          AND ($4::text = ''
+            OR product_code ILIKE '%' || $4 || '%'
+            OR COALESCE(product_name_thai, product_name_eng, '') ILIKE '%' || $4 || '%'
+            OR COALESCE(barcode, '') ILIKE '%' || $4 || '%')
+          AND ($5::text IS NULL OR action = $5)
+      )
+      SELECT
+        COUNT(*)::int AS sku_count,
+        COUNT(*) FILTER (WHERE action = 'TRANSFER_IN')::int AS recommend_transfer_count,
+        COUNT(*) FILTER (WHERE action = 'PURCHASE')::int AS recommend_purchase_count,
+        COUNT(*) FILTER (WHERE action = 'TRANSFER_AND_PURCHASE')::int AS recommend_mixed_count,
+        COUNT(*) FILTER (WHERE action = 'NO_PURCHASE_SLOW_MOVING')::int AS slow_moving_count,
+        COALESCE(SUM(inventory_value), 0)::numeric AS current_inventory_value,
+        COALESCE(SUM(COALESCE(unit_cost_avg, 0) * COALESCE(target_qty, 0)), 0)::numeric AS projected_inventory_value_at_target,
+        COALESCE(SUM(GREATEST(COALESCE(inventory_value, 0) - (COALESCE(unit_cost_avg, 0) * COALESCE(target_qty, 0)), 0)), 0)::numeric AS potential_reduction_value
+      FROM filtered
+    `,
+    [scope.branchCodes, policy.targetDays, anchorDate, search, action],
+  );
+
+  const rowsResult = await db.query(
+    `
+      SELECT *
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = ANY($1::text[])
+        AND target_days = $2
+        AND anchor_date = $3::date
+        AND ($4::text = ''
+          OR product_code ILIKE '%' || $4 || '%'
+          OR COALESCE(product_name_thai, product_name_eng, '') ILIKE '%' || $4 || '%'
+          OR COALESCE(barcode, '') ILIKE '%' || $4 || '%')
+        AND ($5::text IS NULL OR action = $5)
+      ORDER BY ${orderBy}
+      LIMIT $6 OFFSET $7
+    `,
+    [scope.branchCodes, policy.targetDays, anchorDate, search, action, filters.pageSize, filters.offset],
+  );
+
+  return {
+    summary: {
+      skuCount: Number(summaryResult.rows[0]?.sku_count || 0),
+      recommendTransferCount: Number(summaryResult.rows[0]?.recommend_transfer_count || 0),
+      recommendPurchaseCount: Number(summaryResult.rows[0]?.recommend_purchase_count || 0),
+      recommendMixedCount: Number(summaryResult.rows[0]?.recommend_mixed_count || 0),
+      slowMovingCount: Number(summaryResult.rows[0]?.slow_moving_count || 0),
+      currentInventoryValue: numberOrZero(summaryResult.rows[0]?.current_inventory_value),
+      projectedInventoryValueAtTarget: numberOrZero(summaryResult.rows[0]?.projected_inventory_value_at_target),
+      potentialReductionValue: numberOrZero(summaryResult.rows[0]?.potential_reduction_value),
+    },
+    rows: rowsResult.rows.map(mapSnapshotRow),
+    total: Number(summaryResult.rows[0]?.sku_count || 0),
+  };
+}
+
+async function loadPrecomputedBranchSummaries(db, dataset) {
+  const { scope, anchorDate, policy } = dataset;
+  const branchResult = await db.query(
+    `
+      SELECT
+        branch_code,
+        MAX(branch_label) AS branch_label,
+        COALESCE(SUM(inventory_value), 0)::numeric AS current_inventory_value,
+        AVG(current_days_cover) FILTER (WHERE current_days_cover IS NOT NULL)::numeric AS average_days_cover,
+        COUNT(*) FILTER (WHERE action = 'TRANSFER_IN')::int AS recommend_transfer_count,
+        COUNT(*) FILTER (WHERE action IN ('PURCHASE', 'TRANSFER_AND_PURCHASE'))::int AS recommend_purchase_count
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = ANY($1::text[])
+        AND target_days = $2
+        AND anchor_date = $3::date
+      GROUP BY branch_code
+      ORDER BY branch_code ASC
+    `,
+    [scope.branchCodes, policy.targetDays, anchorDate],
+  );
+
+  const found = new Map(branchResult.rows.map((row) => [String(row.branch_code), row]));
+  return scope.activeBranches.map((branch) => {
+    const row = found.get(branch.branchCode);
+    return {
+      branchCode: branch.branchCode,
+      label: row?.branch_label || branch.branchName || `สาขา ${branch.branchCode}`,
+      currentInventoryValue: numberOrZero(row?.current_inventory_value),
+      averageDaysCover: row?.average_days_cover == null ? null : numberOrZero(row.average_days_cover),
+      recommendTransferCount: Number(row?.recommend_transfer_count || 0),
+      recommendPurchaseCount: Number(row?.recommend_purchase_count || 0),
+    };
+  });
+}
+
+async function loadPrecomputedCompanySummary(db, dataset) {
+  const { scope, anchorDate, policy } = dataset;
+  const result = await db.query(
+    `
+      SELECT
+        COALESCE(SUM(inventory_value), 0)::numeric AS current_inventory_value,
+        COALESCE(SUM(COALESCE(unit_cost_avg, 0) * COALESCE(target_qty, 0)), 0)::numeric AS projected_inventory_value_at_target,
+        COALESCE(SUM(GREATEST(COALESCE(inventory_value, 0) - (COALESCE(unit_cost_avg, 0) * COALESCE(target_qty, 0)), 0)), 0)::numeric AS potential_reduction_value,
+        AVG(current_days_cover) FILTER (WHERE current_days_cover IS NOT NULL)::numeric AS average_days_cover,
+        COUNT(*) FILTER (WHERE action = 'TRANSFER_IN')::int AS sku_count_recommend_transfer,
+        COUNT(*) FILTER (WHERE action IN ('PURCHASE', 'TRANSFER_AND_PURCHASE'))::int AS sku_count_recommend_purchase
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = ANY($1::text[])
+        AND target_days = $2
+        AND anchor_date = $3::date
+    `,
+    [scope.branchCodes, policy.targetDays, anchorDate],
+  );
+  return {
+    currentInventoryValue: numberOrZero(result.rows[0]?.current_inventory_value),
+    projectedInventoryValueAtTarget: numberOrZero(result.rows[0]?.projected_inventory_value_at_target),
+    potentialReductionValue: numberOrZero(result.rows[0]?.potential_reduction_value),
+    averageDaysCover: result.rows[0]?.average_days_cover == null ? null : numberOrZero(result.rows[0].average_days_cover),
+    skuCountRecommendTransfer: Number(result.rows[0]?.sku_count_recommend_transfer || 0),
+    skuCountRecommendPurchase: Number(result.rows[0]?.sku_count_recommend_purchase || 0),
+    requestMatchRecommendationCount: 0,
+    requestOverrideRecommendationCount: 0,
+    adminOverrideBranchRequestCount: 0,
+    adminOverrideSystemRecommendationCount: 0,
+  };
+}
+
+async function getPrecomputedRecommendationDetail(db, dataset, productCode) {
+  const result = await db.query(
+    `
+      SELECT *
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = $1
+        AND target_days = $2
+        AND anchor_date = $3::date
+        AND product_code = $4
+      LIMIT 1
+    `,
+    [dataset.scope.branchCodes[0], dataset.policy.targetDays, dataset.anchorDate, productCode],
+  );
+  return result.rows[0] ? mapSnapshotRow(result.rows[0]) : null;
+}
+
+async function computeLiveRecommendationDataset(db, auth, filters = {}) {
   const normalizedFilters = normalizeRecommendationFilters(filters);
   const scope = await resolveEffectiveBranchScope(db, auth, normalizedFilters.branchCode);
   const anchorDate = await resolveAnchorDate(db, normalizedFilters);
   const policy = buildRecommendationPolicy(normalizedFilters, anchorDate);
   const branchNameByCode = new Map(scope.activeBranches.map((branch) => [branch.branchCode, branch.branchName]));
 
-  const stockRows = await loadCurrentStockByProduct(db, { search: normalizedFilters.search });
+  const candidateProductCodes = await loadCandidateProductCodes(db, {
+    scope,
+    search: normalizedFilters.search,
+    anchorDate,
+  });
+  const stockRows = await loadCurrentStockByProduct(db, { productCodes: candidateProductCodes });
   const productCodes = stockRows.map((row) => row.productCode);
   const salesAggByProductBranch = await loadSalesAggByProductBranch(db, {
     productCodes,
@@ -789,25 +1111,69 @@ async function computeRecommendationDataset(db, auth, filters = {}) {
     policy,
     branchNameByCode,
     rows: allRows,
+    source: "live",
   };
+}
+
+async function computeRecommendationDataset(db, auth, filters = {}) {
+  const normalizedFilters = normalizeRecommendationFilters(filters);
+  const scope = await resolveEffectiveBranchScope(db, auth, normalizedFilters.branchCode);
+  const anchorDate = await resolveAnchorDate(db, normalizedFilters);
+  const policy = buildRecommendationPolicy(normalizedFilters, anchorDate);
+  const branchNameByCode = new Map(scope.activeBranches.map((branch) => [branch.branchCode, branch.branchName]));
+  const snapshotMeta = await resolveSnapshotMeta(db, {
+    scope,
+    targetDays: policy.targetDays,
+    anchorDate,
+  });
+
+  if (snapshotMeta && Number(snapshotMeta.row_count || 0) > 0) {
+    return {
+      filters: normalizedFilters,
+      scope,
+      anchorDate,
+      policy,
+      branchNameByCode,
+      rows: [],
+      source: "precomputed",
+      snapshotMeta: {
+        rowCount: Number(snapshotMeta.row_count || 0),
+        generatedAt: snapshotMeta.generated_at || null,
+      },
+    };
+  }
+
+  return computeLiveRecommendationDataset(db, auth, normalizedFilters);
 }
 
 async function listStockRecommendations({ db, auth, filters = {} }) {
   const dataset = await computeRecommendationDataset(db, auth, filters);
-  const filteredRows = sortRows(applyActionFilter(dataset.rows, dataset.filters.action), dataset.filters.sort);
-  const pagedRows = filteredRows.slice(dataset.filters.offset, dataset.filters.offset + dataset.filters.pageSize);
-  const summary = buildListSummary(filteredRows);
+  let pagedRows;
+  let summary;
+  let total;
+
+  if (dataset.source === "precomputed") {
+    const precomputed = await listPrecomputedStockRecommendations(db, dataset);
+    pagedRows = precomputed.rows;
+    summary = precomputed.summary;
+    total = precomputed.total;
+  } else {
+    const filteredRows = sortRows(applyActionFilter(dataset.rows, dataset.filters.action), dataset.filters.sort);
+    pagedRows = filteredRows.slice(dataset.filters.offset, dataset.filters.offset + dataset.filters.pageSize);
+    summary = buildListSummary(filteredRows);
+    total = filteredRows.length;
+  }
 
   return {
     branchCode: dataset.scope.branchCode,
     targetDays: dataset.policy.targetDays,
-    generatedAt: new Date().toISOString(),
+    generatedAt: dataset.snapshotMeta?.generatedAt || new Date().toISOString(),
     policy: dataset.policy,
     summary,
     pagination: {
       page: dataset.filters.page,
       pageSize: dataset.filters.pageSize,
-      total: filteredRows.length,
+      total,
     },
     rows: pagedRows,
     meta: {
@@ -815,6 +1181,7 @@ async function listStockRecommendations({ db, auth, filters = {} }) {
       activeBranchCodes: dataset.scope.activeBranchCodes,
       branchCodesInScope: dataset.scope.branchCodes,
       anchorDate: dataset.anchorDate,
+      source: dataset.source,
     },
   };
 }
@@ -825,16 +1192,26 @@ async function getStockRecommendationSummary({ db, auth, filters = {} }) {
     branchCode: filters.branchCode || "all",
   });
 
+  const company =
+    dataset.source === "precomputed"
+      ? await loadPrecomputedCompanySummary(db, dataset)
+      : buildCompanySummary(dataset.rows);
+  const branches =
+    dataset.source === "precomputed"
+      ? await loadPrecomputedBranchSummaries(db, dataset)
+      : buildBranchSummaries(dataset.rows, dataset.scope.activeBranches);
+
   return {
     branchCode: dataset.scope.branchCode,
     targetDays: dataset.policy.targetDays,
-    generatedAt: new Date().toISOString(),
+    generatedAt: dataset.snapshotMeta?.generatedAt || new Date().toISOString(),
     policy: dataset.policy,
-    company: buildCompanySummary(dataset.rows),
-    branches: buildBranchSummaries(dataset.rows, dataset.scope.activeBranches),
+    company,
+    branches,
     meta: {
       isAllBranches: dataset.scope.isAllBranches,
       anchorDate: dataset.anchorDate,
+      source: dataset.source,
     },
   };
 }
@@ -850,22 +1227,211 @@ async function getStockRecommendationDetail({ db, auth, branchCode, productCode,
     branchCode,
   });
 
-  const row = dataset.rows.find(
-    (candidate) => candidate.branchCode === dataset.scope.branchCodes[0] && candidate.productCode === normalizedProductCode,
-  ) || null;
+  const row = dataset.source === "precomputed"
+    ? await getPrecomputedRecommendationDetail(db, dataset, normalizedProductCode)
+    : (
+      dataset.rows.find(
+        (candidate) => candidate.branchCode === dataset.scope.branchCodes[0] && candidate.productCode === normalizedProductCode,
+      ) || null
+    );
 
   return {
     branchCode: dataset.scope.branchCode,
     productCode: normalizedProductCode,
     targetDays: dataset.policy.targetDays,
-    generatedAt: new Date().toISOString(),
+    generatedAt: dataset.snapshotMeta?.generatedAt || new Date().toISOString(),
     policy: dataset.policy,
     recommendation: row,
     branchRequest: null,
     adminDecision: null,
     meta: {
       anchorDate: dataset.anchorDate,
+      source: dataset.source,
     },
+  };
+}
+
+async function refreshStockRecommendationSnapshots(db, options = {}) {
+  const targetDays = parsePositiveInt(options.targetDays, 90);
+  if (targetDays == null) {
+    throw createHttpError("targetDays must be a positive integer.", 400);
+  }
+
+  const requestedBranchCodes = Array.isArray(options.branchCodes)
+    ? options.branchCodes.map((value) => normalizeText(value)).filter((value) => BRANCH_SNAPSHOT_COLUMNS[value])
+    : null;
+
+  const liveDataset = await computeLiveRecommendationDataset(db, { role: "admin" }, {
+    branchCode: "all",
+    targetDays,
+  });
+
+  const rowsToPersist = requestedBranchCodes && requestedBranchCodes.length > 0
+    ? liveDataset.rows.filter((row) => requestedBranchCodes.includes(row.branchCode))
+    : liveDataset.rows;
+  const generatedAt = new Date().toISOString();
+
+  const client = typeof db.connect === "function" ? await db.connect() : db;
+  try {
+    if (typeof client.query === "function" && typeof client.release === "function") {
+      await client.query("BEGIN");
+    }
+
+    if (requestedBranchCodes && requestedBranchCodes.length > 0) {
+      await client.query(
+        `
+          DELETE FROM ordering.stock_recommendation_snapshots
+          WHERE anchor_date = $1::date
+            AND target_days = $2
+            AND branch_code = ANY($3::text[])
+        `,
+        [liveDataset.anchorDate, targetDays, requestedBranchCodes],
+      );
+    } else {
+      await client.query(
+        `
+          DELETE FROM ordering.stock_recommendation_snapshots
+          WHERE anchor_date = $1::date
+            AND target_days = $2
+        `,
+        [liveDataset.anchorDate, targetDays],
+      );
+    }
+
+    const chunkSize = 500;
+    for (let index = 0; index < rowsToPersist.length; index += chunkSize) {
+      const chunk = rowsToPersist.slice(index, index + chunkSize).map((row) => ({
+        anchor_date: liveDataset.anchorDate,
+        target_days: targetDays,
+        branch_code: row.branchCode,
+        branch_label: row.branchLabel,
+        product_code: row.productCode,
+        product_name_thai: row.productNameThai,
+        product_name_eng: row.productNameEng,
+        barcode: row.barcode,
+        unit: row.unit,
+        current_stock: row.currentStock,
+        unit_cost_avg: row.unitCostAvg,
+        inventory_value: row.inventoryValue,
+        sold_qty_30d: row.soldQty30d,
+        sold_qty_90d: row.soldQty90d,
+        sold_qty_same_period_last_year: row.soldQtySamePeriodLastYear,
+        adu_30: row.adu30,
+        adu_90: row.adu90,
+        trend_ratio_30_vs_90: row.trendRatio30Vs90,
+        adjusted_adu: row.adjustedAdu,
+        incoming_po_qty_total: row.incomingPoQtyTotal,
+        incoming_po_allocation_qty: row.incomingPoAllocationQty,
+        effective_stock: row.effectiveStock,
+        current_days_cover: row.currentDaysCover,
+        effective_days_cover: row.effectiveDaysCover,
+        target_qty: row.targetQty,
+        surplus_qty: row.surplusQty,
+        shortage_qty: row.shortageQty,
+        transfer_plan_qty: row.transferPlanQty,
+        purchase_qty: row.purchaseQty,
+        priority_score: row.priorityScore,
+        action: row.action,
+        recommendation_reason: row.recommendationReason,
+        recommendation_flags: row.flags || [],
+        donors_json: row.donors || [],
+        primary_suggested_donor_branch_code: row.primarySuggestedDonorBranchCode,
+        synced_at: row.syncedAt,
+        generated_at: generatedAt,
+      }));
+
+      await client.query(
+        `
+          INSERT INTO ordering.stock_recommendation_snapshots (
+            anchor_date, target_days, branch_code, branch_label, product_code,
+            product_name_thai, product_name_eng, barcode, unit,
+            current_stock, unit_cost_avg, inventory_value,
+            sold_qty_30d, sold_qty_90d, sold_qty_same_period_last_year,
+            adu_30, adu_90, trend_ratio_30_vs_90, adjusted_adu,
+            incoming_po_qty_total, incoming_po_allocation_qty, effective_stock,
+            current_days_cover, effective_days_cover,
+            target_qty, surplus_qty, shortage_qty,
+            transfer_plan_qty, purchase_qty, priority_score,
+            action, recommendation_reason, recommendation_flags, donors_json,
+            primary_suggested_donor_branch_code, synced_at, generated_at
+          )
+          SELECT
+            x.anchor_date, x.target_days, x.branch_code, x.branch_label, x.product_code,
+            x.product_name_thai, x.product_name_eng, x.barcode, x.unit,
+            x.current_stock, x.unit_cost_avg, x.inventory_value,
+            x.sold_qty_30d, x.sold_qty_90d, x.sold_qty_same_period_last_year,
+            x.adu_30, x.adu_90, x.trend_ratio_30_vs_90, x.adjusted_adu,
+            x.incoming_po_qty_total, x.incoming_po_allocation_qty, x.effective_stock,
+            x.current_days_cover, x.effective_days_cover,
+            x.target_qty, x.surplus_qty, x.shortage_qty,
+            x.transfer_plan_qty, x.purchase_qty, x.priority_score,
+            x.action, x.recommendation_reason, x.recommendation_flags, x.donors_json,
+            x.primary_suggested_donor_branch_code, x.synced_at, x.generated_at
+          FROM jsonb_to_recordset($1::jsonb) AS x(
+            anchor_date date,
+            target_days integer,
+            branch_code text,
+            branch_label text,
+            product_code text,
+            product_name_thai text,
+            product_name_eng text,
+            barcode text,
+            unit text,
+            current_stock numeric,
+            unit_cost_avg numeric,
+            inventory_value numeric,
+            sold_qty_30d numeric,
+            sold_qty_90d numeric,
+            sold_qty_same_period_last_year numeric,
+            adu_30 numeric,
+            adu_90 numeric,
+            trend_ratio_30_vs_90 numeric,
+            adjusted_adu numeric,
+            incoming_po_qty_total numeric,
+            incoming_po_allocation_qty numeric,
+            effective_stock numeric,
+            current_days_cover numeric,
+            effective_days_cover numeric,
+            target_qty numeric,
+            surplus_qty numeric,
+            shortage_qty numeric,
+            transfer_plan_qty numeric,
+            purchase_qty numeric,
+            priority_score numeric,
+            action text,
+            recommendation_reason text,
+            recommendation_flags jsonb,
+            donors_json jsonb,
+            primary_suggested_donor_branch_code text,
+            synced_at timestamptz,
+            generated_at timestamptz
+          )
+        `,
+        [JSON.stringify(chunk)],
+      );
+    }
+
+    if (typeof client.query === "function" && typeof client.release === "function") {
+      await client.query("COMMIT");
+    }
+  } catch (error) {
+    if (typeof client.query === "function" && typeof client.release === "function") {
+      await client.query("ROLLBACK");
+    }
+    throw error;
+  } finally {
+    if (typeof client.release === "function") {
+      client.release();
+    }
+  }
+
+  return {
+    anchorDate: liveDataset.anchorDate,
+    targetDays,
+    generatedAt,
+    rowCount: rowsToPersist.length,
+    branchCount: new Set(rowsToPersist.map((row) => row.branchCode)).size,
+    source: "live_to_snapshot",
   };
 }
 
@@ -873,4 +1439,5 @@ module.exports = {
   listStockRecommendations,
   getStockRecommendationSummary,
   getStockRecommendationDetail,
+  refreshStockRecommendationSnapshots,
 };

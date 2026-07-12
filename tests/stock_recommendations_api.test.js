@@ -173,13 +173,68 @@ function createMockDb() {
         return { rowCount: 1, rows: [{ latest_date: null }] };
       }
 
-      if (normalized.includes("from ada.branch_stock_snapshots bs") && normalized.includes("order by bs.product_code asc")) {
+      if (
+        normalized.includes("from ordering.stock_recommendation_snapshots") &&
+        normalized.includes("count(*)::int as row_count")
+      ) {
+        return { rowCount: 0, rows: [] };
+      }
+
+      if (
+        normalized.includes("select distinct bs.product_code") &&
+        normalized.includes("from ada.branch_stock_snapshots bs")
+      ) {
         const search = String(params[0] || "").toLowerCase();
         const rows = state.stockRows.filter((row) => {
           if (!search) return true;
           return [row.product_code, row.product_name_thai, row.product_name_eng, row.barcode]
             .filter(Boolean)
             .some((value) => String(value).toLowerCase().includes(search));
+        }).map((row) => ({ product_code: row.product_code }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.includes("from ada.branch_stock_snapshots bs") &&
+        normalized.includes("select bs.product_code") &&
+        normalized.includes("coalesce(bs.qty_branch_")
+      ) {
+        const branchMatches = [...normalized.matchAll(/qty_branch_(\d{3})/g)].map((match) => match[1]);
+        const rows = state.stockRows
+          .filter((row) => branchMatches.some((branchCode) => Number(row[`qty_branch_${branchCode}`] || 0) > 0))
+          .map((row) => ({ product_code: row.product_code }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.includes("select distinct product_code") &&
+        normalized.includes("from analytics.product_sales_summary_periods") &&
+        normalized.includes("sold_qty_base > 0")
+      ) {
+        const branchCodes = Array.isArray(params[0]) ? params[0] : [];
+        const rows = state.salesAggRows
+          .filter((row) => branchCodes.includes(row.branch_code) && Number(row.sold_qty_30d || 0) + Number(row.sold_qty_90d || 0) > 0)
+          .map((row) => ({ product_code: row.product_code }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.includes("select distinct product_code") &&
+        normalized.includes("from ( select l.product_code from ada.pending_receipt_lines l")
+      ) {
+        const rows = state.incomingRows.map((row) => ({ product_code: row.product_code }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.includes("from ada.branch_stock_snapshots bs") &&
+        normalized.includes("where bs.product_code = any($1::text[])") &&
+        normalized.includes("order by bs.product_code asc")
+      ) {
+        const productCodes = Array.isArray(params[0]) ? params[0] : [];
+        const rows = state.stockRows.filter((row) => {
+          if (!productCodes.includes(row.product_code)) return false;
+          return true;
         });
         return { rowCount: rows.length, rows };
       }
