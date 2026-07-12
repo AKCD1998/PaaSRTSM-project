@@ -165,8 +165,12 @@ function createMockDb() {
         };
       }
 
-      if (normalized.startsWith("select max(doc_date)::date as latest_date from ada.sales_headers")) {
+      if (normalized.startsWith("select max(period_end)::date as latest_date from analytics.product_sales_summary_periods")) {
         return { rowCount: 1, rows: [{ latest_date: new Date("2026-07-12T00:00:00.000Z") }] };
+      }
+
+      if (normalized.startsWith("select max(doc_date)::date as latest_date from ada.sales_headers")) {
+        return { rowCount: 1, rows: [{ latest_date: null }] };
       }
 
       if (normalized.includes("from ada.branch_stock_snapshots bs") && normalized.includes("order by bs.product_code asc")) {
@@ -180,7 +184,10 @@ function createMockDb() {
         return { rowCount: rows.length, rows };
       }
 
-      if (normalized.includes("with filtered_sales as (") && normalized.includes("sum(qty) filter")) {
+      if (
+        normalized.includes("from analytics.product_sales_summary_periods") &&
+        normalized.includes("sum(sold_qty_base) filter")
+      ) {
         const branchCodes = Array.isArray(params[0]) ? params[0] : [];
         const productCodes = Array.isArray(params[1]) ? params[1] : [];
         const rows = state.salesAggRows.filter(

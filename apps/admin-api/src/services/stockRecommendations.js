@@ -247,13 +247,25 @@ async function resolveAnchorDate(db, filters) {
 
   const result = await db.query(
     `
+      SELECT MAX(period_end)::date AS latest_date
+      FROM analytics.product_sales_summary_periods
+      WHERE period_days IN (30, 90)
+    `,
+  );
+  const latestAnalyticsDate = formatDateOnly(result.rows[0]?.latest_date || null);
+  if (latestAnalyticsDate) {
+    return latestAnalyticsDate;
+  }
+
+  const fallbackResult = await db.query(
+    `
       SELECT MAX(doc_date)::date AS latest_date
       FROM ada.sales_headers
       WHERE COALESCE(NULLIF(raw_payload->>'FTShdDocType', ''), '1') = '1'
         AND COALESCE(NULLIF(raw_payload->>'FTShdStaPaid', ''), paid_status, '') = '3'
     `,
   );
-  const latestDate = result.rows[0]?.latest_date || null;
+  const latestDate = fallbackResult.rows[0]?.latest_date || null;
   const normalizedLatestDate = formatDateOnly(latestDate);
   if (!normalizedLatestDate) {
     return new Date().toISOString().slice(0, 10);
@@ -335,29 +347,16 @@ async function loadSalesAggByProductBranch(db, { productCodes, branchCodes, anch
 
   const result = await db.query(
     `
-      WITH filtered_sales AS (
-        SELECT
-          sh.branch_code,
-          sl.product_code,
-          sh.doc_date,
-          COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0)) AS qty
-        FROM ada.sales_headers sh
-        JOIN ada.sales_lines sl
-          ON sl.branch_code = sh.branch_code
-         AND sl.doc_no = sh.doc_no
-        WHERE sh.branch_code = ANY($1::text[])
-          AND sl.product_code = ANY($2::text[])
-          AND sh.doc_date >= ($3::date - INTERVAL '89 days')
-          AND sh.doc_date <= $3::date
-          AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
-          AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
-      )
       SELECT
         product_code,
         branch_code,
-        COALESCE(SUM(qty) FILTER (WHERE doc_date >= ($3::date - INTERVAL '29 days')), 0)::numeric AS sold_qty_30d,
-        COALESCE(SUM(qty), 0)::numeric AS sold_qty_90d
-      FROM filtered_sales
+        COALESCE(SUM(sold_qty_base) FILTER (WHERE period_days = 30), 0)::numeric AS sold_qty_30d,
+        COALESCE(SUM(sold_qty_base) FILTER (WHERE period_days = 90), 0)::numeric AS sold_qty_90d
+      FROM analytics.product_sales_summary_periods
+      WHERE branch_code = ANY($1::text[])
+        AND product_code = ANY($2::text[])
+        AND period_end = $3::date
+        AND period_days IN (30, 90)
       GROUP BY product_code, branch_code
     `,
     [branchCodes, productCodes, anchorDate],
