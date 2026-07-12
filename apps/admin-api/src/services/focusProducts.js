@@ -139,8 +139,8 @@ async function fetchSoldQtyBatch(db, productCodes, dateFrom, dateTo) {
      JOIN ada.sales_headers sh
        ON sh.branch_code = sl.branch_code
       AND sh.doc_no = sl.doc_no
-     WHERE sl.product_code = ANY($1)
-       AND sh.doc_date BETWEEN $2 AND $3
+     WHERE sl.product_code = ANY($1::text[])
+       AND sh.doc_date BETWEEN $2::date AND $3::date
        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
      GROUP BY sl.product_code, sh.branch_code`,
