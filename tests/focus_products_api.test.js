@@ -45,6 +45,7 @@ function createMockDb() {
         date_from: "2026-07-01",
         date_to: "2026-07-31",
         branch_codes: null,
+        branch_targets: null,
         assigned_person_name: "กนกวรา มันทะเสน",
         note: "โปรโมชั่นเดือนกรกฎาคม",
         is_active: true,
@@ -99,6 +100,7 @@ function createMockDb() {
           is_active: true,
           created_by: params[7],
           assigned_person_name: params[8] || null,
+          branch_targets: params[9] ? JSON.parse(params[9]) : null,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
           frozen_sold_by_branch: null,
@@ -122,6 +124,7 @@ function createMockDb() {
             note: params[7],
             is_active: params[8],
             assigned_person_name: params[9] || null,
+            branch_targets: params[10] ? JSON.parse(params[10]) : null,
             updated_at: new Date().toISOString(),
           });
           if (q.includes("frozen_at = null")) {
@@ -350,4 +353,66 @@ test("group_manager achieved is true only when every branch clears the target", 
   assert.equal(row.branchAchieved["003"], true);
   assert.equal(row.branchAchieved["005"], false);
   assert.equal(row.achieved, false);
+});
+
+test("group_manager branchTargets overrides the global target per branch", async () => {
+  const { app, db } = createTestApp();
+  db.state.rows.get(1).focus_type = "group_manager";
+  db.state.rows.get(1).target_qty = "3"; // fallback for branches without an override
+  db.state.rows.get(1).branch_targets = { "001": 8, "003": 6 }; // 001 mock sells 10, 003 sells 5
+
+  const staff = request.agent(app);
+  await loginAs(staff, "staff@example.com", "staff-pass-123");
+  const res = await staff.get("/api/focus-products");
+  const row = res.body.focusProducts[0];
+
+  assert.equal(row.branchTargetsEffective["001"], 8);
+  assert.equal(row.branchTargetsEffective["003"], 6);
+  assert.equal(row.branchTargetsEffective["005"], 3); // no override -> falls back to target_qty
+  assert.equal(row.branchAchieved["001"], true);  // 10 >= 8
+  assert.equal(row.branchAchieved["003"], false); // 5 < 6
+  assert.equal(row.branchAchieved["005"], false); // 0 < 3
+  assert.equal(row.achieved, false);
+});
+
+test("admin can set branchTargets on create and it round-trips", async () => {
+  const { app } = createTestApp();
+  const admin = request.agent(app);
+  const csrf = await loginAs(admin);
+
+  const created = await admin
+    .post("/api/admin/focus-products")
+    .set("x-csrf-token", csrf)
+    .send({
+      productCode: "IC-004615",
+      focusType: "group_manager",
+      targetQty: 3,
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31",
+      branchCodes: ["001", "005"],
+      branchTargets: { "001": 8, "005": 3 },
+    });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.body.focusProduct.branchTargets, { "001": 8, "005": 3 });
+  assert.equal(created.body.focusProduct.branchTargetsEffective["001"], 8);
+  assert.equal(created.body.focusProduct.branchTargetsEffective["005"], 3);
+});
+
+test("branchTargets rejects non-positive values", async () => {
+  const { app } = createTestApp();
+  const admin = request.agent(app);
+  const csrf = await loginAs(admin);
+
+  const bad = await admin
+    .post("/api/admin/focus-products")
+    .set("x-csrf-token", csrf)
+    .send({
+      productCode: "IC-1",
+      focusType: "group_manager",
+      targetQty: 3,
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31",
+      branchTargets: { "001": 0 },
+    });
+  assert.equal(bad.status, 400);
 });

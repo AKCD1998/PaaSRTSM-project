@@ -35,6 +35,27 @@ function normalizeBranchCodes(value) {
   return codes.length > 0 ? codes : null;
 }
 
+// {branch_code: target_qty} overrides — only meaningful for group_manager
+// rows, where each branch can have its own distinct target for the same
+// product. Absent/empty branches fall back to the row's global target_qty.
+function normalizeBranchTargets(value) {
+  if (value == null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw createHttpError("branchTargets must be an object of branchCode -> targetQty.", 400);
+  }
+  const entries = [];
+  for (const [rawCode, rawQty] of Object.entries(value)) {
+    const code = normalizeText(rawCode);
+    if (!code) continue;
+    const qty = Number(rawQty);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      throw createHttpError(`branchTargets.${code} must be a positive number.`, 400);
+    }
+    entries.push([code, qty]);
+  }
+  return entries.length > 0 ? Object.fromEntries(entries) : null;
+}
+
 // "Today" for freeze comparisons — Bangkok wall-clock date, matching the
 // convention used elsewhere in the sync pipeline (adapos-sync/src/transform.js).
 function todayBangkokIso() {
@@ -59,6 +80,7 @@ function mapFocusProductRow(row) {
     dateFrom: row.date_from,
     dateTo: row.date_to,
     branchCodesRaw: row.branch_codes || null, // null = defaulted to all active branches
+    branchTargets: row.branch_targets || null, // per-branch target overrides (group_manager only)
     assignedPersonName: row.assigned_person_name || null,
     note: row.note,
     isActive: row.is_active,
@@ -126,7 +148,7 @@ async function fetchSoldQtyByBranch(db, productCode, dateFrom, dateTo) {
   return map;
 }
 
-function computeStatus(focusType, targetQty, soldByBranch, branchCodes) {
+function computeStatus(focusType, targetQty, soldByBranch, branchCodes, branchTargets) {
   const relevantBranches = branchCodes;
   const totalSold = relevantBranches.reduce((sum, code) => sum + (soldByBranch[code] || 0), 0);
 
@@ -135,24 +157,30 @@ function computeStatus(focusType, targetQty, soldByBranch, branchCodes) {
       totalSold,
       achieved: totalSold >= targetQty,
       branchAchieved: null,
+      branchTargetsEffective: null,
     };
   }
 
-  // pharmacist / store_manager / group_manager: each branch judged independently
-  // against the same target_qty.
+  // pharmacist / store_manager / group_manager: each branch judged independently.
+  // group_manager may have a distinct target per branch (branchTargets); the
+  // other two types always compare against the row's single target_qty.
   const branchAchieved = {};
+  const branchTargetsEffective = {};
   for (const code of relevantBranches) {
-    branchAchieved[code] = (soldByBranch[code] || 0) >= targetQty;
+    const effectiveTarget = branchTargets?.[code] ?? targetQty;
+    branchTargetsEffective[code] = effectiveTarget;
+    branchAchieved[code] = (soldByBranch[code] || 0) >= effectiveTarget;
   }
   const allBranchesAchieved = relevantBranches.length > 0
     && relevantBranches.every((code) => branchAchieved[code]);
 
   return {
     totalSold,
-    // group_manager success requires every branch to individually clear the target;
+    // group_manager success requires every branch to individually clear its target;
     // pharmacist/store_manager have no combined verdict (each branch stands alone).
     achieved: focusType === "group_manager" ? allBranchesAchieved : null,
     branchAchieved,
+    branchTargetsEffective,
   };
 }
 
@@ -199,7 +227,7 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
       }
     }
 
-    const status = computeStatus(row.focus_type, Number(row.target_qty), soldByBranch, branchCodes);
+    const status = computeStatus(row.focus_type, Number(row.target_qty), soldByBranch, branchCodes, row.branch_targets || null);
 
     results.push({
       ...mapFocusProductRow(row),
@@ -240,16 +268,17 @@ async function createFocusProduct(db, fields) {
   if (dateTo < dateFrom) throw createHttpError("dateTo must not be before dateFrom.", 400);
 
   const branchCodes = normalizeBranchCodes(fields.branchCodes);
+  const branchTargets = normalizeBranchTargets(fields.branchTargets);
   const note = normalizeNullableText(fields.note, NOTE_MAX_CHARS);
   const createdBy = normalizeNullableText(fields.createdBy);
   const assignedPersonName = normalizeNullableText(fields.assignedPersonName);
 
   const inserted = await db.query(
     `INSERT INTO focus.focus_products
-       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by, assigned_person_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by, assigned_person_name, branch_targets)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
      RETURNING id`,
-    [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy, assignedPersonName],
+    [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy, assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null],
   );
   const row = await fetchFocusProductRow(db, inserted.rows[0].id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
@@ -277,6 +306,7 @@ async function updateFocusProduct(db, id, fields) {
   if (dateTo < dateFrom) throw createHttpError("dateTo must not be before dateFrom.", 400);
 
   const branchCodes = fields.branchCodes === undefined ? before.branch_codes : normalizeBranchCodes(fields.branchCodes);
+  const branchTargets = fields.branchTargets === undefined ? before.branch_targets : normalizeBranchTargets(fields.branchTargets);
   const note = fields.note === undefined ? before.note : normalizeNullableText(fields.note, NOTE_MAX_CHARS);
   const isActive = fields.isActive === undefined ? before.is_active : Boolean(fields.isActive);
   const assignedPersonName = fields.assignedPersonName === undefined
@@ -290,10 +320,10 @@ async function updateFocusProduct(db, id, fields) {
   await db.query(
     `UPDATE focus.focus_products
      SET product_code = $2, focus_type = $3, target_qty = $4, date_from = $5, date_to = $6,
-         branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, updated_at = now()
+         branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, branch_targets = $11::jsonb, updated_at = now()
          ${dateRangeChanged ? ", frozen_sold_by_branch = NULL, frozen_total_sold = NULL, frozen_at = NULL" : ""}
      WHERE id = $1`,
-    [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive, assignedPersonName],
+    [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive, assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null],
   );
   const row = await fetchFocusProductRow(db, id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);

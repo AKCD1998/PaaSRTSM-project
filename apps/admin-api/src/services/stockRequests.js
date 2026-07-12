@@ -11,6 +11,8 @@ const ALLOWED_SUBMITTER_ROLES = new Set(["admin", "branch", "staff"]);
 const VALID_RESPONSE_STATUSES = new Set(["APPROVED_FULL", "CUSTOM", "REJECTED"]);
 const VALID_REQUEST_MODES = new Set(["STANDARD", "ADMIN_ALERT"]);
 const STOCK_REQUEST_DOCUMENT_TYPES = new Set(["RESPONSE_SUMMARY", "PACKING_SLIP"]);
+const VALID_RECOMMENDED_ACTIONS = new Set(["NO_ACTION", "TRANSFER", "PURCHASE", "TRANSFER_AND_PURCHASE"]);
+const VALID_INCOMING_MODES = new Set(["UNKNOWN", "EQUAL_SPLIT", "BRANCH_SPECIFIC", "MANUAL", "LIVE_RECEIPTS"]);
 
 function createHttpError(message, statusCode, extra = {}) {
   return Object.assign(new Error(message), { statusCode, ...extra });
@@ -63,6 +65,154 @@ function parseIsoTimestamp(value) {
     return null;
   }
   return date.toISOString();
+}
+
+function parseIsoDate(value) {
+  const normalized = normalizeNullableText(value, 32);
+  if (!normalized) {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function parseOptionalInteger(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  if (!Number.isInteger(number)) {
+    return null;
+  }
+  return number;
+}
+
+function normalizeJsonArray(value, path) {
+  if (value == null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw createHttpError(`${path} must be an array.`, 400);
+  }
+  return value;
+}
+
+function normalizeJsonObject(value, path) {
+  if (value == null) {
+    return {};
+  }
+  if (Array.isArray(value) || typeof value !== "object") {
+    throw createHttpError(`${path} must be an object.`, 400);
+  }
+  return value;
+}
+
+function normalizeRecommendationPayload(value, { path, productCode, sourceBranchCode, requestedQty }) {
+  if (value == null) {
+    return null;
+  }
+  if (Array.isArray(value) || typeof value !== "object") {
+    throw createHttpError(`${path} must be an object.`, 400);
+  }
+
+  const targetDays = parseOptionalInteger(value.targetDays);
+  if (value.targetDays != null && targetDays == null) {
+    throw createHttpError(`${path}.targetDays must be an integer.`, 400);
+  }
+
+  const incomingAllocationMode = normalizeText(value.incomingAllocationMode || "UNKNOWN").toUpperCase();
+  const incomingSourceMode = normalizeText(value.incomingSourceMode || "UNKNOWN").toUpperCase();
+  if (!VALID_INCOMING_MODES.has(incomingAllocationMode)) {
+    throw createHttpError(`${path}.incomingAllocationMode is invalid.`, 400);
+  }
+  if (!VALID_INCOMING_MODES.has(incomingSourceMode)) {
+    throw createHttpError(`${path}.incomingSourceMode is invalid.`, 400);
+  }
+
+  const recommendationGeneratedAt = parseIsoTimestamp(value.recommendationGeneratedAt);
+  if (value.recommendationGeneratedAt != null && !recommendationGeneratedAt) {
+    throw createHttpError(`${path}.recommendationGeneratedAt is invalid.`, 400);
+  }
+
+  const recommendationBasisDateFrom = parseIsoDate(value.recommendationBasisDateFrom);
+  const recommendationBasisDateTo = parseIsoDate(value.recommendationBasisDateTo);
+  if (value.recommendationBasisDateFrom != null && !recommendationBasisDateFrom) {
+    throw createHttpError(`${path}.recommendationBasisDateFrom is invalid.`, 400);
+  }
+  if (value.recommendationBasisDateTo != null && !recommendationBasisDateTo) {
+    throw createHttpError(`${path}.recommendationBasisDateTo is invalid.`, 400);
+  }
+
+  const recommendedAction = normalizeText(value.recommendedAction || "NO_ACTION").toUpperCase();
+  if (!VALID_RECOMMENDED_ACTIONS.has(recommendedAction)) {
+    throw createHttpError(`${path}.recommendedAction is invalid.`, 400);
+  }
+
+  const primarySuggestedDonorBranchCode = normalizeBranchCode(value.primarySuggestedDonorBranchCode) ||
+    normalizeNullableText(value.primarySuggestedDonorBranchCode, 16);
+  const requestMatchesRecommendation =
+    value.requestMatchesRecommendation == null
+      ? null
+      : Boolean(value.requestMatchesRecommendation);
+
+  return {
+    targetDays: targetDays == null ? 90 : targetDays,
+    incomingAllocationMode,
+    incomingSourceMode,
+    recommendationGeneratedAt,
+    recommendationBasisDateFrom,
+    recommendationBasisDateTo,
+    productCode: normalizeNullableText(value.productCode, 64) || productCode,
+    sourceBranchCode: normalizeBranchCode(value.sourceBranchCode) ||
+      normalizeNullableText(value.sourceBranchCode, 16) ||
+      sourceBranchCode,
+    currentStock: parseOptionalNonNegativeNumber(value.currentStock),
+    unitCostAvg: parseOptionalNonNegativeNumber(value.unitCostAvg),
+    inventoryValue: parseOptionalNonNegativeNumber(value.inventoryValue),
+    soldQty30d: parseOptionalNonNegativeNumber(value.soldQty30d),
+    soldQty90d: parseOptionalNonNegativeNumber(value.soldQty90d),
+    adu30: parseOptionalNonNegativeNumber(value.adu30),
+    adu90: parseOptionalNonNegativeNumber(value.adu90),
+    adjustedAdu: parseOptionalNonNegativeNumber(value.adjustedAdu),
+    incomingPoQtyTotal: parseOptionalNonNegativeNumber(value.incomingPoQtyTotal),
+    incomingPoAllocationQty: parseOptionalNonNegativeNumber(value.incomingPoAllocationQty),
+    effectiveStock: parseOptionalNonNegativeNumber(value.effectiveStock),
+    currentDaysCover: parseOptionalNonNegativeNumber(value.currentDaysCover),
+    effectiveDaysCover: parseOptionalNonNegativeNumber(value.effectiveDaysCover),
+    targetQty: parseOptionalNonNegativeNumber(value.targetQty),
+    surplusQty: parseOptionalNonNegativeNumber(value.surplusQty) || 0,
+    shortageQty: parseOptionalNonNegativeNumber(value.shortageQty) || 0,
+    recommendedAction,
+    recommendedTransferQty: parseOptionalNonNegativeNumber(value.recommendedTransferQty) || 0,
+    recommendedPurchaseQty: parseOptionalNonNegativeNumber(value.recommendedPurchaseQty) || 0,
+    recommendedRequestQty: parseOptionalNonNegativeNumber(value.recommendedRequestQty),
+    requestMatchesRecommendation,
+    primarySuggestedDonorBranchCode,
+    recommendationReason: normalizeNullableText(value.recommendationReason, 2000),
+    recommendationFlags: normalizeJsonArray(value.recommendationFlags, `${path}.recommendationFlags`),
+    donorSnapshot: normalizeJsonArray(value.donorSnapshot, `${path}.donorSnapshot`),
+    recommendationSnapshot: {
+      ...normalizeJsonObject(value.recommendationSnapshot, `${path}.recommendationSnapshot`),
+      requestedQty,
+    },
+  };
+}
+
+function computeRequestMatchesRecommendation(line, recommendation, sourceBranchCode) {
+  if (!recommendation) {
+    return true;
+  }
+  if (recommendation.requestMatchesRecommendation != null) {
+    return recommendation.requestMatchesRecommendation;
+  }
+  const recommendedQty = recommendation.recommendedRequestQty != null
+    ? recommendation.recommendedRequestQty
+    : (recommendation.recommendedTransferQty || 0) + (recommendation.recommendedPurchaseQty || 0);
+  const qtyMatches = Math.abs(Number(line.requestedQty || 0) - Number(recommendedQty || 0)) < 0.0001;
+  const branchMatches = !recommendation.sourceBranchCode || recommendation.sourceBranchCode === sourceBranchCode;
+  return qtyMatches && branchMatches;
 }
 
 function formatDateForPublicId(isoTimestamp) {
@@ -136,6 +286,12 @@ function normalizeSubmitPayload(body) {
       const unit = normalizeNullableText(lineSource?.unit, 128);
       const snapshotQty = parseOptionalNonNegativeNumber(lineSource?.snapshotQty || lineSource?.snapshot_qty);
       const snapshotSyncedAt = parseIsoTimestamp(lineSource?.snapshotSyncedAt || lineSource?.snapshot_synced_at);
+      const recommendation = normalizeRecommendationPayload(lineSource?.recommendation, {
+        path: `groups[${groupIndex}].lines[${lineIndex}].recommendation`,
+        productCode,
+        sourceBranchCode,
+        requestedQty,
+      });
 
       if (!productCode) {
         throw createHttpError(`groups[${groupIndex}].lines[${lineIndex}].productCode is required.`, 400);
@@ -167,11 +323,13 @@ function normalizeSubmitPayload(body) {
       seenLineKeys.add(lineKey);
 
       lines.push({
+        sourceBranchCode,
         productCode,
         requestedQty,
         unit,
         snapshotQty,
         snapshotSyncedAt,
+        recommendation,
       });
     }
 
@@ -479,21 +637,54 @@ async function loadLineRowsByRequestIds(dbLike, requestIds) {
   const result = await dbLike.query(
     `
       SELECT
-        line_id,
-        request_id,
-        product_code,
-        product_name_thai,
-        product_name_eng,
-        barcode,
-        unit,
-        requested_qty,
-        snapshot_qty,
-        snapshot_synced_at,
-        status,
-        created_at
-      FROM ordering.stock_request_lines
-      WHERE request_id = ANY($1::bigint[])
-      ORDER BY request_id ASC, line_id ASC
+        l.line_id,
+        l.request_id,
+        l.product_code,
+        l.product_name_thai,
+        l.product_name_eng,
+        l.barcode,
+        l.unit,
+        l.requested_qty,
+        l.snapshot_qty,
+        l.snapshot_synced_at,
+        l.status,
+        l.created_at,
+        rec.target_days AS recommendation_target_days,
+        rec.incoming_allocation_mode AS recommendation_incoming_allocation_mode,
+        rec.incoming_source_mode AS recommendation_incoming_source_mode,
+        rec.recommendation_generated_at,
+        rec.recommendation_basis_date_from,
+        rec.recommendation_basis_date_to,
+        rec.current_stock AS recommendation_current_stock,
+        rec.unit_cost_avg AS recommendation_unit_cost_avg,
+        rec.inventory_value AS recommendation_inventory_value,
+        rec.sold_qty_30d AS recommendation_sold_qty_30d,
+        rec.sold_qty_90d AS recommendation_sold_qty_90d,
+        rec.adu_30 AS recommendation_adu_30,
+        rec.adu_90 AS recommendation_adu_90,
+        rec.adjusted_adu AS recommendation_adjusted_adu,
+        rec.incoming_po_qty_total AS recommendation_incoming_po_qty_total,
+        rec.incoming_po_allocation_qty AS recommendation_incoming_po_allocation_qty,
+        rec.effective_stock AS recommendation_effective_stock,
+        rec.current_days_cover AS recommendation_current_days_cover,
+        rec.effective_days_cover AS recommendation_effective_days_cover,
+        rec.target_qty AS recommendation_target_qty,
+        rec.surplus_qty AS recommendation_surplus_qty,
+        rec.shortage_qty AS recommendation_shortage_qty,
+        rec.recommended_action,
+        rec.recommended_transfer_qty,
+        rec.recommended_purchase_qty,
+        rec.request_matches_recommendation,
+        rec.primary_suggested_donor_branch_code,
+        rec.recommendation_reason,
+        rec.recommendation_flags,
+        rec.donor_snapshot,
+        rec.recommendation_snapshot
+      FROM ordering.stock_request_lines l
+      LEFT JOIN ordering.stock_request_line_recommendations rec
+        ON rec.line_id = l.line_id
+      WHERE l.request_id = ANY($1::bigint[])
+      ORDER BY l.request_id ASC, l.line_id ASC
     `,
     [normalizedIds],
   );
@@ -727,7 +918,101 @@ async function insertLine(client, { requestId, line, product }) {
     ],
   );
 
-  return Number(result.rows[0].line_id);
+  const lineId = Number(result.rows[0].line_id);
+  if (line.recommendation) {
+    const rec = line.recommendation;
+    await client.query(
+      `
+        INSERT INTO ordering.stock_request_line_recommendations
+          (
+            line_id,
+            target_days,
+            incoming_allocation_mode,
+            incoming_source_mode,
+            recommendation_generated_at,
+            recommendation_basis_date_from,
+            recommendation_basis_date_to,
+            product_code,
+            current_stock,
+            unit_cost_avg,
+            inventory_value,
+            sold_qty_30d,
+            sold_qty_90d,
+            adu_30,
+            adu_90,
+            adjusted_adu,
+            incoming_po_qty_total,
+            incoming_po_allocation_qty,
+            effective_stock,
+            current_days_cover,
+            effective_days_cover,
+            target_qty,
+            surplus_qty,
+            shortage_qty,
+            recommended_action,
+            recommended_transfer_qty,
+            recommended_purchase_qty,
+            request_matches_recommendation,
+            primary_suggested_donor_branch_code,
+            recommendation_reason,
+            recommendation_flags,
+            donor_snapshot,
+            recommendation_snapshot
+          )
+        VALUES
+          (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12, $13,
+            $14, $15, $16, $17, $18,
+            $19, $20, $21, $22, $23,
+            $24, $25, $26, $27,
+            $28, $29, $30, $31::jsonb,
+            $32::jsonb, $33::jsonb
+          )
+      `,
+      [
+        lineId,
+        rec.targetDays,
+        rec.incomingAllocationMode,
+        rec.incomingSourceMode,
+        rec.recommendationGeneratedAt,
+        rec.recommendationBasisDateFrom,
+        rec.recommendationBasisDateTo,
+        rec.productCode,
+        rec.currentStock,
+        rec.unitCostAvg,
+        rec.inventoryValue,
+        rec.soldQty30d,
+        rec.soldQty90d,
+        rec.adu30,
+        rec.adu90,
+        rec.adjustedAdu,
+        rec.incomingPoQtyTotal,
+        rec.incomingPoAllocationQty,
+        rec.effectiveStock,
+        rec.currentDaysCover,
+        rec.effectiveDaysCover,
+        rec.targetQty,
+        rec.surplusQty,
+        rec.shortageQty,
+        rec.recommendedAction,
+        rec.recommendedTransferQty,
+        rec.recommendedPurchaseQty,
+        computeRequestMatchesRecommendation(line, rec, line.sourceBranchCode),
+        rec.primarySuggestedDonorBranchCode,
+        rec.recommendationReason,
+        JSON.stringify(rec.recommendationFlags),
+        JSON.stringify(rec.donorSnapshot),
+        JSON.stringify({
+          ...rec.recommendationSnapshot,
+          sourceBranchCode: rec.sourceBranchCode,
+          recommendedRequestQty: rec.recommendedRequestQty,
+        }),
+      ],
+    );
+  }
+
+  return lineId;
 }
 
 async function insertEvent(client, event) {
@@ -837,6 +1122,51 @@ function mapResponseRow(row) {
   };
 }
 
+function mapRecommendationRow(row) {
+  if (row.recommended_action == null) {
+    return null;
+  }
+  const snapshot = row.recommendation_snapshot && typeof row.recommendation_snapshot === "object"
+    ? row.recommendation_snapshot
+    : {};
+  return {
+    targetDays: row.recommendation_target_days == null ? 90 : Number(row.recommendation_target_days),
+    incomingAllocationMode: row.recommendation_incoming_allocation_mode || "UNKNOWN",
+    incomingSourceMode: row.recommendation_incoming_source_mode || "UNKNOWN",
+    recommendationGeneratedAt: row.recommendation_generated_at || null,
+    recommendationBasisDateFrom: row.recommendation_basis_date_from || null,
+    recommendationBasisDateTo: row.recommendation_basis_date_to || null,
+    productCode: row.product_code,
+    sourceBranchCode: snapshot.sourceBranchCode || null,
+    currentStock: row.recommendation_current_stock == null ? null : Number(row.recommendation_current_stock),
+    unitCostAvg: row.recommendation_unit_cost_avg == null ? null : Number(row.recommendation_unit_cost_avg),
+    inventoryValue: row.recommendation_inventory_value == null ? null : Number(row.recommendation_inventory_value),
+    soldQty30d: row.recommendation_sold_qty_30d == null ? null : Number(row.recommendation_sold_qty_30d),
+    soldQty90d: row.recommendation_sold_qty_90d == null ? null : Number(row.recommendation_sold_qty_90d),
+    adu30: row.recommendation_adu_30 == null ? null : Number(row.recommendation_adu_30),
+    adu90: row.recommendation_adu_90 == null ? null : Number(row.recommendation_adu_90),
+    adjustedAdu: row.recommendation_adjusted_adu == null ? null : Number(row.recommendation_adjusted_adu),
+    incomingPoQtyTotal: row.recommendation_incoming_po_qty_total == null ? null : Number(row.recommendation_incoming_po_qty_total),
+    incomingPoAllocationQty: row.recommendation_incoming_po_allocation_qty == null ? null : Number(row.recommendation_incoming_po_allocation_qty),
+    effectiveStock: row.recommendation_effective_stock == null ? null : Number(row.recommendation_effective_stock),
+    currentDaysCover: row.recommendation_current_days_cover == null ? null : Number(row.recommendation_current_days_cover),
+    effectiveDaysCover: row.recommendation_effective_days_cover == null ? null : Number(row.recommendation_effective_days_cover),
+    targetQty: row.recommendation_target_qty == null ? null : Number(row.recommendation_target_qty),
+    surplusQty: row.recommendation_surplus_qty == null ? 0 : Number(row.recommendation_surplus_qty),
+    shortageQty: row.recommendation_shortage_qty == null ? 0 : Number(row.recommendation_shortage_qty),
+    recommendedAction: row.recommended_action || "NO_ACTION",
+    recommendedTransferQty: row.recommended_transfer_qty == null ? 0 : Number(row.recommended_transfer_qty),
+    recommendedPurchaseQty: row.recommended_purchase_qty == null ? 0 : Number(row.recommended_purchase_qty),
+    recommendedRequestQty: snapshot.recommendedRequestQty == null ? null : Number(snapshot.recommendedRequestQty),
+    requestMatchesRecommendation: row.request_matches_recommendation == null ? true : Boolean(row.request_matches_recommendation),
+    primarySuggestedDonorBranchCode: row.primary_suggested_donor_branch_code || null,
+    recommendationReason: row.recommendation_reason || null,
+    recommendationFlags: Array.isArray(row.recommendation_flags) ? row.recommendation_flags : [],
+    donorSnapshot: Array.isArray(row.donor_snapshot) ? row.donor_snapshot : [],
+    recommendationSnapshot: snapshot,
+  };
+}
+
 function mapLineRow(row, responseRow, currentStockMap) {
   return {
     lineId: Number(row.line_id),
@@ -856,6 +1186,7 @@ function mapLineRow(row, responseRow, currentStockMap) {
     status: row.status,
     createdAt: row.created_at,
     response: mapResponseRow(responseRow),
+    recommendation: mapRecommendationRow(row),
   };
 }
 

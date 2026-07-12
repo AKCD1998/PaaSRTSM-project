@@ -101,8 +101,12 @@ function createInitialState() {
     // draft tables
     drafts: [],
     draftLines: [],
+    draftLineRecommendations: [],
+    lineRecommendations: [],
     nextDraftId: 1,
     nextDraftLineId: 1,
+    nextDraftLineRecommendationId: 1,
+    nextLineRecommendationId: 1,
     failOnLineProductCode: null,
   };
 }
@@ -137,8 +141,12 @@ function cloneState(state) {
     nextEventId: state.nextEventId,
     drafts: state.drafts.map((r) => ({ ...r })),
     draftLines: state.draftLines.map((r) => ({ ...r })),
+    draftLineRecommendations: state.draftLineRecommendations.map((r) => ({ ...r })),
+    lineRecommendations: state.lineRecommendations.map((r) => ({ ...r })),
     nextDraftId: state.nextDraftId,
     nextDraftLineId: state.nextDraftLineId,
+    nextDraftLineRecommendationId: state.nextDraftLineRecommendationId,
+    nextLineRecommendationId: state.nextLineRecommendationId,
     failOnLineProductCode: state.failOnLineProductCode,
   };
 }
@@ -313,11 +321,49 @@ function createDraftMockDb() {
     }
 
     // SELECT draft lines
-    if (normalized.includes("from ordering.stock_request_draft_lines") && normalized.includes("where draft_id = $1")) {
+    if (normalized.includes("from ordering.stock_request_draft_lines") && normalized.includes("draft_id = $1")) {
       const rows = state.draftLines
         .filter((r) => r.draft_id === Number(params[0]))
         .sort((a, b) => a.draft_line_id - b.draft_line_id);
-      return { rowCount: rows.length, rows };
+      return {
+        rowCount: rows.length,
+        rows: rows.map((row) => {
+          const rec = state.draftLineRecommendations.find((item) => item.draft_line_id === row.draft_line_id) || {};
+          return {
+            ...row,
+            recommendation_target_days: rec.target_days ?? null,
+            recommendation_incoming_allocation_mode: rec.incoming_allocation_mode ?? null,
+            recommendation_incoming_source_mode: rec.incoming_source_mode ?? null,
+            recommendation_generated_at: rec.recommendation_generated_at ?? null,
+            recommendation_basis_date_from: rec.recommendation_basis_date_from ?? null,
+            recommendation_basis_date_to: rec.recommendation_basis_date_to ?? null,
+            recommendation_current_stock: rec.current_stock ?? null,
+            recommendation_unit_cost_avg: rec.unit_cost_avg ?? null,
+            recommendation_inventory_value: rec.inventory_value ?? null,
+            recommendation_sold_qty_30d: rec.sold_qty_30d ?? null,
+            recommendation_sold_qty_90d: rec.sold_qty_90d ?? null,
+            recommendation_adu_30: rec.adu_30 ?? null,
+            recommendation_adu_90: rec.adu_90 ?? null,
+            recommendation_adjusted_adu: rec.adjusted_adu ?? null,
+            recommendation_incoming_po_qty_total: rec.incoming_po_qty_total ?? null,
+            recommendation_incoming_po_allocation_qty: rec.incoming_po_allocation_qty ?? null,
+            recommendation_effective_stock: rec.effective_stock ?? null,
+            recommendation_current_days_cover: rec.current_days_cover ?? null,
+            recommendation_effective_days_cover: rec.effective_days_cover ?? null,
+            recommendation_target_qty: rec.target_qty ?? null,
+            recommendation_surplus_qty: rec.surplus_qty ?? null,
+            recommendation_shortage_qty: rec.shortage_qty ?? null,
+            recommended_action: rec.recommended_action ?? null,
+            recommended_transfer_qty: rec.recommended_transfer_qty ?? null,
+            recommended_purchase_qty: rec.recommended_purchase_qty ?? null,
+            primary_suggested_donor_branch_code: rec.primary_suggested_donor_branch_code ?? null,
+            recommendation_reason: rec.recommendation_reason ?? null,
+            recommendation_flags: rec.recommendation_flags ?? null,
+            donor_snapshot: rec.donor_snapshot ?? null,
+            recommendation_snapshot: rec.recommendation_snapshot ?? null,
+          };
+        }),
+      };
     }
 
     // INSERT draft line
@@ -341,13 +387,54 @@ function createDraftMockDb() {
         updated_at: new Date().toISOString(),
       };
       state.draftLines.push(row);
+      return { rowCount: 1, rows: [{ draft_line_id: row.draft_line_id }] };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_draft_line_recommendations")) {
+      state.draftLineRecommendations.push({
+        draft_line_recommendation_id: state.nextDraftLineRecommendationId++,
+        draft_line_id: Number(params[0]),
+        target_days: Number(params[1]),
+        incoming_allocation_mode: params[2],
+        incoming_source_mode: params[3],
+        recommendation_generated_at: params[4],
+        recommendation_basis_date_from: params[5],
+        recommendation_basis_date_to: params[6],
+        product_code: params[7],
+        current_stock: params[8] == null ? null : Number(params[8]),
+        unit_cost_avg: params[9] == null ? null : Number(params[9]),
+        inventory_value: params[10] == null ? null : Number(params[10]),
+        sold_qty_30d: params[11] == null ? null : Number(params[11]),
+        sold_qty_90d: params[12] == null ? null : Number(params[12]),
+        adu_30: params[13] == null ? null : Number(params[13]),
+        adu_90: params[14] == null ? null : Number(params[14]),
+        adjusted_adu: params[15] == null ? null : Number(params[15]),
+        incoming_po_qty_total: params[16] == null ? null : Number(params[16]),
+        incoming_po_allocation_qty: params[17] == null ? null : Number(params[17]),
+        effective_stock: params[18] == null ? null : Number(params[18]),
+        current_days_cover: params[19] == null ? null : Number(params[19]),
+        effective_days_cover: params[20] == null ? null : Number(params[20]),
+        target_qty: params[21] == null ? null : Number(params[21]),
+        surplus_qty: Number(params[22] || 0),
+        shortage_qty: Number(params[23] || 0),
+        recommended_action: params[24],
+        recommended_transfer_qty: Number(params[25] || 0),
+        recommended_purchase_qty: Number(params[26] || 0),
+        primary_suggested_donor_branch_code: params[27] || null,
+        recommendation_reason: params[28] || null,
+        recommendation_flags: params[29] ? JSON.parse(params[29]) : [],
+        donor_snapshot: params[30] ? JSON.parse(params[30]) : [],
+        recommendation_snapshot: params[31] ? JSON.parse(params[31]) : {},
+      });
       return { rowCount: 1, rows: [] };
     }
 
     // DELETE draft lines
     if (normalized.startsWith("delete from ordering.stock_request_draft_lines where draft_id = $1")) {
       const before = state.draftLines.length;
+      const removedLineIds = state.draftLines.filter((r) => r.draft_id === Number(params[0])).map((r) => r.draft_line_id);
       state.draftLines = state.draftLines.filter((r) => r.draft_id !== Number(params[0]));
+      state.draftLineRecommendations = state.draftLineRecommendations.filter((r) => !removedLineIds.includes(r.draft_line_id));
       return { rowCount: before - state.draftLines.length, rows: [] };
     }
 
@@ -400,6 +487,15 @@ function createDraftMockDb() {
       const row = { line_id: state.nextLineId++, request_id: Number(params[0]), product_code: params[1] };
       state.lines.push(row);
       return { rowCount: 1, rows: [{ line_id: row.line_id }] };
+    }
+    if (normalized.startsWith("insert into ordering.stock_request_line_recommendations")) {
+      state.lineRecommendations.push({
+        request_line_recommendation_id: state.nextLineRecommendationId++,
+        line_id: Number(params[0]),
+        product_code: params[7],
+        request_matches_recommendation: Boolean(params[27]),
+      });
+      return { rowCount: 1, rows: [] };
     }
     if (normalized.startsWith("insert into ordering.stock_request_events")) {
       state.events.push({ event_id: state.nextEventId++ });
@@ -467,6 +563,43 @@ function sampleLine(overrides = {}) {
     snapshotQty: 12,
     snapshotSyncedAt: "2026-06-24T08:00:00.000Z",
     lineNote: "",
+    ...overrides,
+  };
+}
+
+function sampleRecommendation(overrides = {}) {
+  return {
+    targetDays: 90,
+    incomingAllocationMode: "EQUAL_SPLIT",
+    incomingSourceMode: "LIVE_RECEIPTS",
+    recommendationGeneratedAt: "2026-06-24T08:05:00.000Z",
+    recommendationBasisDateFrom: "2026-03-26",
+    recommendationBasisDateTo: "2026-06-23",
+    currentStock: 12,
+    unitCostAvg: 45.5,
+    inventoryValue: 546,
+    soldQty30d: 9,
+    soldQty90d: 24,
+    adu30: 0.3,
+    adu90: 0.266667,
+    adjustedAdu: 0.266667,
+    incomingPoQtyTotal: 8,
+    incomingPoAllocationQty: 2,
+    effectiveStock: 14,
+    currentDaysCover: 45,
+    effectiveDaysCover: 52.5,
+    targetQty: 24,
+    surplusQty: 0,
+    shortageQty: 10,
+    recommendedAction: "TRANSFER",
+    recommendedTransferQty: 10,
+    recommendedPurchaseQty: 0,
+    recommendedRequestQty: 10,
+    primarySuggestedDonorBranchCode: "000",
+    recommendationReason: "Low cover vs 90-day target",
+    recommendationFlags: ["LOW_COVER"],
+    donorSnapshot: [{ branchCode: "000", availableQty: 20 }],
+    recommendationSnapshot: { urgencyScore: 82 },
     ...overrides,
   };
 }
@@ -544,6 +677,34 @@ test("second PUT with correct version updates draft and increments version", asy
   assert.equal(draft.version, firstVersion + 1, "version increments by 1");
   assert.equal(draft.note, "v2");
   assert.equal(draft.lines.length, 2);
+});
+
+test("draft save/load preserves recommendation sidecar metadata", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+  const csrfToken = await loginAsBranch001(agent);
+
+  const save = await agent
+    .put("/api/stock-request-draft/me")
+    .set("x-csrf-token", csrfToken)
+    .send({
+      version: 0,
+      note: "with recommendation",
+      lines: [sampleLine({ recommendation: sampleRecommendation() })],
+    });
+
+  assert.equal(save.status, 200);
+  assert.equal(db.state.draftLineRecommendations.length, 1);
+  assert.equal(db.state.draftLineRecommendations[0].recommended_action, "TRANSFER");
+
+  const load = await agent
+    .get("/api/stock-request-draft/me")
+    .set("x-csrf-token", csrfToken);
+
+  assert.equal(load.status, 200);
+  assert.equal(load.body.draft.lines[0].recommendation.recommendedAction, "TRANSFER");
+  assert.equal(load.body.draft.lines[0].recommendation.recommendedTransferQty, 10);
+  assert.equal(load.body.draft.lines[0].recommendation.primarySuggestedDonorBranchCode, "000");
 });
 
 test("stale PUT returns 409 with DRAFT_VERSION_CONFLICT", async () => {

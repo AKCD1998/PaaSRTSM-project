@@ -37,6 +37,7 @@ const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
 const { createReviewQueueRouter } = require("./routes/review-queue");
 const { createMovementAnalyticsRouter } = require("./routes/movement-analytics");
+const { createStockRecommendationsRouter } = require("./routes/stock-recommendations");
 const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowledge");
 const { createIngredientAdminRouter } = require("./routes/ingredient-admin");
 const { createFocusProductsRouter, createFocusProductsAdminRouter } = require("./routes/focus-products");
@@ -290,6 +291,13 @@ function createApp(overrides = {}) {
   app.use(
     "/api/admin",
     createMovementAnalyticsRouter({
+      db,
+      requireAuthMiddleware,
+    }),
+  );
+  app.use(
+    "/api/admin",
+    createStockRecommendationsRouter({
       db,
       requireAuthMiddleware,
     }),

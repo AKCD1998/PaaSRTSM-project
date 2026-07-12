@@ -94,6 +94,7 @@ function createInitialState() {
     batches: [],
     requests: [],
     lines: [],
+    lineRecommendations: [],
     responses: [],
     notifications: [],
     documents: [],
@@ -109,6 +110,7 @@ function createInitialState() {
     nextBatchId: 1,
     nextRequestId: 1,
     nextLineId: 1,
+    nextLineRecommendationId: 1,
     nextResponseId: 1,
     nextNotificationId: 1,
     nextDocumentId: 1,
@@ -129,6 +131,7 @@ function cloneState(state) {
     batches: state.batches.map((row) => ({ ...row })),
     requests: state.requests.map((row) => ({ ...row })),
     lines: state.lines.map((row) => ({ ...row })),
+    lineRecommendations: state.lineRecommendations.map((row) => ({ ...row })),
     responses: state.responses.map((row) => ({ ...row })),
     notifications: state.notifications.map((row) => ({ ...row })),
     documents: state.documents.map((row) => ({ ...row })),
@@ -142,6 +145,7 @@ function cloneState(state) {
     nextBatchId: state.nextBatchId,
     nextRequestId: state.nextRequestId,
     nextLineId: state.nextLineId,
+    nextLineRecommendationId: state.nextLineRecommendationId,
     nextResponseId: state.nextResponseId,
     nextNotificationId: state.nextNotificationId,
     nextDocumentId: state.nextDocumentId,
@@ -362,14 +366,51 @@ function createStockRequestMockDb() {
     }
 
     if (
-      normalized.includes("select line_id, request_id, product_code, product_name_thai, product_name_eng, barcode, unit, requested_qty, snapshot_qty, snapshot_synced_at, status, created_at") &&
+      normalized.includes("product_name_thai") &&
       normalized.includes("from ordering.stock_request_lines") &&
-      normalized.includes("where request_id = any($1::bigint[])")
+      normalized.includes("request_id = any($1::bigint[])")
     ) {
       const ids = Array.isArray(params[0]) ? params[0].map(Number) : [];
       const rows = state.lines
         .filter((row) => ids.includes(Number(row.request_id)))
-        .sort((left, right) => left.request_id - right.request_id || left.line_id - right.line_id);
+        .sort((left, right) => left.request_id - right.request_id || left.line_id - right.line_id)
+        .map((row) => {
+          const rec = state.lineRecommendations.find((item) => item.line_id === row.line_id) || {};
+          return {
+            ...row,
+            recommendation_target_days: rec.target_days ?? null,
+            recommendation_incoming_allocation_mode: rec.incoming_allocation_mode ?? null,
+            recommendation_incoming_source_mode: rec.incoming_source_mode ?? null,
+            recommendation_generated_at: rec.recommendation_generated_at ?? null,
+            recommendation_basis_date_from: rec.recommendation_basis_date_from ?? null,
+            recommendation_basis_date_to: rec.recommendation_basis_date_to ?? null,
+            recommendation_current_stock: rec.current_stock ?? null,
+            recommendation_unit_cost_avg: rec.unit_cost_avg ?? null,
+            recommendation_inventory_value: rec.inventory_value ?? null,
+            recommendation_sold_qty_30d: rec.sold_qty_30d ?? null,
+            recommendation_sold_qty_90d: rec.sold_qty_90d ?? null,
+            recommendation_adu_30: rec.adu_30 ?? null,
+            recommendation_adu_90: rec.adu_90 ?? null,
+            recommendation_adjusted_adu: rec.adjusted_adu ?? null,
+            recommendation_incoming_po_qty_total: rec.incoming_po_qty_total ?? null,
+            recommendation_incoming_po_allocation_qty: rec.incoming_po_allocation_qty ?? null,
+            recommendation_effective_stock: rec.effective_stock ?? null,
+            recommendation_current_days_cover: rec.current_days_cover ?? null,
+            recommendation_effective_days_cover: rec.effective_days_cover ?? null,
+            recommendation_target_qty: rec.target_qty ?? null,
+            recommendation_surplus_qty: rec.surplus_qty ?? null,
+            recommendation_shortage_qty: rec.shortage_qty ?? null,
+            recommended_action: rec.recommended_action ?? null,
+            recommended_transfer_qty: rec.recommended_transfer_qty ?? null,
+            recommended_purchase_qty: rec.recommended_purchase_qty ?? null,
+            request_matches_recommendation: rec.request_matches_recommendation ?? null,
+            primary_suggested_donor_branch_code: rec.primary_suggested_donor_branch_code ?? null,
+            recommendation_reason: rec.recommendation_reason ?? null,
+            recommendation_flags: rec.recommendation_flags ?? null,
+            donor_snapshot: rec.donor_snapshot ?? null,
+            recommendation_snapshot: rec.recommendation_snapshot ?? null,
+          };
+        });
       return { rowCount: rows.length, rows };
     }
 
@@ -495,6 +536,46 @@ function createStockRequestMockDb() {
       };
       state.lines.push(row);
       return { rowCount: 1, rows: [{ line_id: row.line_id }] };
+    }
+
+    if (normalized.startsWith("insert into ordering.stock_request_line_recommendations")) {
+      state.lineRecommendations.push({
+        request_line_recommendation_id: state.nextLineRecommendationId++,
+        line_id: Number(params[0]),
+        target_days: Number(params[1]),
+        incoming_allocation_mode: params[2],
+        incoming_source_mode: params[3],
+        recommendation_generated_at: params[4],
+        recommendation_basis_date_from: params[5],
+        recommendation_basis_date_to: params[6],
+        product_code: params[7],
+        current_stock: params[8] == null ? null : Number(params[8]),
+        unit_cost_avg: params[9] == null ? null : Number(params[9]),
+        inventory_value: params[10] == null ? null : Number(params[10]),
+        sold_qty_30d: params[11] == null ? null : Number(params[11]),
+        sold_qty_90d: params[12] == null ? null : Number(params[12]),
+        adu_30: params[13] == null ? null : Number(params[13]),
+        adu_90: params[14] == null ? null : Number(params[14]),
+        adjusted_adu: params[15] == null ? null : Number(params[15]),
+        incoming_po_qty_total: params[16] == null ? null : Number(params[16]),
+        incoming_po_allocation_qty: params[17] == null ? null : Number(params[17]),
+        effective_stock: params[18] == null ? null : Number(params[18]),
+        current_days_cover: params[19] == null ? null : Number(params[19]),
+        effective_days_cover: params[20] == null ? null : Number(params[20]),
+        target_qty: params[21] == null ? null : Number(params[21]),
+        surplus_qty: Number(params[22] || 0),
+        shortage_qty: Number(params[23] || 0),
+        recommended_action: params[24],
+        recommended_transfer_qty: Number(params[25] || 0),
+        recommended_purchase_qty: Number(params[26] || 0),
+        request_matches_recommendation: Boolean(params[27]),
+        primary_suggested_donor_branch_code: params[28] || null,
+        recommendation_reason: params[29] || null,
+        recommendation_flags: params[30] ? JSON.parse(params[30]) : [],
+        donor_snapshot: params[31] ? JSON.parse(params[31]) : [],
+        recommendation_snapshot: params[32] ? JSON.parse(params[32]) : {},
+      });
+      return { rowCount: 1, rows: [] };
     }
 
     if (normalized.startsWith("insert into ordering.stock_request_events")) {
@@ -917,6 +998,43 @@ async function submitSampleBatch(agent, csrfToken, overrides = {}) {
   return response;
 }
 
+function sampleRecommendation(overrides = {}) {
+  return {
+    targetDays: 90,
+    incomingAllocationMode: "EQUAL_SPLIT",
+    incomingSourceMode: "LIVE_RECEIPTS",
+    recommendationGeneratedAt: "2026-06-18T08:05:00.000Z",
+    recommendationBasisDateFrom: "2026-03-20",
+    recommendationBasisDateTo: "2026-06-17",
+    currentStock: 6,
+    unitCostAvg: 12.5,
+    inventoryValue: 75,
+    soldQty30d: 15,
+    soldQty90d: 36,
+    adu30: 0.5,
+    adu90: 0.4,
+    adjustedAdu: 0.44,
+    incomingPoQtyTotal: 8,
+    incomingPoAllocationQty: 2,
+    effectiveStock: 8,
+    currentDaysCover: 13.6,
+    effectiveDaysCover: 18.1,
+    targetQty: 39.6,
+    surplusQty: 0,
+    shortageQty: 31.6,
+    recommendedAction: "TRANSFER",
+    recommendedTransferQty: 3,
+    recommendedPurchaseQty: 0,
+    recommendedRequestQty: 3,
+    primarySuggestedDonorBranchCode: "003",
+    recommendationReason: "Below target cover",
+    recommendationFlags: ["LOW_COVER"],
+    donorSnapshot: [{ branchCode: "003", availableQty: 10 }],
+    recommendationSnapshot: { urgencyScore: 90 },
+    ...overrides,
+  };
+}
+
 test("branch user submits one batch that fans out into child requests and line events in one transaction", async () => {
   const { app, db } = createTestApp();
   const agent = request.agent(app);
@@ -990,6 +1108,48 @@ test("branch user submits one batch that fans out into child requests and line e
     ],
   );
   assert.deepEqual(db.state.txLog, ["BEGIN", "COMMIT"]);
+});
+
+test("request submission persists recommendation sidecar metadata and exposes it in batch detail", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+  const csrfToken = await login(agent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+
+  const submit = await agent
+    .post("/api/stock-requests")
+    .set("x-csrf-token", csrfToken)
+    .send({
+      idempotencyKey: "stock-request:001:with-recommendation",
+      groups: [
+        {
+          sourceBranchCode: "003",
+          lines: [
+            {
+              productCode: "630010002",
+              requestedQty: 3,
+              unit: "TAB",
+              snapshotQty: 6,
+              recommendation: sampleRecommendation(),
+            },
+          ],
+        },
+      ],
+    });
+
+  assert.equal(submit.status, 201);
+  assert.equal(db.state.lineRecommendations.length, 1);
+  assert.equal(db.state.lineRecommendations[0].recommended_action, "TRANSFER");
+  assert.equal(db.state.lineRecommendations[0].request_matches_recommendation, true);
+
+  const detail = await agent.get(`/api/stock-requests/${submit.body.batchPublicId}`);
+  assert.equal(detail.status, 200);
+  const line = detail.body.batch.requests[0].lines[0];
+  assert.equal(line.recommendation.recommendedAction, "TRANSFER");
+  assert.equal(line.recommendation.recommendedTransferQty, 3);
+  assert.equal(line.recommendation.requestMatchesRecommendation, true);
 });
 
 test("submit is idempotent on idempotencyKey for the same actor and branch", async () => {
