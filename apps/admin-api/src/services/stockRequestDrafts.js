@@ -6,7 +6,14 @@ const DRAFT_NOTE_MAX_CHARS = 2000;
 const DRAFT_LINE_NOTE_MAX_CHARS = 500;
 const ALLOWED_SUBMITTER_ROLES = new Set(["admin", "branch", "staff"]);
 const VALID_REQUEST_MODES = new Set(["STANDARD", "ADMIN_ALERT"]);
-const VALID_RECOMMENDED_ACTIONS = new Set(["NO_ACTION", "TRANSFER", "PURCHASE", "TRANSFER_AND_PURCHASE"]);
+const VALID_RECOMMENDED_ACTIONS = new Set([
+  "NO_ACTION",
+  "TRANSFER",
+  "TRANSFER_IN",
+  "PURCHASE",
+  "TRANSFER_AND_PURCHASE",
+  "NO_PURCHASE_SLOW_MOVING",
+]);
 const VALID_INCOMING_MODES = new Set(["UNKNOWN", "EQUAL_SPLIT", "BRANCH_SPECIFIC", "MANUAL", "LIVE_RECEIPTS"]);
 
 function createHttpError(message, statusCode, extra = {}) {
