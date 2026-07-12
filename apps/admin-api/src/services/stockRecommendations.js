@@ -93,6 +93,23 @@ function addDays(isoDate, days) {
   return date.toISOString().slice(0, 10);
 }
 
+function formatDateOnly(value) {
+  if (!value) return null;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    return value.toISOString().slice(0, 10);
+  }
+
+  const normalized = normalizeText(value);
+  if (isIsoDate(normalized)) {
+    return normalized;
+  }
+
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
 async function loadActiveBranches(db) {
   const result = await db.query(
     `
@@ -237,10 +254,11 @@ async function resolveAnchorDate(db, filters) {
     `,
   );
   const latestDate = result.rows[0]?.latest_date || null;
-  if (!latestDate) {
+  const normalizedLatestDate = formatDateOnly(latestDate);
+  if (!normalizedLatestDate) {
     return new Date().toISOString().slice(0, 10);
   }
-  return String(latestDate).slice(0, 10);
+  return normalizedLatestDate;
 }
 
 async function loadCurrentStockByProduct(db, { search }) {

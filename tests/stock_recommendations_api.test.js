@@ -166,7 +166,7 @@ function createMockDb() {
       }
 
       if (normalized.startsWith("select max(doc_date)::date as latest_date from ada.sales_headers")) {
-        return { rowCount: 1, rows: [{ latest_date: "2026-07-12" }] };
+        return { rowCount: 1, rows: [{ latest_date: new Date("2026-07-12T00:00:00.000Z") }] };
       }
 
       if (normalized.includes("from ada.branch_stock_snapshots bs") && normalized.includes("order by bs.product_code asc")) {
