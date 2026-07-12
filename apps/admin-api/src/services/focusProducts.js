@@ -205,9 +205,15 @@ async function freezeFocusProduct(db, id, soldByBranch, totalSold) {
   return result.rows[0] || null;
 }
 
-async function attachProgress(db, focusRows, allActiveBranchCodes) {
+async function attachProgress(db, focusRows, allActiveBranchCodes, timings = null) {
+  const mark = (label, start) => {
+    if (timings) timings.push({ label, ms: Date.now() - start });
+  };
+
+  let t = Date.now();
   const productCodes = [...new Set(focusRows.map((row) => row.product_code))];
   const nameMap = await fetchProductNames(db, productCodes);
+  mark("fetchProductNames", t);
   const today = todayBangkokIso();
 
   // Frozen rows never need a live sales query. Unfrozen rows are grouped by
@@ -223,8 +229,10 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
   }
   const batchByRange = new Map(); // "dateFrom|dateTo" -> Map<productCode, {branchCode: qty}>
   for (const [key, codes] of rangeGroups) {
+    t = Date.now();
     const [dateFrom, dateTo] = key.split("|");
     batchByRange.set(key, await fetchSoldQtyBatch(db, [...codes], dateFrom, dateTo));
+    mark(`fetchSoldQtyBatch(${codes.size} codes, ${key})`, t);
   }
 
   const results = [];
@@ -266,13 +274,25 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
   return results;
 }
 
-async function listFocusProducts(db, { includeInactive = false } = {}) {
+async function listFocusProducts(db, { includeInactive = false, debug = false } = {}) {
+  const timings = debug ? [] : null;
+  const mark = (label, start) => {
+    if (timings) timings.push({ label, ms: Date.now() - start });
+  };
+
+  let t = Date.now();
   const sql = includeInactive
     ? `SELECT * FROM focus.focus_products ORDER BY created_at DESC`
     : `SELECT * FROM focus.focus_products WHERE is_active = TRUE ORDER BY created_at DESC`;
   const result = await db.query(sql);
+  mark("select focus_products", t);
+
+  t = Date.now();
   const activeBranchCodes = await fetchActiveBranchCodes(db);
-  return attachProgress(db, result.rows, activeBranchCodes);
+  mark("fetchActiveBranchCodes", t);
+
+  const rows = await attachProgress(db, result.rows, activeBranchCodes, timings);
+  return debug ? { rows, timings } : rows;
 }
 
 async function createFocusProduct(db, fields) {

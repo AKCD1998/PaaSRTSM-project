@@ -21,8 +21,10 @@ function createFocusProductsRouter(deps) {
 
   router.get("/focus-products", requireAuthMiddleware, async (req, res, next) => {
     try {
-      const rows = await listFocusProducts(db, { includeInactive: false });
-      return res.json({ ok: true, focusProducts: rows, request_id: req.requestId || null });
+      const debug = req.query.debug === "1";
+      const result = await listFocusProducts(db, { includeInactive: false, debug });
+      const { rows, timings } = debug ? result : { rows: result, timings: undefined };
+      return res.json({ ok: true, focusProducts: rows, timings, request_id: req.requestId || null });
     } catch (error) {
       return next(error);
     }
@@ -40,8 +42,10 @@ function createFocusProductsAdminRouter(deps) {
 
   router.get("/focus-products", auth, async (req, res, next) => {
     try {
-      const rows = await listFocusProducts(db, { includeInactive: true });
-      return res.json({ ok: true, focusProducts: rows, request_id: req.requestId || null });
+      const debug = req.query.debug === "1";
+      const result = await listFocusProducts(db, { includeInactive: true, debug });
+      const { rows, timings } = debug ? result : { rows: result, timings: undefined };
+      return res.json({ ok: true, focusProducts: rows, timings, request_id: req.requestId || null });
     } catch (error) {
       return next(error);
     }
