@@ -35,9 +35,12 @@ function normalizeBranchCodes(value) {
   return codes.length > 0 ? codes : null;
 }
 
-// {branch_code: target_qty} overrides — only meaningful for group_manager
-// rows, where each branch can have its own distinct target for the same
-// product. Absent/empty branches fall back to the row's global target_qty.
+// {branch_code: target_qty} overrides — lets a branch have its own distinct
+// target for the same product (group_manager: differing per-branch targets
+// that must each be cleared; pharmacist/store_manager: a branch whose real
+// target isn't known yet, set to 0 as an explicit placeholder). Absent
+// branches fall back to the row's global target_qty. Zero is allowed here
+// (unlike the row's own target_qty) specifically to represent "not set yet".
 function normalizeBranchTargets(value) {
   if (value == null) return null;
   if (typeof value !== "object" || Array.isArray(value)) {
@@ -48,8 +51,8 @@ function normalizeBranchTargets(value) {
     const code = normalizeText(rawCode);
     if (!code) continue;
     const qty = Number(rawQty);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      throw createHttpError(`branchTargets.${code} must be a positive number.`, 400);
+    if (!Number.isFinite(qty) || qty < 0) {
+      throw createHttpError(`branchTargets.${code} must be zero or a positive number.`, 400);
     }
     entries.push([code, qty]);
   }

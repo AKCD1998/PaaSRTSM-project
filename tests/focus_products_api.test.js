@@ -405,7 +405,7 @@ test("admin can set branchTargets on create and it round-trips", async () => {
   assert.equal(created.body.focusProduct.branchTargetsEffective["005"], 3);
 });
 
-test("branchTargets rejects non-positive values", async () => {
+test("branchTargets rejects negative values but allows zero as a placeholder", async () => {
   const { app } = createTestApp();
   const admin = request.agent(app);
   const csrf = await loginAs(admin);
@@ -419,7 +419,25 @@ test("branchTargets rejects non-positive values", async () => {
       targetQty: 3,
       dateFrom: "2026-07-01",
       dateTo: "2026-07-31",
-      branchTargets: { "001": 0 },
+      branchTargets: { "001": -1 },
     });
   assert.equal(bad.status, 400);
+
+  // Zero means "target not known yet" — a legitimate placeholder for a
+  // branch that hasn't been assigned a real number.
+  const ok = await admin
+    .post("/api/admin/focus-products")
+    .set("x-csrf-token", csrf)
+    .send({
+      productCode: "IC-2",
+      focusType: "pharmacist",
+      targetQty: 5,
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31",
+      branchCodes: ["001", "005"],
+      branchTargets: { "001": 0 },
+    });
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.focusProduct.branchTargetsEffective["001"], 0);
+  assert.equal(ok.body.focusProduct.branchTargetsEffective["005"], 5);
 });
