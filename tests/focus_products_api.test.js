@@ -45,11 +45,15 @@ function createMockDb() {
         date_from: "2026-07-01",
         date_to: "2026-07-31",
         branch_codes: null,
+        assigned_person_name: "กนกวรา มันทะเสน",
         note: "โปรโมชั่นเดือนกรกฎาคม",
         is_active: true,
         created_by: "admin@example.com",
         created_at: "2026-07-01T00:00:00.000Z",
         updated_at: "2026-07-01T00:00:00.000Z",
+        frozen_sold_by_branch: null,
+        frozen_total_sold: null,
+        frozen_at: null,
       }],
     ]),
   };
@@ -94,8 +98,12 @@ function createMockDb() {
           note: params[6],
           is_active: true,
           created_by: params[7],
+          assigned_person_name: params[8] || null,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
+          frozen_sold_by_branch: null,
+          frozen_total_sold: null,
+          frozen_at: null,
         };
         state.rows.set(id, row);
         return { rowCount: 1, rows: [{ id }] };
@@ -113,8 +121,12 @@ function createMockDb() {
             branch_codes: params[6],
             note: params[7],
             is_active: params[8],
+            assigned_person_name: params[9] || null,
             updated_at: new Date().toISOString(),
           });
+          if (q.includes("frozen_at = null")) {
+            Object.assign(row, { frozen_sold_by_branch: null, frozen_total_sold: null, frozen_at: null });
+          }
         }
         return { rowCount: row ? 1 : 0, rows: [] };
       }
@@ -123,6 +135,17 @@ function createMockDb() {
         const row = state.rows.get(id);
         if (row) row.is_active = false;
         return { rowCount: row ? 1 : 0, rows: [] };
+      }
+      if (q.startsWith("update focus.focus_products set frozen_sold_by_branch")) {
+        const id = Number(params[0]);
+        const row = state.rows.get(id);
+        if (row && !row.frozen_at) {
+          row.frozen_sold_by_branch = JSON.parse(params[1]);
+          row.frozen_total_sold = params[2];
+          row.frozen_at = new Date().toISOString();
+          return { rowCount: 1, rows: [{ frozen_sold_by_branch: row.frozen_sold_by_branch, frozen_total_sold: row.frozen_total_sold, frozen_at: row.frozen_at }] };
+        }
+        return { rowCount: 0, rows: [] };
       }
 
       throw new Error(`Unhandled mock query: ${q}`);
@@ -252,6 +275,65 @@ test("create rejects invalid focusType, non-positive targetQty, and inverted dat
     .set("x-csrf-token", csrf)
     .send({ productCode: "IC-1", focusType: "pharmacist", targetQty: 5, dateFrom: "2026-07-31", dateTo: "2026-07-01" });
   assert.equal(badRange.status, 400);
+});
+
+test("salesperson row surfaces the assigned employee name", async () => {
+  const { app } = createTestApp();
+  const staff = request.agent(app);
+  await loginAs(staff, "staff@example.com", "staff-pass-123");
+
+  const res = await staff.get("/api/focus-products");
+  assert.equal(res.body.focusProducts[0].assignedPersonName, "กนกวรา มันทะเสน");
+});
+
+test("a focus row whose date_to has already passed is frozen on first read", async () => {
+  const { app, db } = createTestApp();
+  db.state.rows.get(1).date_from = "2026-01-01";
+  db.state.rows.get(1).date_to = "2026-01-31"; // well in the past relative to test run time
+
+  const staff = request.agent(app);
+  await loginAs(staff, "staff@example.com", "staff-pass-123");
+
+  const first = await staff.get("/api/focus-products");
+  const row = first.body.focusProducts[0];
+  assert.equal(row.isFrozen, true);
+  assert.ok(row.frozenAt);
+  assert.equal(row.totalSold, 15); // 10 (001) + 5 (003) from the mock sales query
+
+  // Mutate the mock's live sales query response to prove the frozen row no
+  // longer re-queries — a later AdaPOS correction must not change history.
+  const originalQuery = db.query.bind(db);
+  db.query = async (sql, params) => {
+    if (String(sql).toLowerCase().includes("from ada.sales_lines sl")) {
+      return { rowCount: 1, rows: [{ branch_code: "001", sold_qty: "999" }] };
+    }
+    return originalQuery(sql, params);
+  };
+
+  const second = await staff.get("/api/focus-products");
+  assert.equal(second.body.focusProducts[0].totalSold, 15); // unchanged — still frozen
+});
+
+test("editing a frozen row's date range clears the freeze so it re-evaluates", async () => {
+  const { app, db } = createTestApp();
+  db.state.rows.get(1).date_from = "2026-01-01";
+  db.state.rows.get(1).date_to = "2026-01-31";
+
+  const admin = request.agent(app);
+  const csrf = await loginAs(admin);
+  await admin.get("/api/admin/focus-products"); // triggers freeze-on-read
+  assert.ok(db.state.rows.get(1).frozen_at);
+
+  // Extend dateTo into the future — the row is "still open" again, so
+  // attachProgress (called at the end of updateFocusProduct) must not
+  // immediately re-freeze it.
+  const updated = await admin
+    .patch("/api/admin/focus-products/1")
+    .set("x-csrf-token", csrf)
+    .send({ dateTo: "2026-08-31" });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.focusProduct.isFrozen, false);
+  assert.equal(db.state.rows.get(1).frozen_at, null);
 });
 
 test("group_manager achieved is true only when every branch clears the target", async () => {

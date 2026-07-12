@@ -35,6 +35,21 @@ function normalizeBranchCodes(value) {
   return codes.length > 0 ? codes : null;
 }
 
+// "Today" for freeze comparisons — Bangkok wall-clock date, matching the
+// convention used elsewhere in the sync pipeline (adapos-sync/src/transform.js).
+function todayBangkokIso() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Bangkok" }).format(new Date());
+}
+
+// pg returns DATE columns as either a JS Date or a "YYYY-MM-DD" string
+// depending on driver config — normalize to the date-only string either way.
+function toIsoDateOnly(value) {
+  if (!value) return "";
+  return value instanceof Date
+    ? new Intl.DateTimeFormat("en-CA", { timeZone: "UTC" }).format(value)
+    : String(value).slice(0, 10);
+}
+
 function mapFocusProductRow(row) {
   return {
     id: Number(row.id),
@@ -44,6 +59,7 @@ function mapFocusProductRow(row) {
     dateFrom: row.date_from,
     dateTo: row.date_to,
     branchCodesRaw: row.branch_codes || null, // null = defaulted to all active branches
+    assignedPersonName: row.assigned_person_name || null,
     note: row.note,
     isActive: row.is_active,
     createdBy: row.created_by,
@@ -91,14 +107,15 @@ async function fetchSoldQtyByBranch(db, productCode, dateFrom, dateTo) {
   const result = await db.query(
     `SELECT
        sh.branch_code,
-       SUM(COALESCE(sl.qty_base, sl.qty * NULLIF(sl.stock_factor, 0), sl.qty, 0))::numeric AS sold_qty
+       SUM(COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0)))::numeric AS sold_qty
      FROM ada.sales_lines sl
      JOIN ada.sales_headers sh
        ON sh.branch_code = sl.branch_code
       AND sh.doc_no = sl.doc_no
      WHERE sl.product_code = $1
        AND sh.doc_date BETWEEN $2 AND $3
-       AND LOWER(COALESCE(sh.paid_status, '')) IN ('1', 'true', 't', 'paid', 'success', 'y')
+       AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
+       AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
      GROUP BY sh.branch_code`,
     [productCode, dateFrom, dateTo],
   );
@@ -139,14 +156,49 @@ function computeStatus(focusType, targetQty, soldByBranch, branchCodes) {
   };
 }
 
+// Once a focus row's date_to has passed, snapshot its sold-qty progress once
+// and lock it — protects the historical/HR record from being silently
+// rewritten by late-arriving AdaPOS corrections (voids/refunds synced after
+// month-end). Uses a conditional UPDATE so concurrent reads can't double-write.
+async function freezeFocusProduct(db, id, soldByBranch, totalSold) {
+  const result = await db.query(
+    `UPDATE focus.focus_products
+     SET frozen_sold_by_branch = $2::jsonb, frozen_total_sold = $3, frozen_at = now()
+     WHERE id = $1 AND frozen_at IS NULL
+     RETURNING frozen_sold_by_branch, frozen_total_sold, frozen_at`,
+    [id, JSON.stringify(soldByBranch), totalSold],
+  );
+  return result.rows[0] || null;
+}
+
 async function attachProgress(db, focusRows, allActiveBranchCodes) {
   const productCodes = [...new Set(focusRows.map((row) => row.product_code))];
   const nameMap = await fetchProductNames(db, productCodes);
+  const today = todayBangkokIso();
 
   const results = [];
   for (const row of focusRows) {
     const branchCodes = normalizeBranchCodes(row.branch_codes) || allActiveBranchCodes;
-    const soldByBranch = await fetchSoldQtyByBranch(db, row.product_code, row.date_from, row.date_to);
+    let soldByBranch;
+    let isFrozen = false;
+    let frozenAt = row.frozen_at || null;
+
+    if (row.frozen_at) {
+      soldByBranch = row.frozen_sold_by_branch || {};
+      isFrozen = true;
+    } else {
+      soldByBranch = await fetchSoldQtyByBranch(db, row.product_code, row.date_from, row.date_to);
+      if (toIsoDateOnly(row.date_to) < today) {
+        const totalSold = Object.values(soldByBranch).reduce((sum, v) => sum + v, 0);
+        const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold);
+        if (frozen) {
+          soldByBranch = frozen.frozen_sold_by_branch || soldByBranch;
+          frozenAt = frozen.frozen_at;
+        }
+        isFrozen = true;
+      }
+    }
+
     const status = computeStatus(row.focus_type, Number(row.target_qty), soldByBranch, branchCodes);
 
     results.push({
@@ -154,6 +206,8 @@ async function attachProgress(db, focusRows, allActiveBranchCodes) {
       productName: nameMap.get(row.product_code) || null,
       branchCodes,
       soldByBranch,
+      isFrozen,
+      frozenAt,
       ...status,
     });
   }
@@ -188,13 +242,14 @@ async function createFocusProduct(db, fields) {
   const branchCodes = normalizeBranchCodes(fields.branchCodes);
   const note = normalizeNullableText(fields.note, NOTE_MAX_CHARS);
   const createdBy = normalizeNullableText(fields.createdBy);
+  const assignedPersonName = normalizeNullableText(fields.assignedPersonName);
 
   const inserted = await db.query(
     `INSERT INTO focus.focus_products
-       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by, assigned_person_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING id`,
-    [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy],
+    [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy, assignedPersonName],
   );
   const row = await fetchFocusProductRow(db, inserted.rows[0].id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
@@ -224,13 +279,21 @@ async function updateFocusProduct(db, id, fields) {
   const branchCodes = fields.branchCodes === undefined ? before.branch_codes : normalizeBranchCodes(fields.branchCodes);
   const note = fields.note === undefined ? before.note : normalizeNullableText(fields.note, NOTE_MAX_CHARS);
   const isActive = fields.isActive === undefined ? before.is_active : Boolean(fields.isActive);
+  const assignedPersonName = fields.assignedPersonName === undefined
+    ? before.assigned_person_name
+    : normalizeNullableText(fields.assignedPersonName);
+
+  // Editing the date range invalidates any existing freeze snapshot — it was
+  // computed for the old range and no longer applies.
+  const dateRangeChanged = dateFrom !== toIsoDateOnly(before.date_from) || dateTo !== toIsoDateOnly(before.date_to);
 
   await db.query(
     `UPDATE focus.focus_products
      SET product_code = $2, focus_type = $3, target_qty = $4, date_from = $5, date_to = $6,
-         branch_codes = $7, note = $8, is_active = $9, updated_at = now()
+         branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, updated_at = now()
+         ${dateRangeChanged ? ", frozen_sold_by_branch = NULL, frozen_total_sold = NULL, frozen_at = NULL" : ""}
      WHERE id = $1`,
-    [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive],
+    [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive, assignedPersonName],
   );
   const row = await fetchFocusProductRow(db, id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
