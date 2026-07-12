@@ -39,6 +39,7 @@ const { createReviewQueueRouter } = require("./routes/review-queue");
 const { createMovementAnalyticsRouter } = require("./routes/movement-analytics");
 const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowledge");
 const { createIngredientAdminRouter } = require("./routes/ingredient-admin");
+const { createFocusProductsRouter, createFocusProductsAdminRouter } = require("./routes/focus-products");
 const {
   createMobileEnrollRouter,
   createBranchStaffRouter,
@@ -305,6 +306,22 @@ function createApp(overrides = {}) {
   app.use(
     "/api/admin/ingredient-dictionary",
     createIngredientAdminRouter({
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
+      requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api",
+    createFocusProductsRouter({
+      db,
+      requireAuthMiddleware,
+    }),
+  );
+  app.use(
+    "/api/admin",
+    createFocusProductsAdminRouter({
       db,
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
