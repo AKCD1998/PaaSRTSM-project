@@ -51,6 +51,7 @@ const { getVideoProvider } = require("./services/video-providers/providerRegistr
 const { getStorageProvider } = require("./services/storage/storageRegistry");
 const { createVideoJobRunner } = require("./services/videoJobRunner");
 const { startAssetCleanupSchedule } = require("./services/videoAssetCleanup");
+const { startStockRecommendationSchedule } = require("./services/stockRecommendationSchedule");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -484,8 +485,17 @@ async function startServer() {
     logger: console,
   });
 
+  // Nightly ordering.stock_recommendation_snapshots refresh. No-ops unless
+  // FEATURE_STOCK_RECOMMENDATION_CRON is set — see stockRecommendationSchedule.js.
+  const stockRecommendationCronTask = startStockRecommendationSchedule({
+    db,
+    config,
+    logger: console,
+  });
+
   const shutdown = async () => {
     if (assetCleanupTimer) clearInterval(assetCleanupTimer);
+    if (stockRecommendationCronTask) stockRecommendationCronTask.stop();
     server.close(async () => {
       if (db && typeof db.end === "function") {
         await db.end();

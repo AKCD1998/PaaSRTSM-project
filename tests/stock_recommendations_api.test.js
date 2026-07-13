@@ -208,18 +208,6 @@ function createMockDb() {
 
       if (
         normalized.includes("select distinct product_code") &&
-        normalized.includes("from analytics.product_sales_summary_periods") &&
-        normalized.includes("sold_qty_base > 0")
-      ) {
-        const branchCodes = Array.isArray(params[0]) ? params[0] : [];
-        const rows = state.salesAggRows
-          .filter((row) => branchCodes.includes(row.branch_code) && Number(row.sold_qty_30d || 0) + Number(row.sold_qty_90d || 0) > 0)
-          .map((row) => ({ product_code: row.product_code }));
-        return { rowCount: rows.length, rows };
-      }
-
-      if (
-        normalized.includes("select distinct product_code") &&
         normalized.includes("from ( select l.product_code from ada.pending_receipt_lines l")
       ) {
         const rows = state.incomingRows.map((row) => ({ product_code: row.product_code }));
@@ -240,14 +228,11 @@ function createMockDb() {
       }
 
       if (
-        normalized.includes("from analytics.product_sales_summary_periods") &&
-        normalized.includes("sum(sold_qty_base) filter")
+        normalized.includes("from ada.sales_headers sh") &&
+        normalized.includes("join ada.sales_lines sl")
       ) {
         const branchCodes = Array.isArray(params[0]) ? params[0] : [];
-        const productCodes = Array.isArray(params[1]) ? params[1] : [];
-        const rows = state.salesAggRows.filter(
-          (row) => branchCodes.includes(row.branch_code) && productCodes.includes(row.product_code),
-        );
+        const rows = state.salesAggRows.filter((row) => branchCodes.includes(row.branch_code));
         return { rowCount: rows.length, rows };
       }
 

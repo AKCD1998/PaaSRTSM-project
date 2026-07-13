@@ -280,7 +280,7 @@ function buildBranchQtyPositiveSql(branchCodes, alias = "bs") {
   return parts.length ? `(${parts.join(" OR ")})` : "FALSE";
 }
 
-async function loadCandidateProductCodes(db, { scope, search, anchorDate }) {
+async function loadCandidateProductCodes(db, { scope, search, rawSalesAgg }) {
   const normalizedSearch = normalizeText(search || "");
   const productCodes = new Set();
 
@@ -328,19 +328,11 @@ async function loadCandidateProductCodes(db, { scope, search, anchorDate }) {
     if (row.product_code) productCodes.add(String(row.product_code));
   }
 
-  const salesResult = await db.query(
-    `
-      SELECT DISTINCT product_code
-      FROM analytics.product_sales_summary_periods
-      WHERE branch_code = ANY($1::text[])
-        AND period_end = $2::date
-        AND period_days IN (30, 90)
-        AND sold_qty_base > 0
-    `,
-    [scope.activeBranchCodes, anchorDate],
-  );
-  for (const row of salesResult.rows) {
-    if (row.product_code) productCodes.add(String(row.product_code));
+  for (const key of rawSalesAgg.keys()) {
+    const agg = rawSalesAgg.get(key);
+    if (agg.soldQty30d > 0 || agg.soldQty90d > 0) {
+      productCodes.add(key.slice(0, key.lastIndexOf("|")));
+    }
   }
 
   const incomingResult = await db.query(
@@ -430,26 +422,39 @@ async function loadCurrentStockByProduct(db, { productCodes }) {
   }));
 }
 
-async function loadSalesAggByProductBranch(db, { productCodes, branchCodes, anchorDate }) {
-  if (!Array.isArray(productCodes) || productCodes.length === 0 || !Array.isArray(branchCodes) || branchCodes.length === 0) {
+// Reads straight from ada.sales_lines/ada.sales_headers instead of
+// analytics.product_sales_summary_periods: that table's period_days=90 bucket
+// is only ever populated by ada.refresh_sales_summary_period_into_analytics()
+// (migration 017), which filters on paid_status IN ('1', ...) — real data uses
+// paid_status='3' (see movement-analytics.js / focusProducts.js), so that
+// function's output is effectively empty and hasn't refreshed since
+// 2026-05-20. The only live feed (adapos_sync, from the branch senders) only
+// ever pushes period_days=30, so soldQty90d was always 0 and every product
+// looked like a 90-day non-mover. Querying the raw tables directly with the
+// correct paid filter fixes both windows at the source.
+async function loadRawSalesAggByBranch(db, { branchCodes, window30From, window90From, anchorDate }) {
+  if (!Array.isArray(branchCodes) || branchCodes.length === 0) {
     return new Map();
   }
 
   const result = await db.query(
     `
       SELECT
-        product_code,
-        branch_code,
-        COALESCE(SUM(sold_qty_base) FILTER (WHERE period_days = 30), 0)::numeric AS sold_qty_30d,
-        COALESCE(SUM(sold_qty_base) FILTER (WHERE period_days = 90), 0)::numeric AS sold_qty_90d
-      FROM analytics.product_sales_summary_periods
-      WHERE branch_code = ANY($1::text[])
-        AND product_code = ANY($2::text[])
-        AND period_end = $3::date
-        AND period_days IN (30, 90)
-      GROUP BY product_code, branch_code
+        sl.product_code,
+        sh.branch_code,
+        COALESCE(SUM(COALESCE(sl.qty_base, sl.qty, 0)) FILTER (WHERE sh.doc_date >= $4::date), 0)::numeric AS sold_qty_30d,
+        COALESCE(SUM(COALESCE(sl.qty_base, sl.qty, 0)), 0)::numeric AS sold_qty_90d
+      FROM ada.sales_headers sh
+      JOIN ada.sales_lines sl
+        ON sl.branch_code = sh.branch_code
+       AND sl.doc_no = sh.doc_no
+      WHERE sh.branch_code = ANY($1::text[])
+        AND sh.doc_date BETWEEN $2::date AND $3::date
+        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
+        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
+      GROUP BY sl.product_code, sh.branch_code
     `,
-    [branchCodes, productCodes, anchorDate],
+    [branchCodes, window90From, anchorDate, window30From],
   );
 
   const map = new Map();
@@ -747,10 +752,21 @@ function buildRecommendationRows({ stockRows, salesAggByProductBranch, incomingB
       if (metric.incomingPoAllocationQty > 0) flags.push("HAS_INCOMING_PO");
       if (metric.unitCostAvg == null && metric.currentStock > 0) flags.push("MISSING_COST");
       if (metric.effectiveDaysCover != null && metric.effectiveDaysCover > 120) flags.push("OVERSTOCK");
+      if (metric.currentStock < 0) flags.push("NEGATIVE_STOCK");
 
       const primaryDonor = donors[0] || null;
       const recommendationReason = buildRecommendationReason(metric, action, donors, purchaseQty);
-      const priorityScore = round(metric.shortageQty * (metric.unitCostAvg || 0), 2);
+      // Priority must reflect only the qty this action will actually move — deriving it from
+      // metric.shortageQty (which can be spuriously positive off negative currentStock when
+      // there's no recent demand, e.g. branch 000's warehouse never sells) put NO_ACTION /
+      // NO_PURCHASE_SLOW_MOVING rows ahead of genuine PURCHASE/TRANSFER_IN shortages.
+      const priorityActionQty =
+        action === "PURCHASE" || action === "TRANSFER_AND_PURCHASE"
+          ? purchaseQty
+          : action === "TRANSFER_IN"
+            ? transferPlanQty
+            : 0;
+      const priorityScore = round(priorityActionQty * (metric.unitCostAvg || 0), 2);
 
       rows.push({
         branchCode,
@@ -1078,18 +1094,20 @@ async function computeLiveRecommendationDataset(db, auth, filters = {}) {
   const policy = buildRecommendationPolicy(normalizedFilters, anchorDate);
   const branchNameByCode = new Map(scope.activeBranches.map((branch) => [branch.branchCode, branch.branchName]));
 
+  const rawSalesAgg = await loadRawSalesAggByBranch(db, {
+    branchCodes: scope.activeBranchCodes,
+    window30From: policy.salesWindow30dFrom,
+    window90From: policy.salesWindow90dFrom,
+    anchorDate,
+  });
   const candidateProductCodes = await loadCandidateProductCodes(db, {
     scope,
     search: normalizedFilters.search,
-    anchorDate,
+    rawSalesAgg,
   });
   const stockRows = await loadCurrentStockByProduct(db, { productCodes: candidateProductCodes });
   const productCodes = stockRows.map((row) => row.productCode);
-  const salesAggByProductBranch = await loadSalesAggByProductBranch(db, {
-    productCodes,
-    branchCodes: scope.activeBranchCodes,
-    anchorDate,
-  });
+  const salesAggByProductBranch = rawSalesAgg;
   const incomingByProduct = await loadIncomingReceiptAggByProduct(db, {
     productCodes,
     mode: policy.incomingSourceMode,

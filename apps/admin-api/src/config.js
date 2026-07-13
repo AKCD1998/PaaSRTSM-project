@@ -247,6 +247,18 @@ function loadConfig(env = process.env) {
     // days (DB row + job history stay, only the bytes on disk are removed).
     videoLocalAssetRetentionDays: parseIntWithFallback(env.VIDEO_LOCAL_ASSET_RETENTION_DAYS, 3),
     videoAssetCleanupIntervalMs: parseIntWithFallback(env.VIDEO_ASSET_CLEANUP_INTERVAL_MS, 6 * 60 * 60 * 1000),
+
+    // Nightly stock-recommendation snapshot refresh. Off by default — an operator
+    // opts in once the branch-morning sync window is known, so the job doesn't
+    // start firing against a fresh deploy before anyone's looked at the schedule.
+    featureStockRecommendationCron: parseBool(env.FEATURE_STOCK_RECOMMENDATION_CRON, false),
+    // Default 06:00 Asia/Bangkok — after the branch morning sync (soldqty pulled
+    // "every morning") has landed, before staff start their shift.
+    stockRecommendationCronExpression: env.STOCK_RECOMMENDATION_CRON_EXPRESSION || "0 6 * * *",
+    stockRecommendationCronTimezone: env.STOCK_RECOMMENDATION_CRON_TIMEZONE || "Asia/Bangkok",
+    stockRecommendationCronTargetDays: [...parseCsvSet(env.STOCK_RECOMMENDATION_CRON_TARGET_DAYS || "90")]
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0),
   };
 }
 
