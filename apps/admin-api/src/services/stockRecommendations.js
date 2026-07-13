@@ -86,6 +86,17 @@ function safeDivide(numerator, denominator) {
   return numerator / denominator;
 }
 
+const BANGKOK_TIMEZONE = "Asia/Bangkok";
+
+function bangkokNow() {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: BANGKOK_TIMEZONE }));
+}
+
+function toBangkokDateString(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function addDays(isoDate, days) {
   const date = new Date(`${isoDate}T00:00:00.000Z`);
   if (Number.isNaN(date.getTime())) return null;
@@ -97,7 +108,13 @@ function formatDateOnly(value) {
   if (!value) return null;
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) return null;
-    return value.toISOString().slice(0, 10);
+    // node-postgres parses a DATE column into a Date object set to midnight
+    // in the RUNNING PROCESS's local timezone, not UTC. Reading it back out
+    // with .toISOString() (UTC) therefore rolls the calendar date backward
+    // by one day on any host running east of UTC (Bangkok included) — the
+    // same class of bug toBangkokDateString() elsewhere in this codebase
+    // exists to avoid. Use local getters to recover the date pg intended.
+    return toBangkokDateString(value);
   }
 
   const normalized = normalizeText(value);
@@ -240,11 +257,39 @@ function buildRecommendationPolicy(filters, anchorDate) {
   };
 }
 
+// Pinned to "yesterday in Bangkok" instead of live MAX(period_end) from a
+// table branch senders sync into every ~10 minutes. That live value moves
+// (and was observed to move backward transiently, likely from a sync agent
+// replacing rows rather than pure upsert) within the same few minutes,
+// which made precomputed snapshots — generated with one fixed anchor_date —
+// miss their cache key constantly and fall back to the slow live-compute
+// path on nearly every request. A 90-day trailing-demand figure doesn't need
+// minute-level freshness, so pinning to a date that only changes once daily
+// (at midnight) removes the flicker entirely for the default (no explicit
+// dateTo) case.
 async function resolveAnchorDate(db, filters) {
   if (filters.dateTo) {
     return filters.dateTo;
   }
 
+  const pinnedAnchorDate = addDays(toBangkokDateString(bangkokNow()), -1);
+  const pinnedCheck = await db.query(
+    `
+      SELECT 1
+      FROM analytics.product_sales_summary_periods
+      WHERE period_days IN (30, 90)
+        AND period_end = $1::date
+      LIMIT 1
+    `,
+    [pinnedAnchorDate],
+  );
+  if (pinnedCheck.rowCount > 0) {
+    return pinnedAnchorDate;
+  }
+
+  // Edge case only: "yesterday" has no synced data at all yet (e.g. very
+  // first day this ever ran). Fall back to whatever's actually there so the
+  // feature still works instead of resolving to an empty date with no rows.
   const result = await db.query(
     `
       SELECT MAX(period_end)::date AS latest_date
@@ -268,7 +313,7 @@ async function resolveAnchorDate(db, filters) {
   const latestDate = fallbackResult.rows[0]?.latest_date || null;
   const normalizedLatestDate = formatDateOnly(latestDate);
   if (!normalizedLatestDate) {
-    return new Date().toISOString().slice(0, 10);
+    return toBangkokDateString(bangkokNow());
   }
   return normalizedLatestDate;
 }
@@ -950,6 +995,24 @@ async function resolveSnapshotMeta(db, { scope, targetDays, anchorDate }) {
   return result.rows[0] || null;
 }
 
+// Whatever anchor_date the snapshot table actually has data for, for this
+// scope/target_days — not whatever "today" happens to live-resolve to right
+// now. Used for the default (no explicit dateTo) read path so a request
+// never has to match a moving target: see resolveAnchorDate for why that
+// target moves, and computeRecommendationDataset for how this is used.
+async function resolveLatestSnapshotAnchorDate(db, { scope, targetDays }) {
+  const result = await db.query(
+    `
+      SELECT MAX(anchor_date)::date AS latest_anchor_date
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = ANY($1::text[])
+        AND target_days = $2
+    `,
+    [scope.branchCodes, targetDays],
+  );
+  return formatDateOnly(result.rows[0]?.latest_anchor_date || null);
+}
+
 async function listPrecomputedStockRecommendations(db, dataset) {
   const { scope, filters, anchorDate, policy } = dataset;
   const search = normalizeText(filters.search || "");
@@ -1160,29 +1223,40 @@ async function computeLiveRecommendationDataset(db, auth, filters = {}) {
 async function computeRecommendationDataset(db, auth, filters = {}) {
   const normalizedFilters = normalizeRecommendationFilters(filters);
   const scope = await resolveEffectiveBranchScope(db, auth, normalizedFilters.branchCode);
-  const anchorDate = await resolveAnchorDate(db, normalizedFilters);
-  const policy = buildRecommendationPolicy(normalizedFilters, anchorDate);
   const branchNameByCode = new Map(scope.activeBranches.map((branch) => [branch.branchCode, branch.branchName]));
-  const snapshotMeta = await resolveSnapshotMeta(db, {
-    scope,
-    targetDays: policy.targetDays,
-    anchorDate,
-  });
 
-  if (snapshotMeta && Number(snapshotMeta.row_count || 0) > 0) {
-    return {
-      filters: normalizedFilters,
+  // A specific dateTo is a deliberate historical/point-in-time query — honor
+  // it exactly (existing behavior: match-or-live-compute for that date). The
+  // default "just show me the current view" case instead serves whatever
+  // snapshot actually exists, so a moving live anchor date or a missed cron
+  // run never forces a slow live recompute — see resolveLatestSnapshotAnchorDate.
+  const anchorDate = normalizedFilters.dateTo
+    ? normalizedFilters.dateTo
+    : await resolveLatestSnapshotAnchorDate(db, { scope, targetDays: normalizedFilters.targetDays });
+
+  if (anchorDate) {
+    const policy = buildRecommendationPolicy(normalizedFilters, anchorDate);
+    const snapshotMeta = await resolveSnapshotMeta(db, {
       scope,
+      targetDays: policy.targetDays,
       anchorDate,
-      policy,
-      branchNameByCode,
-      rows: [],
-      source: "precomputed",
-      snapshotMeta: {
-        rowCount: Number(snapshotMeta.row_count || 0),
-        generatedAt: snapshotMeta.generated_at || null,
-      },
-    };
+    });
+
+    if (snapshotMeta && Number(snapshotMeta.row_count || 0) > 0) {
+      return {
+        filters: normalizedFilters,
+        scope,
+        anchorDate,
+        policy,
+        branchNameByCode,
+        rows: [],
+        source: "precomputed",
+        snapshotMeta: {
+          rowCount: Number(snapshotMeta.row_count || 0),
+          generatedAt: snapshotMeta.generated_at || null,
+        },
+      };
+    }
   }
 
   return computeLiveRecommendationDataset(db, auth, normalizedFilters);
