@@ -864,12 +864,29 @@ function buildListSummary(rows) {
   };
 }
 
+// Plain per-SKU AVG(current_days_cover) is dominated by long-tail dead stock:
+// a SKU with 1 unit sold in 90 days but a few units on hand gets a days_cover
+// in the thousands, and it counts exactly as much as a core fast-mover that
+// carries most of the branch's actual stock value. Weight by inventory_value
+// instead so the number reflects how long the money tied up in stock would
+// last at the current burn rate, not the average SKU's arithmetic cover.
+function computeValueWeightedDaysCover(rows) {
+  let totalValue = 0;
+  let totalDailyValue = 0;
+  for (const row of rows) {
+    const value = numberOrZero(row.inventoryValue);
+    totalValue += value;
+    const cover = row.currentDaysCover;
+    if (cover != null && cover > 0 && value > 0) {
+      totalDailyValue += value / cover;
+    }
+  }
+  return totalDailyValue > 0 ? round(totalValue / totalDailyValue, 2) : null;
+}
+
 function buildCompanySummary(rows) {
   const listSummary = buildListSummary(rows);
-  const coverRows = rows.filter((row) => row.currentDaysCover != null);
-  const averageDaysCover = coverRows.length
-    ? round(coverRows.reduce((sum, row) => sum + row.currentDaysCover, 0) / coverRows.length, 2)
-    : null;
+  const averageDaysCover = computeValueWeightedDaysCover(rows);
 
   return {
     currentInventoryValue: listSummary.currentInventoryValue,
@@ -888,14 +905,11 @@ function buildCompanySummary(rows) {
 function buildBranchSummaries(rows, activeBranches) {
   return activeBranches.map((branch) => {
     const branchRows = rows.filter((row) => row.branchCode === branch.branchCode);
-    const coverRows = branchRows.filter((row) => row.currentDaysCover != null);
     return {
       branchCode: branch.branchCode,
       label: branch.branchName || `สาขา ${branch.branchCode}`,
       currentInventoryValue: round(branchRows.reduce((sum, row) => sum + numberOrZero(row.inventoryValue), 0), 2),
-      averageDaysCover: coverRows.length
-        ? round(coverRows.reduce((sum, row) => sum + row.currentDaysCover, 0) / coverRows.length, 2)
-        : null,
+      averageDaysCover: computeValueWeightedDaysCover(branchRows),
       recommendTransferCount: branchRows.filter((row) => row.action === "TRANSFER_IN").length,
       recommendPurchaseCount: branchRows.filter((row) => row.action === "PURCHASE" || row.action === "TRANSFER_AND_PURCHASE").length,
     };
@@ -1012,7 +1026,12 @@ async function loadPrecomputedBranchSummaries(db, dataset) {
         branch_code,
         MAX(branch_label) AS branch_label,
         COALESCE(SUM(inventory_value), 0)::numeric AS current_inventory_value,
-        AVG(current_days_cover) FILTER (WHERE current_days_cover IS NOT NULL)::numeric AS average_days_cover,
+        ROUND(
+          COALESCE(SUM(inventory_value), 0)
+            / NULLIF(SUM(inventory_value / NULLIF(current_days_cover, 0))
+                FILTER (WHERE current_days_cover IS NOT NULL AND current_days_cover > 0), 0),
+          2
+        ) AS average_days_cover,
         COUNT(*) FILTER (WHERE action = 'TRANSFER_IN')::int AS recommend_transfer_count,
         COUNT(*) FILTER (WHERE action IN ('PURCHASE', 'TRANSFER_AND_PURCHASE'))::int AS recommend_purchase_count
       FROM ordering.stock_recommendation_snapshots
@@ -1047,7 +1066,12 @@ async function loadPrecomputedCompanySummary(db, dataset) {
         COALESCE(SUM(inventory_value), 0)::numeric AS current_inventory_value,
         COALESCE(SUM(COALESCE(unit_cost_avg, 0) * COALESCE(target_qty, 0)), 0)::numeric AS projected_inventory_value_at_target,
         COALESCE(SUM(GREATEST(COALESCE(inventory_value, 0) - (COALESCE(unit_cost_avg, 0) * COALESCE(target_qty, 0)), 0)), 0)::numeric AS potential_reduction_value,
-        AVG(current_days_cover) FILTER (WHERE current_days_cover IS NOT NULL)::numeric AS average_days_cover,
+        ROUND(
+          COALESCE(SUM(inventory_value), 0)
+            / NULLIF(SUM(inventory_value / NULLIF(current_days_cover, 0))
+                FILTER (WHERE current_days_cover IS NOT NULL AND current_days_cover > 0), 0),
+          2
+        ) AS average_days_cover,
         COUNT(*) FILTER (WHERE action = 'TRANSFER_IN')::int AS sku_count_recommend_transfer,
         COUNT(*) FILTER (WHERE action IN ('PURCHASE', 'TRANSFER_AND_PURCHASE'))::int AS sku_count_recommend_purchase
       FROM ordering.stock_recommendation_snapshots
