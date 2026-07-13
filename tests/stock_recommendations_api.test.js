@@ -165,6 +165,21 @@ function createMockDb() {
         };
       }
 
+      if (
+        normalized.includes("from ordering.stock_recommendation_snapshots") &&
+        normalized.includes("max(anchor_date)::date as latest_anchor_date")
+      ) {
+        return { rowCount: 1, rows: [{ latest_anchor_date: null }] };
+      }
+
+      if (
+        normalized.startsWith("select 1") &&
+        normalized.includes("from analytics.product_sales_summary_periods") &&
+        normalized.includes("period_end = $1::date")
+      ) {
+        return { rowCount: 0, rows: [] };
+      }
+
       if (normalized.startsWith("select max(period_end)::date as latest_date from analytics.product_sales_summary_periods")) {
         return { rowCount: 1, rows: [{ latest_date: new Date("2026-07-12T00:00:00.000Z") }] };
       }
