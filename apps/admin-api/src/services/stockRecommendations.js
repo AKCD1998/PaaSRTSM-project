@@ -248,7 +248,7 @@ function normalizeRecommendationFilters(rawFilters = {}) {
 function buildRecommendationPolicy(filters, anchorDate) {
   return {
     targetDays: filters.targetDays,
-    incomingAllocationMode: "equal_split",
+    incomingAllocationMode: "shortage_weighted_with_demand_fallback",
     incomingSourceMode: "pending_and_approved_receipts",
     demandMode: "sales_90d_with_30d_trend_adjustment",
     anchorDate,
@@ -610,12 +610,69 @@ function mapSnapshotRow(row) {
   };
 }
 
+// Splits a whole-unit total across branches by weight using the
+// largest-remainder method — the same apportionment style used to divide
+// parliamentary seats proportionally, and the same style the paper
+// allocation table this replaces used, just with dynamic weights instead of
+// a fixed 3:3:1:1 ratio. Physical shipments are whole units, so the total is
+// rounded before splitting and every branch gets an integer share that sums
+// back to exactly that rounded total.
+function apportionByWeights(totalQty, weightByBranchCode) {
+  const branchCodes = [...weightByBranchCode.keys()];
+  const result = new Map(branchCodes.map((branchCode) => [branchCode, 0]));
+  const totalWhole = Math.round(totalQty);
+  if (totalWhole <= 0 || branchCodes.length === 0) {
+    return result;
+  }
+
+  const totalWeight = branchCodes.reduce(
+    (sum, branchCode) => sum + Math.max(weightByBranchCode.get(branchCode) || 0, 0),
+    0,
+  );
+  if (totalWeight <= 0) {
+    // No usable weight reached this point (callers already fall back to
+    // demand, then to equal weight, before calling this) — split evenly as
+    // a last resort so a shipment is never silently dropped.
+    let remaining = totalWhole;
+    const share = Math.floor(totalWhole / branchCodes.length);
+    for (const branchCode of branchCodes) {
+      result.set(branchCode, share);
+      remaining -= share;
+    }
+    for (let i = 0; i < remaining; i += 1) {
+      const branchCode = branchCodes[i % branchCodes.length];
+      result.set(branchCode, result.get(branchCode) + 1);
+    }
+    return result;
+  }
+
+  const shares = branchCodes.map((branchCode) => {
+    const weight = Math.max(weightByBranchCode.get(branchCode) || 0, 0);
+    const raw = (totalWhole * weight) / totalWeight;
+    const floorQty = Math.floor(raw);
+    return { branchCode, floorQty, remainder: raw - floorQty };
+  });
+
+  const allocatedSoFar = shares.reduce((sum, share) => sum + share.floorQty, 0);
+  const remaining = totalWhole - allocatedSoFar;
+
+  shares.sort((a, b) => b.remainder - a.remainder || a.branchCode.localeCompare(b.branchCode));
+  shares.forEach((share, index) => {
+    result.set(share.branchCode, share.floorQty + (index < remaining ? 1 : 0));
+  });
+
+  return result;
+}
+
 function buildBranchMetricsByProduct({ stockRow, salesAggByProductBranch, incomingByProduct, scope, policy }) {
   const incomingTotal = incomingByProduct.get(stockRow.productCode) || 0;
-  const activeBranchCount = Math.max(1, scope.activeBranchCodes.length);
-  const allocatedIncoming = incomingTotal / activeBranchCount;
-  const metricsByBranch = new Map();
 
+  // Pass 1: per-branch demand/stock metrics computed WITHOUT incoming stock.
+  // The shortage used to weight the incoming shipment must reflect real
+  // pre-shipment need — computing it from effectiveStock (which already
+  // includes the allocation) would make the allocation circular with the
+  // shortage it's supposed to be driven by.
+  const baseByBranch = new Map();
   for (const branchCode of scope.activeBranchCodes) {
     const branchSnapshot = stockRow.branches[branchCode] || { qty: 0, unitCostAvg: null };
     const sales = salesAggByProductBranch.get(`${stockRow.productCode}|${branchCode}`) || {
@@ -636,33 +693,76 @@ function buildBranchMetricsByProduct({ stockRow, salesAggByProductBranch, incomi
       else if (trendRatio <= 0.8) adjustedAdu = baseAdu * 0.9;
     }
 
-    const incomingPoAllocationQty = allocatedIncoming;
-    const effectiveStock = currentStock + incomingPoAllocationQty;
-    const currentDaysCover = adjustedAdu > 0 ? currentStock / adjustedAdu : null;
-    const effectiveDaysCover = adjustedAdu > 0 ? effectiveStock / adjustedAdu : null;
     const targetQty = adjustedAdu * policy.targetDays;
-    const gapQty = effectiveStock - targetQty;
+    const preAllocationShortage = Math.max(targetQty - currentStock, 0);
+
+    baseByBranch.set(branchCode, {
+      currentStock,
+      unitCostAvg,
+      inventoryValue,
+      soldQty30d: sales.soldQty30d,
+      soldQty90d: sales.soldQty90d,
+      adu30,
+      adu90,
+      trendRatio,
+      adjustedAdu,
+      targetQty,
+      preAllocationShortage,
+    });
+  }
+
+  // Weight the shipment by pre-shipment shortage first — a branch already
+  // at or above its target gets weight 0 and none of this shipment, which is
+  // what makes allocation self-correct toward the 90-day goal instead of
+  // perpetuating a fixed historical ratio. Fall back to raw demand
+  // (adjustedAdu) when nobody is short for this SKU, and to equal weight
+  // only when there's no signal at all (e.g. a brand new SKU with no sales
+  // anywhere yet).
+  let weightByBranchCode = new Map(
+    [...baseByBranch.entries()].map(([branchCode, base]) => [branchCode, base.preAllocationShortage]),
+  );
+  let totalWeight = [...weightByBranchCode.values()].reduce((sum, weight) => sum + weight, 0);
+  if (totalWeight <= 0) {
+    weightByBranchCode = new Map(
+      [...baseByBranch.entries()].map(([branchCode, base]) => [branchCode, base.adjustedAdu]),
+    );
+    totalWeight = [...weightByBranchCode.values()].reduce((sum, weight) => sum + weight, 0);
+  }
+  if (totalWeight <= 0) {
+    weightByBranchCode = new Map([...baseByBranch.keys()].map((branchCode) => [branchCode, 1]));
+  }
+
+  const allocationByBranchCode = apportionByWeights(incomingTotal, weightByBranchCode);
+
+  const metricsByBranch = new Map();
+  for (const [branchCode, base] of baseByBranch.entries()) {
+    const incomingPoAllocationQty = allocationByBranchCode.get(branchCode) || 0;
+    const effectiveStock = base.currentStock + incomingPoAllocationQty;
+    const currentDaysCover = base.adjustedAdu > 0 ? base.currentStock / base.adjustedAdu : null;
+    const effectiveDaysCover = base.adjustedAdu > 0 ? effectiveStock / base.adjustedAdu : null;
+    const gapQty = effectiveStock - base.targetQty;
     const surplusQty = Math.max(gapQty, 0);
     const shortageQty = Math.max(-gapQty, 0);
-    const donorTransferableQty = adjustedAdu > 0 ? Math.max(effectiveStock - targetQty, 0) : Math.max(currentStock, 0);
+    const donorTransferableQty =
+      base.adjustedAdu > 0 ? Math.max(effectiveStock - base.targetQty, 0) : Math.max(base.currentStock, 0);
 
     metricsByBranch.set(branchCode, {
       branchCode,
-      currentStock: round(currentStock, 4),
-      unitCostAvg: unitCostAvg == null ? null : round(unitCostAvg, 4),
-      inventoryValue: round(inventoryValue, 2),
-      soldQty30d: round(sales.soldQty30d, 4),
-      soldQty90d: round(sales.soldQty90d, 4),
-      adu30: round(adu30, 6),
-      adu90: round(adu90, 6),
-      trendRatio30Vs90: adu90 > 0 ? round(trendRatio, 4) : null,
-      adjustedAdu: round(adjustedAdu, 6),
+      currentStock: round(base.currentStock, 4),
+      unitCostAvg: base.unitCostAvg == null ? null : round(base.unitCostAvg, 4),
+      inventoryValue: round(base.inventoryValue, 2),
+      soldQty30d: round(base.soldQty30d, 4),
+      soldQty90d: round(base.soldQty90d, 4),
+      adu30: round(base.adu30, 6),
+      adu90: round(base.adu90, 6),
+      trendRatio30Vs90: base.adu90 > 0 ? round(base.trendRatio, 4) : null,
+      adjustedAdu: round(base.adjustedAdu, 6),
       incomingPoQtyTotal: round(incomingTotal, 4),
       incomingPoAllocationQty: round(incomingPoAllocationQty, 4),
       effectiveStock: round(effectiveStock, 4),
       currentDaysCover: currentDaysCover == null ? null : round(currentDaysCover, 2),
       effectiveDaysCover: effectiveDaysCover == null ? null : round(effectiveDaysCover, 2),
-      targetQty: round(targetQty, 4),
+      targetQty: round(base.targetQty, 4),
       surplusQty: round(surplusQty, 4),
       shortageQty: round(shortageQty, 4),
       donorTransferableQty: round(donorTransferableQty, 4),
