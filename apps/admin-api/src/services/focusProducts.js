@@ -2,6 +2,7 @@
 
 const FOCUS_TYPES = new Set(["salesperson", "pharmacist", "store_manager", "group_manager"]);
 const PUBLICATION_STATUSES = new Set(["draft", "published", "scheduled"]);
+const REQUIRED_FOCUS_BRANCHES = ["001", "003", "004", "005"];
 const NOTE_MAX_CHARS = 2000;
 
 function createHttpError(message, statusCode, extra = {}) {
@@ -361,6 +362,10 @@ async function listFocusProducts(db, { includeInactive = false, debug = false } 
 }
 
 async function createFocusProduct(db, fields) {
+  // New rows must be operationally complete even when saved as drafts.  Keep
+  // this at the service boundary so API callers cannot bypass the admin UI.
+  const [completeFields] = validateBulkRows([fields]);
+  fields = completeFields;
   const productCode = normalizeText(fields.productCode);
   if (!productCode) throw createHttpError("productCode is required.", 400);
 
@@ -398,6 +403,105 @@ async function createFocusProduct(db, fields) {
   const activeBranchCodes = await fetchActiveBranchCodes(db);
   const [withProgress] = await attachProgress(db, [row], activeBranchCodes);
   return withProgress;
+}
+
+function validateBulkRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw createHttpError("focusProducts must contain at least one item.", 400);
+  }
+  if (rows.length > 100) throw createHttpError("A batch cannot contain more than 100 items.", 400);
+
+  const seen = new Set();
+  return rows.map((source, index) => {
+    const row = source && typeof source === "object" ? source : {};
+    const productCode = normalizeText(row.productCode);
+    const focusType = normalizeText(row.focusType);
+    const targetQty = Number(row.targetQty);
+    const assignedPersonName = normalizeNullableText(row.assignedPersonName);
+    const branchCodes = normalizeBranchCodes(row.branchCodes) || [];
+    const branchTargets = normalizeBranchTargets(row.branchTargets);
+    const missingBranches = REQUIRED_FOCUS_BRANCHES.filter((code) => !branchCodes.includes(code));
+
+    if (!productCode) throw createHttpError(`รายการที่ ${index + 1}: ต้องเลือกสินค้า`, 400, { rowIndex: index });
+    if (!FOCUS_TYPES.has(focusType)) throw createHttpError(`รายการที่ ${index + 1}: ประเภทโฟกัสไม่ถูกต้อง`, 400, { rowIndex: index });
+    if (!Number.isFinite(targetQty) || targetQty <= 0) throw createHttpError(`รายการที่ ${index + 1}: เป้าหมายต้องมากกว่า 0`, 400, { rowIndex: index });
+    if (missingBranches.length || branchCodes.some((code) => !REQUIRED_FOCUS_BRANCHES.includes(code))) {
+      throw createHttpError(`รายการที่ ${index + 1}: ต้องเลือกสาขา 001, 003, 004 และ 005 ให้ครบ`, 400, { rowIndex: index });
+    }
+    if (focusType === "salesperson" && !assignedPersonName) {
+      throw createHttpError(`รายการที่ ${index + 1}: ต้องระบุผู้รับผิดชอบ`, 400, { rowIndex: index });
+    }
+    if (focusType !== "salesperson") {
+      const incomplete = REQUIRED_FOCUS_BRANCHES.filter((code) => !Number.isFinite(Number(branchTargets?.[code])) || Number(branchTargets[code]) <= 0);
+      if (incomplete.length) {
+        throw createHttpError(`รายการที่ ${index + 1}: เป้าสาขา ${incomplete.join(", ")} ต้องมากกว่า 0`, 400, { rowIndex: index });
+      }
+    }
+    const duplicateKey = focusType === "salesperson"
+      ? `${focusType}|${productCode.toLowerCase()}|${assignedPersonName.toLowerCase()}`
+      : `${focusType}|${productCode.toLowerCase()}`;
+    if (seen.has(duplicateKey)) throw createHttpError(`รายการที่ ${index + 1}: มีสินค้า/ผู้รับผิดชอบซ้ำในชุดนี้`, 409, { rowIndex: index });
+    seen.add(duplicateKey);
+    return { ...row, productCode, focusType, targetQty, assignedPersonName, branchCodes: [...REQUIRED_FOCUS_BRANCHES], branchTargets };
+  });
+}
+
+async function createFocusProductsBulk(db, fields) {
+  const rows = validateBulkRows(fields.focusProducts);
+  const dateFrom = normalizeDate(fields.dateFrom, "dateFrom");
+  const dateTo = normalizeDate(fields.dateTo, "dateTo");
+  if (dateTo < dateFrom) throw createHttpError("dateTo must not be before dateFrom.", 400);
+  normalizePublication(fields);
+
+  const client = typeof db.connect === "function" ? await db.connect() : db;
+  const ownsClient = client !== db;
+  try {
+    await client.query("BEGIN");
+    const productCodes = [...new Set(rows.map((row) => row.productCode))];
+    const productResult = await client.query(
+      `SELECT company_code FROM public.skus WHERE company_code = ANY($1::text[])`,
+      [productCodes],
+    );
+    const validCodes = new Set(productResult.rows.map((row) => row.company_code));
+    const invalidCodes = productCodes.filter((code) => !validCodes.has(code));
+    if (invalidCodes.length) throw createHttpError(`ไม่พบรหัสสินค้า: ${invalidCodes.join(", ")}`, 400);
+
+    for (const row of rows) {
+      const duplicateParams = [row.productCode, row.focusType, dateFrom, dateTo];
+      let personSql = "";
+      if (row.focusType === "salesperson") {
+        duplicateParams.push(row.assignedPersonName);
+        personSql = `AND lower(COALESCE(assigned_person_name, '')) = lower($5)`;
+      }
+      const duplicate = await client.query(
+        `SELECT id FROM focus.focus_products
+         WHERE is_active = TRUE AND product_code = $1 AND focus_type = $2
+           AND date_from <= $4::date AND date_to >= $3::date ${personSql}
+         LIMIT 1`,
+        duplicateParams,
+      );
+      if (duplicate.rowCount) throw createHttpError(`มีสินค้าโฟกัสซ้ำอยู่แล้ว: ${row.productCode}`, 409, { existingId: Number(duplicate.rows[0].id) });
+    }
+
+    const created = [];
+    for (const row of rows) {
+      created.push(await createFocusProduct(client, {
+        ...row,
+        dateFrom,
+        dateTo,
+        publicationStatus: fields.publicationStatus,
+        scheduledPublishAt: fields.scheduledPublishAt,
+        createdBy: fields.createdBy,
+      }));
+    }
+    await client.query("COMMIT");
+    return created;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    if (ownsClient && typeof client.release === "function") client.release();
+  }
 }
 
 async function updateFocusProduct(db, id, fields) {
@@ -476,4 +580,7 @@ module.exports = {
   fetchFocusProductRow,
   normalizePublication,
   computeStatus,
+  REQUIRED_FOCUS_BRANCHES,
+  validateBulkRows,
+  createFocusProductsBulk,
 };

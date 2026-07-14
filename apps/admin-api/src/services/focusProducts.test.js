@@ -6,6 +6,7 @@ const {
   computeStatus,
   listFocusProducts,
   normalizePublication,
+  validateBulkRows,
 } = require("./focusProducts");
 
 test("publication defaults to published for backward-compatible API callers", () => {
@@ -13,6 +14,40 @@ test("publication defaults to published for backward-compatible API callers", ()
   assert.equal(result.status, "published");
   assert.equal(result.scheduledPublishAt, null);
   assert.ok(result.publishedAt instanceof Date);
+});
+
+test("bulk rows require all branches, positive targets, and salesperson owner", () => {
+  const base = {
+    productCode: "IC-001",
+    focusType: "pharmacist",
+    targetQty: 10,
+    branchCodes: ["001", "003", "004", "005"],
+    branchTargets: { "001": 1, "003": 2, "004": 3, "005": 4 },
+  };
+  assert.equal(validateBulkRows([base]).length, 1);
+  assert.throws(() => validateBulkRows([{ ...base, branchTargets: { "001": 1 } }]), /003, 004, 005/);
+  assert.throws(() => validateBulkRows([{ ...base, focusType: "salesperson", assignedPersonName: "" }]), /ผู้รับผิดชอบ/);
+});
+
+test("bulk rows reject duplicates within the same batch", () => {
+  const row = {
+    productCode: "IC-001",
+    focusType: "group_manager",
+    targetQty: 10,
+    branchCodes: ["001", "003", "004", "005"],
+    branchTargets: { "001": 1, "003": 1, "004": 1, "005": 1 },
+  };
+  assert.throws(() => validateBulkRows([row, { ...row }]), /ซ้ำ/);
+});
+
+test("single-create validation cannot bypass completeness rules", () => {
+  assert.throws(() => validateBulkRows([{
+    productCode: "IC-001",
+    focusType: "pharmacist",
+    targetQty: 10,
+    branchCodes: ["001", "003", "004", "005"],
+    branchTargets: { "001": 1, "003": 1, "004": 1 },
+  }]), /005/);
 });
 
 test("scheduled publication requires a future timestamp", () => {
