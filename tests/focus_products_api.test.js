@@ -55,6 +55,10 @@ function createMockDb() {
         frozen_sold_by_branch: null,
         frozen_total_sold: null,
         frozen_at: null,
+        publication_status: "published",
+        scheduled_publish_at: null,
+        published_at: "2026-07-01T00:00:00.000Z",
+        published_by: "admin@example.com",
       }],
     ]),
   };
@@ -67,8 +71,14 @@ function createMockDb() {
     async query(sql, params = []) {
       const q = normalizeSql(sql);
 
-      if (q.startsWith("select * from focus.focus_products where is_active = true order by created_at desc")) {
-        return { rowCount: state.rows.size, rows: [...state.rows.values()].filter((r) => r.is_active) };
+      if (q.startsWith("select * from focus.focus_products where is_active = true")) {
+        const now = Date.now();
+        const rows = [...state.rows.values()].filter((r) => r.is_active && (
+          (r.publication_status || "published") === "published"
+          || ((r.publication_status || "published") === "scheduled"
+            && new Date(r.scheduled_publish_at).getTime() <= now)
+        ));
+        return { rowCount: rows.length, rows };
       }
       if (q.startsWith("select * from focus.focus_products order by created_at desc")) {
         return { rowCount: state.rows.size, rows: [...state.rows.values()] };
@@ -108,6 +118,10 @@ function createMockDb() {
           created_by: params[7],
           assigned_person_name: params[8] || null,
           branch_targets: params[9] ? JSON.parse(params[9]) : null,
+          publication_status: params[10],
+          scheduled_publish_at: params[11],
+          published_at: params[12],
+          published_by: params[13],
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
           frozen_sold_by_branch: null,
@@ -132,6 +146,10 @@ function createMockDb() {
             is_active: params[8],
             assigned_person_name: params[9] || null,
             branch_targets: params[10] ? JSON.parse(params[10]) : null,
+            publication_status: params[11],
+            scheduled_publish_at: params[12],
+            published_at: params[13],
+            published_by: params[14],
             updated_at: new Date().toISOString(),
           });
           if (q.includes("frozen_at = null")) {
@@ -261,6 +279,41 @@ test("admin CRUD requires admin role and CSRF for writes", async () => {
 
   const afterDelete = await admin.get("/api/focus-products");
   assert.ok(!afterDelete.body.focusProducts.some((r) => r.id === created.body.focusProduct.id));
+});
+
+test("admin can save a draft and publish it when ready", async () => {
+  const { app } = createTestApp();
+  const admin = request.agent(app);
+  const staff = request.agent(app);
+  const csrf = await loginAs(admin);
+  await loginAs(staff, "staff@example.com", "staff-pass-123");
+
+  const created = await admin
+    .post("/api/admin/focus-products")
+    .set("x-csrf-token", csrf)
+    .send({
+      productCode: "IC-DRAFT-001",
+      focusType: "store_manager",
+      targetQty: 10,
+      dateFrom: "2027-01-01",
+      dateTo: "2027-01-31",
+      publicationStatus: "draft",
+    });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.focusProduct.publicationStatus, "draft");
+
+  const hidden = await staff.get("/api/focus-products");
+  assert.ok(!hidden.body.focusProducts.some((row) => row.id === created.body.focusProduct.id));
+
+  const published = await admin
+    .patch(`/api/admin/focus-products/${created.body.focusProduct.id}`)
+    .set("x-csrf-token", csrf)
+    .send({ publicationStatus: "published" });
+  assert.equal(published.status, 200);
+  assert.equal(published.body.focusProduct.publicationState, "published");
+
+  const visible = await staff.get("/api/focus-products");
+  assert.ok(visible.body.focusProducts.some((row) => row.id === created.body.focusProduct.id));
 });
 
 test("create rejects invalid focusType, non-positive targetQty, and inverted date range", async () => {

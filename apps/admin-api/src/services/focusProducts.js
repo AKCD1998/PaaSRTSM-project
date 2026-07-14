@@ -1,6 +1,7 @@
 "use strict";
 
 const FOCUS_TYPES = new Set(["salesperson", "pharmacist", "store_manager", "group_manager"]);
+const PUBLICATION_STATUSES = new Set(["draft", "published", "scheduled"]);
 const NOTE_MAX_CHARS = 2000;
 
 function createHttpError(message, statusCode, extra = {}) {
@@ -24,6 +25,54 @@ function normalizeDate(value, field) {
     throw createHttpError(`${field} must be a date in YYYY-MM-DD format.`, 400);
   }
   return text;
+}
+
+function normalizeScheduledPublishAt(value) {
+  const text = normalizeText(value);
+  if (!text) throw createHttpError("scheduledPublishAt is required for scheduled publication.", 400);
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) {
+    throw createHttpError("scheduledPublishAt must be a valid date and time.", 400);
+  }
+  if (parsed.getTime() <= Date.now()) {
+    throw createHttpError("scheduledPublishAt must be in the future.", 400);
+  }
+  return parsed.toISOString();
+}
+
+function normalizePublication(fields, before = null) {
+  const status = fields.publicationStatus === undefined
+    ? (before?.publication_status || "published")
+    : normalizeText(fields.publicationStatus);
+  if (!PUBLICATION_STATUSES.has(status)) {
+    throw createHttpError("publicationStatus is invalid.", 400);
+  }
+
+  if (status === "scheduled") {
+    const rawSchedule = fields.scheduledPublishAt === undefined
+      ? before?.scheduled_publish_at
+      : fields.scheduledPublishAt;
+    if (fields.publicationStatus === undefined && fields.scheduledPublishAt === undefined && rawSchedule) {
+      return { status, scheduledPublishAt: rawSchedule, publishedAt: null };
+    }
+    return {
+      status,
+      scheduledPublishAt: normalizeScheduledPublishAt(rawSchedule),
+      publishedAt: null,
+    };
+  }
+
+  if (status === "published") {
+    return {
+      status,
+      scheduledPublishAt: null,
+      publishedAt: before?.publication_status === "published" && before?.published_at
+        ? before.published_at
+        : new Date(),
+    };
+  }
+
+  return { status, scheduledPublishAt: null, publishedAt: null };
 }
 
 function normalizeBranchCodes(value) {
@@ -75,6 +124,10 @@ function toIsoDateOnly(value) {
 }
 
 function mapFocusProductRow(row) {
+  const scheduledPublishAt = row.scheduled_publish_at || null;
+  const scheduleHasArrived = row.publication_status === "scheduled"
+    && scheduledPublishAt
+    && new Date(scheduledPublishAt).getTime() <= Date.now();
   return {
     id: Number(row.id),
     productCode: row.product_code,
@@ -90,6 +143,11 @@ function mapFocusProductRow(row) {
     createdBy: row.created_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    publicationStatus: row.publication_status || "published",
+    publicationState: scheduleHasArrived ? "published" : (row.publication_status || "published"),
+    scheduledPublishAt,
+    publishedAt: row.published_at || (scheduleHasArrived ? scheduledPublishAt : null),
+    publishedBy: row.published_by || null,
   };
 }
 
@@ -286,7 +344,11 @@ async function listFocusProducts(db, { includeInactive = false, debug = false } 
   let t = Date.now();
   const sql = includeInactive
     ? `SELECT * FROM focus.focus_products ORDER BY created_at DESC`
-    : `SELECT * FROM focus.focus_products WHERE is_active = TRUE ORDER BY created_at DESC`;
+    : `SELECT * FROM focus.focus_products
+       WHERE is_active = TRUE
+         AND (publication_status = 'published'
+           OR (publication_status = 'scheduled' AND scheduled_publish_at <= now()))
+       ORDER BY created_at DESC`;
   const result = await db.query(sql);
   mark("select focus_products", t);
 
@@ -319,13 +381,18 @@ async function createFocusProduct(db, fields) {
   const note = normalizeNullableText(fields.note, NOTE_MAX_CHARS);
   const createdBy = normalizeNullableText(fields.createdBy);
   const assignedPersonName = normalizeNullableText(fields.assignedPersonName);
+  const publication = normalizePublication(fields);
+  const publishedBy = publication.status === "published" ? normalizeNullableText(fields.createdBy) : null;
 
   const inserted = await db.query(
     `INSERT INTO focus.focus_products
-       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by, assigned_person_name, branch_targets)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by,
+        assigned_person_name, branch_targets, publication_status, scheduled_publish_at, published_at, published_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14)
      RETURNING id`,
-    [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy, assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null],
+    [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy,
+      assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
+      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy],
   );
   const row = await fetchFocusProductRow(db, inserted.rows[0].id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
@@ -359,6 +426,11 @@ async function updateFocusProduct(db, id, fields) {
   const assignedPersonName = fields.assignedPersonName === undefined
     ? before.assigned_person_name
     : normalizeNullableText(fields.assignedPersonName);
+  const publication = normalizePublication(fields, before);
+  const actor = normalizeNullableText(fields.updatedBy);
+  const publishedBy = publication.status === "published"
+    ? (before.publication_status === "published" ? before.published_by : actor)
+    : null;
 
   // Editing the date range invalidates any existing freeze snapshot — it was
   // computed for the old range and no longer applies.
@@ -367,10 +439,14 @@ async function updateFocusProduct(db, id, fields) {
   await db.query(
     `UPDATE focus.focus_products
      SET product_code = $2, focus_type = $3, target_qty = $4, date_from = $5, date_to = $6,
-         branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, branch_targets = $11::jsonb, updated_at = now()
+         branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, branch_targets = $11::jsonb,
+         publication_status = $12, scheduled_publish_at = $13, published_at = $14, published_by = $15,
+         updated_at = now()
          ${dateRangeChanged ? ", frozen_sold_by_branch = NULL, frozen_total_sold = NULL, frozen_at = NULL" : ""}
      WHERE id = $1`,
-    [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive, assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null],
+    [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive,
+      assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
+      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy],
   );
   const row = await fetchFocusProductRow(db, id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
@@ -389,6 +465,7 @@ async function deactivateFocusProduct(db, id) {
 
 module.exports = {
   FOCUS_TYPES,
+  PUBLICATION_STATUSES,
   createHttpError,
   listFocusProducts,
   createFocusProduct,
@@ -397,4 +474,6 @@ module.exports = {
   mapFocusProductRow,
   attachProgress,
   fetchFocusProductRow,
+  normalizePublication,
+  computeStatus,
 };

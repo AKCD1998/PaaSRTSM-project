@@ -67,7 +67,10 @@ function createFocusProductsAdminRouter(deps) {
     try {
       const id = toIntOrNull(req.params.id);
       if (!id) return res.status(400).json({ error: "Invalid focus product id", request_id: req.requestId || null });
-      const updated = await updateFocusProduct(db, id, req.body || {});
+      const updated = await updateFocusProduct(db, id, {
+        ...(req.body || {}),
+        updatedBy: req.auth?.userId || null,
+      });
       return res.json({ ok: true, focusProduct: updated, request_id: req.requestId || null });
     } catch (error) {
       return next(error);
