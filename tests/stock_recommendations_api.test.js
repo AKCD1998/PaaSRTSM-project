@@ -318,8 +318,11 @@ test("branch user recommendation list is forced to its own branch scope and retu
 
   const purchaseRow = rows.find((row) => row.productCode === "P2");
   assert.equal(purchaseRow.action, "PURCHASE");
-  assert.equal(purchaseRow.incomingPoAllocationQty, 5);
-  assert.equal(purchaseRow.purchaseQty, 11);
+  // Branch 003 has no sales/shortage for P2, so shortage-weighted allocation
+  // (replacing the old equal_split) routes the whole incoming shipment to
+  // branch 001, which actually needs it.
+  assert.equal(purchaseRow.incomingPoAllocationQty, 10);
+  assert.equal(purchaseRow.purchaseQty, 6);
 
   const slowRow = rows.find((row) => row.productCode === "P3");
   assert.equal(slowRow.action, "NO_PURCHASE_SLOW_MOVING");
