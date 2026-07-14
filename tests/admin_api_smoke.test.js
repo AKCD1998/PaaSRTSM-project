@@ -198,7 +198,9 @@ function createMockDb() {
               product_name: state.product.display_name,
               barcode: "8853935031319",
               supplier: state.product.supplier_code,
-              unit: "BOX",
+              unit: "ขวด",
+              unit_code: "004",
+              unit_name: "ขวด",
               min_stock: "3",
               max_stock: "20",
               lead_time_days: "5",
@@ -555,7 +557,9 @@ test("ordering and sync routes are available on the unified backend", async () =
   assert.equal(searchResponse.status, 200);
   assert.equal(searchResponse.body[0].productCode, "630010001");
   assert.equal(searchResponse.body[0].barcode, "8853935031319");
-  assert.equal(searchResponse.body[0].unit, "BOX");
+  assert.equal(searchResponse.body[0].unit, "ขวด");
+  assert.equal(searchResponse.body[0].unitCode, "004");
+  assert.equal(searchResponse.body[0].unitName, "ขวด");
 
   const csrfToken = await loginAs(agent, "admin@example.com", "admin-pass-123");
   assert.ok(csrfToken);

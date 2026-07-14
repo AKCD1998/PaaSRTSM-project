@@ -993,7 +993,9 @@ function createOrderingRouter(deps) {
           COALESCE(s.display_name, i.display_name, i.generic_name, s.company_code) AS product_name,
           COALESCE(b.barcode, '') AS barcode,
           COALESCE(s.supplier_code, i.supplier_code, '') AS supplier,
-          COALESCE(unit_meta.unit_name, s.uom, '') AS unit,
+          COALESCE(unit_meta.unit_name, unit_usage.unit_name, s.uom, '') AS unit,
+          COALESCE(unit_meta.unit_name, unit_usage.unit_name, '') AS unit_name,
+          COALESCE(s.uom, '') AS unit_code,
           COALESCE(s.min_stock, 0) AS min_stock,
           COALESCE(s.max_stock, 0) AS max_stock,
           COALESCE(s.lead_time_days, 0) AS lead_time_days,
@@ -1019,6 +1021,7 @@ function createOrderingRouter(deps) {
           FROM ada.product_effective_branch_prices ep
           WHERE ep.product_code = s.company_code
             AND NULLIF(ep.unit_name, '') IS NOT NULL
+            AND NULLIF(BTRIM(ep.unit_name), '') IS DISTINCT FROM NULLIF(BTRIM(s.uom), '')
           ORDER BY
             CASE ep.channel WHEN 'retail' THEN 0 ELSE 1 END,
             ep.price_level ASC,
@@ -1026,6 +1029,31 @@ function createOrderingRouter(deps) {
             ep.branch_code ASC
           LIMIT 1
         ) unit_meta ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT candidate.unit_name
+          FROM (
+            SELECT
+              NULLIF(BTRIM(COALESCE(
+                sl.raw_payload->>'unitName',
+                sl.raw_payload->>'FTSdtUnitName'
+              )), '') AS unit_name,
+              sl.source_synced_at
+            FROM ada.sales_lines sl
+            WHERE sl.product_code = s.company_code
+
+            UNION ALL
+
+            SELECT
+              NULLIF(BTRIM(tl.unit_name), '') AS unit_name,
+              tl.source_synced_at
+            FROM ada.transfer_lines tl
+            WHERE tl.product_code = s.company_code
+          ) candidate
+          WHERE candidate.unit_name IS NOT NULL
+            AND candidate.unit_name IS DISTINCT FROM NULLIF(BTRIM(s.uom), '')
+          ORDER BY candidate.source_synced_at DESC NULLS LAST
+          LIMIT 1
+        ) unit_usage ON TRUE
         LEFT JOIN LATERAL (
           SELECT stock_current, stock_retail, stock_warehouse
           FROM analytics.product_stock_snapshots ps
@@ -1048,6 +1076,8 @@ function createOrderingRouter(deps) {
           barcode: row.barcode,
           supplier: row.supplier,
           unit: row.unit,
+          unitCode: row.unit_code || row.unit || "",
+          unitName: row.unit_name || "",
           stockCurrent: Number(row.stock_current || 0),
           stockRetail: Number(row.stock_retail || 0),
           stockWarehouse: Number(row.stock_warehouse || 0),
