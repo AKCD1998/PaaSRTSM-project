@@ -993,8 +993,25 @@ function createOrderingRouter(deps) {
           COALESCE(s.display_name, i.display_name, i.generic_name, s.company_code) AS product_name,
           COALESCE(b.barcode, '') AS barcode,
           COALESCE(s.supplier_code, i.supplier_code, '') AS supplier,
-          COALESCE(unit_meta.unit_name, unit_usage.unit_name, s.uom, '') AS unit,
-          COALESCE(unit_meta.unit_name, unit_usage.unit_name, '') AS unit_name,
+          COALESCE(
+            unit_meta.unit_name,
+            CASE
+              WHEN NULLIF(BTRIM(bss.unit), '') IS DISTINCT FROM NULLIF(BTRIM(s.uom), '')
+              THEN NULLIF(BTRIM(bss.unit), '')
+            END,
+            unit_usage.unit_name,
+            s.uom,
+            ''
+          ) AS unit,
+          COALESCE(
+            unit_meta.unit_name,
+            CASE
+              WHEN NULLIF(BTRIM(bss.unit), '') IS DISTINCT FROM NULLIF(BTRIM(s.uom), '')
+              THEN NULLIF(BTRIM(bss.unit), '')
+            END,
+            unit_usage.unit_name,
+            ''
+          ) AS unit_name,
           COALESCE(s.uom, '') AS unit_code,
           COALESCE(s.min_stock, 0) AS min_stock,
           COALESCE(s.max_stock, 0) AS max_stock,
@@ -1020,6 +1037,7 @@ function createOrderingRouter(deps) {
           SELECT NULLIF(ep.unit_name, '') AS unit_name
           FROM ada.product_effective_branch_prices ep
           WHERE ep.product_code = s.company_code
+            AND ep.unit_size = 'S'
             AND NULLIF(ep.unit_name, '') IS NOT NULL
             AND NULLIF(BTRIM(ep.unit_name), '') IS DISTINCT FROM NULLIF(BTRIM(s.uom), '')
           ORDER BY
@@ -1037,6 +1055,10 @@ function createOrderingRouter(deps) {
                 sl.raw_payload->>'unitName',
                 sl.raw_payload->>'FTSdtUnitName'
               )), '') AS unit_name,
+              NULLIF(BTRIM(COALESCE(
+                sl.raw_payload->>'unitCode',
+                sl.raw_payload->>'FTPunCode'
+              )), '') AS unit_code,
               sl.source_synced_at
             FROM ada.sales_lines sl
             WHERE sl.product_code = s.company_code
@@ -1045,11 +1067,13 @@ function createOrderingRouter(deps) {
 
             SELECT
               NULLIF(BTRIM(tl.unit_name), '') AS unit_name,
+              NULLIF(BTRIM(tl.unit_code), '') AS unit_code,
               tl.source_synced_at
             FROM ada.transfer_lines tl
             WHERE tl.product_code = s.company_code
           ) candidate
           WHERE candidate.unit_name IS NOT NULL
+            AND candidate.unit_code = NULLIF(BTRIM(s.uom), '')
             AND candidate.unit_name IS DISTINCT FROM NULLIF(BTRIM(s.uom), '')
           ORDER BY candidate.source_synced_at DESC NULLS LAST
           LIMIT 1
