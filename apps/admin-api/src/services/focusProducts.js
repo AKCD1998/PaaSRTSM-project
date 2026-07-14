@@ -139,7 +139,6 @@ function mapFocusProductRow(row) {
     branchCodesRaw: row.branch_codes || null, // null = defaulted to all active branches
     branchTargets: row.branch_targets || null, // per-branch target overrides (group_manager only)
     assignedPersonName: row.assigned_person_name || null,
-    assignedStaffId: row.assigned_staff_id == null ? null : String(row.assigned_staff_id),
     note: row.note,
     isActive: row.is_active,
     createdBy: row.created_by,
@@ -386,33 +385,19 @@ async function createFocusProduct(db, fields) {
   const branchTargets = normalizeBranchTargets(fields.branchTargets);
   const note = normalizeNullableText(fields.note, NOTE_MAX_CHARS);
   const createdBy = normalizeNullableText(fields.createdBy);
-  let assignedPersonName = null;
-  let assignedStaffId = null;
-  if (focusType === "salesperson") {
-    const staffId = Number(fields.assignedStaffId);
-    if (!Number.isInteger(staffId) || staffId <= 0) throw createHttpError("ต้องเลือกพนักงานขายจากรายชื่อ", 400);
-    const staff = await db.query(
-      `SELECT staff_id, display_name FROM core.branch_staff
-       WHERE staff_id = $1 AND role = 'sales' AND is_active = TRUE
-         AND branch_code = ANY($2::text[])`,
-      [staffId, REQUIRED_FOCUS_BRANCHES],
-    );
-    if (!staff.rowCount) throw createHttpError("พนักงานที่เลือกไม่ใช่พนักงานขาย Active ของสาขาที่กำหนด", 400);
-    assignedStaffId = Number(staff.rows[0].staff_id);
-    assignedPersonName = staff.rows[0].display_name;
-  }
+  const assignedPersonName = normalizeNullableText(fields.assignedPersonName);
   const publication = normalizePublication(fields);
   const publishedBy = publication.status === "published" ? normalizeNullableText(fields.createdBy) : null;
 
   const inserted = await db.query(
     `INSERT INTO focus.focus_products
        (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by,
-        assigned_person_name, branch_targets, publication_status, scheduled_publish_at, published_at, published_by, assigned_staff_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15)
+        assigned_person_name, branch_targets, publication_status, scheduled_publish_at, published_at, published_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14)
      RETURNING id`,
     [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy,
       assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
-      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy, assignedStaffId],
+      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy],
   );
   const row = await fetchFocusProductRow(db, inserted.rows[0].id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
@@ -433,7 +418,6 @@ function validateBulkRows(rows) {
     const focusType = normalizeText(row.focusType);
     const targetQty = Number(row.targetQty);
     const assignedPersonName = normalizeNullableText(row.assignedPersonName);
-    const assignedStaffId = row.assignedStaffId == null ? null : Number(row.assignedStaffId);
     const branchCodes = normalizeBranchCodes(row.branchCodes) || [];
     const branchTargets = normalizeBranchTargets(row.branchTargets);
     const missingBranches = REQUIRED_FOCUS_BRANCHES.filter((code) => !branchCodes.includes(code));
@@ -444,8 +428,8 @@ function validateBulkRows(rows) {
     if (missingBranches.length || branchCodes.some((code) => !REQUIRED_FOCUS_BRANCHES.includes(code))) {
       throw createHttpError(`รายการที่ ${index + 1}: ต้องเลือกสาขา 001, 003, 004 และ 005 ให้ครบ`, 400, { rowIndex: index });
     }
-    if (focusType === "salesperson" && (!Number.isInteger(assignedStaffId) || assignedStaffId <= 0)) {
-      throw createHttpError(`รายการที่ ${index + 1}: ต้องเลือกพนักงานขาย`, 400, { rowIndex: index });
+    if (focusType === "salesperson" && !assignedPersonName) {
+      throw createHttpError(`รายการที่ ${index + 1}: ต้องระบุผู้รับผิดชอบ`, 400, { rowIndex: index });
     }
     if (focusType !== "salesperson") {
       const incomplete = REQUIRED_FOCUS_BRANCHES.filter((code) => !Number.isFinite(Number(branchTargets?.[code])) || Number(branchTargets[code]) <= 0);
@@ -454,11 +438,11 @@ function validateBulkRows(rows) {
       }
     }
     const duplicateKey = focusType === "salesperson"
-      ? `${focusType}|${productCode.toLowerCase()}|${assignedStaffId}`
+      ? `${focusType}|${productCode.toLowerCase()}|${assignedPersonName.toLowerCase()}`
       : `${focusType}|${productCode.toLowerCase()}`;
     if (seen.has(duplicateKey)) throw createHttpError(`รายการที่ ${index + 1}: มีสินค้า/ผู้รับผิดชอบซ้ำในชุดนี้`, 409, { rowIndex: index });
     seen.add(duplicateKey);
-    return { ...row, productCode, focusType, targetQty, assignedPersonName, assignedStaffId, branchCodes: [...REQUIRED_FOCUS_BRANCHES], branchTargets };
+    return { ...row, productCode, focusType, targetQty, assignedPersonName, branchCodes: [...REQUIRED_FOCUS_BRANCHES], branchTargets };
   });
 }
 
@@ -486,8 +470,8 @@ async function createFocusProductsBulk(db, fields) {
       const duplicateParams = [row.productCode, row.focusType, dateFrom, dateTo];
       let personSql = "";
       if (row.focusType === "salesperson") {
-        duplicateParams.push(row.assignedStaffId);
-        personSql = `AND assigned_staff_id = $5`;
+        duplicateParams.push(row.assignedPersonName);
+        personSql = `AND lower(COALESCE(assigned_person_name, '')) = lower($5)`;
       }
       const duplicate = await client.query(
         `SELECT id FROM focus.focus_products
@@ -546,22 +530,6 @@ async function updateFocusProduct(db, id, fields) {
   const assignedPersonName = fields.assignedPersonName === undefined
     ? before.assigned_person_name
     : normalizeNullableText(fields.assignedPersonName);
-  let assignedStaffId = fields.assignedStaffId === undefined ? before.assigned_staff_id : Number(fields.assignedStaffId);
-  let resolvedAssignedPersonName = assignedPersonName;
-  if (focusType === "salesperson" && fields.assignedStaffId !== undefined) {
-    const staff = await db.query(
-      `SELECT staff_id, display_name FROM core.branch_staff
-       WHERE staff_id = $1 AND role = 'sales' AND is_active = TRUE
-         AND branch_code = ANY($2::text[])`,
-      [assignedStaffId, REQUIRED_FOCUS_BRANCHES],
-    );
-    if (!staff.rowCount) throw createHttpError("ต้องเลือกพนักงานขาย Active ของสาขาที่กำหนด", 400);
-    assignedStaffId = Number(staff.rows[0].staff_id);
-    resolvedAssignedPersonName = staff.rows[0].display_name;
-  } else if (focusType !== "salesperson") {
-    assignedStaffId = null;
-    resolvedAssignedPersonName = null;
-  }
   const publication = normalizePublication(fields, before);
   const actor = normalizeNullableText(fields.updatedBy);
   const publishedBy = publication.status === "published"
@@ -576,13 +544,13 @@ async function updateFocusProduct(db, id, fields) {
     `UPDATE focus.focus_products
      SET product_code = $2, focus_type = $3, target_qty = $4, date_from = $5, date_to = $6,
          branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, branch_targets = $11::jsonb,
-         publication_status = $12, scheduled_publish_at = $13, published_at = $14, published_by = $15, assigned_staff_id = $16,
+         publication_status = $12, scheduled_publish_at = $13, published_at = $14, published_by = $15,
          updated_at = now()
          ${dateRangeChanged ? ", frozen_sold_by_branch = NULL, frozen_total_sold = NULL, frozen_at = NULL" : ""}
      WHERE id = $1`,
     [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive,
-      resolvedAssignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
-      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy, assignedStaffId],
+      assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
+      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy],
   );
   const row = await fetchFocusProductRow(db, id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);

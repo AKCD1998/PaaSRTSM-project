@@ -26,7 +26,7 @@ test("bulk rows require all branches, positive targets, and salesperson owner", 
   };
   assert.equal(validateBulkRows([base]).length, 1);
   assert.throws(() => validateBulkRows([{ ...base, branchTargets: { "001": 1 } }]), /003, 004, 005/);
-  assert.throws(() => validateBulkRows([{ ...base, focusType: "salesperson", assignedStaffId: null }]), /พนักงานขาย/);
+  assert.throws(() => validateBulkRows([{ ...base, focusType: "salesperson", assignedPersonName: "" }]), /ผู้รับผิดชอบ/);
 });
 
 test("bulk rows reject duplicates within the same batch", () => {
