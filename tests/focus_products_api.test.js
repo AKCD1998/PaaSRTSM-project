@@ -258,6 +258,8 @@ test("admin CRUD requires admin role and CSRF for writes", async () => {
       targetQty: 5,
       dateFrom: "2026-07-01",
       dateTo: "2026-07-31",
+      branchCodes: ["001", "003", "004", "005"],
+      branchTargets: { "001": 5, "003": 5, "004": 5, "005": 5 },
     });
   assert.equal(created.status, 201);
   assert.equal(created.body.focusProduct.focusType, "pharmacist");
@@ -297,6 +299,8 @@ test("admin can save a draft and publish it when ready", async () => {
       targetQty: 10,
       dateFrom: "2027-01-01",
       dateTo: "2027-01-31",
+      branchCodes: ["001", "003", "004", "005"],
+      branchTargets: { "001": 10, "003": 10, "004": 10, "005": 10 },
       publicationStatus: "draft",
     });
   assert.equal(created.status, 201);
@@ -449,16 +453,16 @@ test("admin can set branchTargets on create and it round-trips", async () => {
       targetQty: 3,
       dateFrom: "2026-07-01",
       dateTo: "2026-07-31",
-      branchCodes: ["001", "005"],
-      branchTargets: { "001": 8, "005": 3 },
+      branchCodes: ["001", "003", "004", "005"],
+      branchTargets: { "001": 8, "003": 3, "004": 3, "005": 3 },
     });
   assert.equal(created.status, 201);
-  assert.deepEqual(created.body.focusProduct.branchTargets, { "001": 8, "005": 3 });
+  assert.deepEqual(created.body.focusProduct.branchTargets, { "001": 8, "003": 3, "004": 3, "005": 3 });
   assert.equal(created.body.focusProduct.branchTargetsEffective["001"], 8);
   assert.equal(created.body.focusProduct.branchTargetsEffective["005"], 3);
 });
 
-test("branchTargets rejects negative values but allows zero as a placeholder", async () => {
+test("branchTargets rejects negative and incomplete/zero targets", async () => {
   const { app } = createTestApp();
   const admin = request.agent(app);
   const csrf = await loginAs(admin);
@@ -476,9 +480,7 @@ test("branchTargets rejects negative values but allows zero as a placeholder", a
     });
   assert.equal(bad.status, 400);
 
-  // Zero means "target not known yet" — a legitimate placeholder for a
-  // branch that hasn't been assigned a real number.
-  const ok = await admin
+  const incomplete = await admin
     .post("/api/admin/focus-products")
     .set("x-csrf-token", csrf)
     .send({
@@ -490,7 +492,5 @@ test("branchTargets rejects negative values but allows zero as a placeholder", a
       branchCodes: ["001", "005"],
       branchTargets: { "001": 0 },
     });
-  assert.equal(ok.status, 201);
-  assert.equal(ok.body.focusProduct.branchTargetsEffective["001"], 0);
-  assert.equal(ok.body.focusProduct.branchTargetsEffective["005"], 5);
+  assert.equal(incomplete.status, 400);
 });

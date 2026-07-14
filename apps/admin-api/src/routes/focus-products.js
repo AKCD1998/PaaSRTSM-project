@@ -6,6 +6,7 @@ const {
   createFocusProduct,
   updateFocusProduct,
   deactivateFocusProduct,
+  createFocusProductsBulk,
 } = require("../services/focusProducts");
 
 function toIntOrNull(value) {
@@ -58,6 +59,18 @@ function createFocusProductsAdminRouter(deps) {
         createdBy: req.auth?.userId || null,
       });
       return res.status(201).json({ ok: true, focusProduct: created, request_id: req.requestId || null });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post("/focus-products/bulk", write, async (req, res, next) => {
+    try {
+      const focusProducts = await createFocusProductsBulk(db, {
+        ...(req.body || {}),
+        createdBy: req.auth?.userId || null,
+      });
+      return res.status(201).json({ ok: true, focusProducts, count: focusProducts.length, request_id: req.requestId || null });
     } catch (error) {
       return next(error);
     }

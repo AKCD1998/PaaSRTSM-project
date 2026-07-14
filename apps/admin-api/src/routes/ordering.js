@@ -993,13 +993,17 @@ function createOrderingRouter(deps) {
           COALESCE(s.display_name, i.display_name, i.generic_name, s.company_code) AS product_name,
           COALESCE(b.barcode, '') AS barcode,
           COALESCE(s.supplier_code, i.supplier_code, '') AS supplier,
-          COALESCE(s.uom, '') AS unit,
+          COALESCE(unit_meta.unit_name, s.uom, '') AS unit,
           COALESCE(s.min_stock, 0) AS min_stock,
           COALESCE(s.max_stock, 0) AS max_stock,
           COALESCE(s.lead_time_days, 0) AS lead_time_days,
           COALESCE(ls.stock_current, 0) AS stock_current,
           COALESCE(ls.stock_retail, 0) AS stock_retail,
           COALESCE(ls.stock_warehouse, 0) AS stock_warehouse
+          ,COALESCE(bss.qty_branch_001, 0) AS qty_branch_001
+          ,COALESCE(bss.qty_branch_003, 0) AS qty_branch_003
+          ,COALESCE(bss.qty_branch_004, 0) AS qty_branch_004
+          ,COALESCE(bss.qty_branch_005, 0) AS qty_branch_005
         FROM public.skus s
         LEFT JOIN public.items i
           ON i.item_id = s.item_id
@@ -1011,12 +1015,26 @@ function createOrderingRouter(deps) {
           LIMIT 1
         ) b ON TRUE
         LEFT JOIN LATERAL (
+          SELECT NULLIF(ep.unit_name, '') AS unit_name
+          FROM ada.product_effective_branch_prices ep
+          WHERE ep.product_code = s.company_code
+            AND NULLIF(ep.unit_name, '') IS NOT NULL
+          ORDER BY
+            CASE ep.channel WHEN 'retail' THEN 0 ELSE 1 END,
+            ep.price_level ASC,
+            CASE ep.unit_size WHEN 'S' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 9 END,
+            ep.branch_code ASC
+          LIMIT 1
+        ) unit_meta ON TRUE
+        LEFT JOIN LATERAL (
           SELECT stock_current, stock_retail, stock_warehouse
           FROM analytics.product_stock_snapshots ps
           WHERE ps.product_code = s.company_code
           ORDER BY ps.snapshot_at DESC, ps.stock_snapshot_id DESC
           LIMIT 1
         ) ls ON TRUE
+        LEFT JOIN ada.branch_stock_snapshots bss
+          ON bss.product_code = s.company_code
         ${whereClause}
         ORDER BY s.company_code ASC
         LIMIT 20
@@ -1036,6 +1054,12 @@ function createOrderingRouter(deps) {
           minStock: Number(row.min_stock || 0),
           maxStock: Number(row.max_stock || 0),
           leadTimeDays: Number(row.lead_time_days || 0),
+          stockByBranch: {
+            "001": Number(row.qty_branch_001 || 0),
+            "003": Number(row.qty_branch_003 || 0),
+            "004": Number(row.qty_branch_004 || 0),
+            "005": Number(row.qty_branch_005 || 0),
+          },
         })),
       );
     } catch (error) {

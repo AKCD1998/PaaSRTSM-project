@@ -554,6 +554,8 @@ test("ordering and sync routes are available on the unified backend", async () =
   const searchResponse = await agent.get("/api/products/search?q=630010001");
   assert.equal(searchResponse.status, 200);
   assert.equal(searchResponse.body[0].productCode, "630010001");
+  assert.equal(searchResponse.body[0].barcode, "8853935031319");
+  assert.equal(searchResponse.body[0].unit, "BOX");
 
   const csrfToken = await loginAs(agent, "admin@example.com", "admin-pass-123");
   assert.ok(csrfToken);
