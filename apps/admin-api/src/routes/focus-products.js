@@ -14,6 +14,11 @@ function toIntOrNull(value) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+function toYearOrNull(value) {
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 2000 && year <= 2100 ? year : null;
+}
+
 // Read-only, visible to every authenticated account (admin/staff/branch) — no
 // role filtering, per product decision: all focus types are shown to everyone.
 function createFocusProductsRouter(deps) {
@@ -23,7 +28,9 @@ function createFocusProductsRouter(deps) {
   router.get("/focus-products", requireAuthMiddleware, async (req, res, next) => {
     try {
       const debug = req.query.debug === "1";
-      const result = await listFocusProducts(db, { includeInactive: false, debug });
+      const year = req.query.year === undefined ? null : toYearOrNull(req.query.year);
+      if (req.query.year !== undefined && !year) return res.status(400).json({ error: "Invalid year" });
+      const result = await listFocusProducts(db, { includeInactive: false, debug, year });
       const { rows, timings } = debug ? result : { rows: result, timings: undefined };
       return res.json({ ok: true, focusProducts: rows, timings, request_id: req.requestId || null });
     } catch (error) {
@@ -44,7 +51,9 @@ function createFocusProductsAdminRouter(deps) {
   router.get("/focus-products", auth, async (req, res, next) => {
     try {
       const debug = req.query.debug === "1";
-      const result = await listFocusProducts(db, { includeInactive: true, debug });
+      const year = req.query.year === undefined ? null : toYearOrNull(req.query.year);
+      if (req.query.year !== undefined && !year) return res.status(400).json({ error: "Invalid year" });
+      const result = await listFocusProducts(db, { includeInactive: true, debug, year });
       const { rows, timings } = debug ? result : { rows: result, timings: undefined };
       return res.json({ ok: true, focusProducts: rows, timings, request_id: req.requestId || null });
     } catch (error) {

@@ -337,21 +337,28 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
   return results;
 }
 
-async function listFocusProducts(db, { includeInactive = false, debug = false } = {}) {
+async function listFocusProducts(db, { includeInactive = false, debug = false, year = null } = {}) {
   const timings = debug ? [] : null;
   const mark = (label, start) => {
     if (timings) timings.push({ label, ms: Date.now() - start });
   };
 
   let t = Date.now();
-  const sql = includeInactive
-    ? `SELECT * FROM focus.focus_products ORDER BY created_at DESC`
-    : `SELECT * FROM focus.focus_products
-       WHERE is_active = TRUE
-         AND (publication_status = 'published'
-           OR (publication_status = 'scheduled' AND scheduled_publish_at <= now()))
-       ORDER BY created_at DESC`;
-  const result = await db.query(sql);
+  const clauses = [];
+  const params = [];
+  if (!includeInactive) {
+    clauses.push(`is_active = TRUE
+      AND (publication_status = 'published'
+        OR (publication_status = 'scheduled' AND scheduled_publish_at <= now()))`);
+  }
+  if (year) {
+    params.push(`${year}-01-01`, `${year}-12-31`);
+    clauses.push(`date_from <= $2::date AND date_to >= $1::date`);
+  }
+  const sql = `SELECT * FROM focus.focus_products
+    ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+    ORDER BY created_at DESC`;
+  const result = await db.query(sql, params);
   mark("select focus_products", t);
 
   t = Date.now();
