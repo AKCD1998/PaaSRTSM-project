@@ -658,13 +658,15 @@ async function queryStockDayBase(db, periodDays, productCode) {
     productClause = "AND s.company_code = $2";
   }
 
-  // latest stock per product is fetched via a LATERAL 1-row index probe per
-  // SKU (backed by idx_product_stock_snapshots_latest) instead of the old
-  // DISTINCT ON CTE, which had to seq-scan + sort the entire 5M-row
-  // analytics.product_stock_snapshots table on every call (EXPLAIN cost
-  // ~938k vs ~12k) — concurrent calls to that CTE saturated the 0.1-CPU
-  // database and starved the shared connection pool during the 2026-07-15
-  // outage.
+  // latest stock per product now reads analytics.product_current_stock (one
+  // row per product, kept in sync by upsertProductBatch in sync.js) instead
+  // of computing it from analytics.product_stock_snapshots on every call.
+  // That history table caused the 2026-07-15 outage: an unindexed DISTINCT
+  // ON had to seq-scan + sort all 5M rows per request (EXPLAIN cost
+  // ~938k), and grows without bound. This read no longer depends on its
+  // size at all — a follow-up index+LATERAL fix (deployed same day, before
+  // this table existed) got cost down to ~12k, but this removes the
+  // dependency on that history table entirely for reads.
   const sql = `
     WITH sales AS (
       SELECT
@@ -704,13 +706,8 @@ async function queryStockDayBase(db, periodDays, productCode) {
       ORDER BY is_primary DESC, updated_at DESC NULLS LAST, barcode ASC
       LIMIT 1
     ) b ON TRUE
-    LEFT JOIN LATERAL (
-      SELECT ps.stock_current
-      FROM analytics.product_stock_snapshots ps
-      WHERE ps.product_code = s.company_code
-      ORDER BY ps.snapshot_at DESC, ps.stock_snapshot_id DESC
-      LIMIT 1
-    ) ls ON TRUE
+    LEFT JOIN analytics.product_current_stock ls
+      ON ls.product_code = s.company_code
     LEFT JOIN sales sa
       ON sa.product_code = s.company_code
     LEFT JOIN purchases pu
@@ -1080,13 +1077,8 @@ function createOrderingRouter(deps) {
           ORDER BY candidate.source_synced_at DESC NULLS LAST
           LIMIT 1
         ) unit_usage ON TRUE
-        LEFT JOIN LATERAL (
-          SELECT stock_current, stock_retail, stock_warehouse
-          FROM analytics.product_stock_snapshots ps
-          WHERE ps.product_code = s.company_code
-          ORDER BY ps.snapshot_at DESC, ps.stock_snapshot_id DESC
-          LIMIT 1
-        ) ls ON TRUE
+        LEFT JOIN analytics.product_current_stock ls
+          ON ls.product_code = s.company_code
         LEFT JOIN ada.branch_stock_snapshots bss
           ON bss.product_code = s.company_code
         ${whereClause}

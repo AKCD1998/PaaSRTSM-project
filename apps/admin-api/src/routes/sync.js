@@ -271,6 +271,37 @@ async function upsertProductBatch(client, records) {
     ],
   );
 
+  // ── 5. Upsert the "latest stock" read model (CP3.2) ──────────────────────
+  // Reads (queryStockDayBase, product search) hit this table instead of the
+  // ever-growing history above, so their cost never depends on how much
+  // history has piled up. The WHERE guard drops the write if a newer
+  // snapshot already landed (a batch from an earlier sync arriving late
+  // after a more recent one) — snapshot_at is set to the same `now()` as
+  // the history INSERT above, both within this transaction.
+  await client.query(
+    `
+      INSERT INTO analytics.product_current_stock
+        (product_code, stock_current, stock_retail, stock_warehouse, snapshot_at, source_name, updated_at)
+      SELECT t.product_code, t.stock_current, t.stock_retail, t.stock_warehouse, now(), 'adapos_sync', now()
+      FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[])
+        AS t(product_code, stock_current, stock_retail, stock_warehouse)
+      ON CONFLICT (product_code) DO UPDATE SET
+        stock_current = EXCLUDED.stock_current,
+        stock_retail = EXCLUDED.stock_retail,
+        stock_warehouse = EXCLUDED.stock_warehouse,
+        snapshot_at = EXCLUDED.snapshot_at,
+        source_name = EXCLUDED.source_name,
+        updated_at = EXCLUDED.updated_at
+      WHERE analytics.product_current_stock.snapshot_at <= EXCLUDED.snapshot_at
+    `,
+    [
+      normalized.map((r) => r.productCode),
+      normalized.map((r) => r.stockCurrent),
+      normalized.map((r) => r.stockRetail),
+      normalized.map((r) => r.stockWarehouse),
+    ],
+  );
+
   return {
     itemsUpserted: itemsResult.rowCount,
     skusUpserted: skusResult.rowCount,
@@ -528,4 +559,5 @@ function createSyncRouter(deps) {
 
 module.exports = {
   createSyncRouter,
+  upsertProductBatch,
 };
