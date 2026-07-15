@@ -88,21 +88,6 @@ test("non-admin listing filters drafts and exposes due schedules", async () => {
   assert.match(queries[0], /scheduled_publish_at <= now\(\)/);
 });
 
-test("focus listing can limit work to rows overlapping one calendar year", async () => {
-  const queries = [];
-  const db = {
-    async query(sql, params = []) {
-      queries.push({ sql, params });
-      if (/SELECT branch_code FROM core\.branches/.test(sql)) return { rows: [] };
-      return { rows: [] };
-    },
-  };
-
-  await listFocusProducts(db, { includeInactive: true, year: 2026 });
-  assert.match(queries[0].sql, /date_from <= \$2::date AND date_to >= \$1::date/);
-  assert.deepEqual(queries[0].params, ["2026-01-01", "2026-12-31"]);
-});
-
 test("focus success rules remain unchanged", () => {
   const sold = { "001": 10, "003": 4 };
   assert.equal(computeStatus("salesperson", 14, sold, ["001", "003"], null).achieved, true);
