@@ -658,18 +658,15 @@ async function queryStockDayBase(db, periodDays, productCode) {
     productClause = "AND s.company_code = $2";
   }
 
+  // latest stock per product is fetched via a LATERAL 1-row index probe per
+  // SKU (backed by idx_product_stock_snapshots_latest) instead of the old
+  // DISTINCT ON CTE, which had to seq-scan + sort the entire 5M-row
+  // analytics.product_stock_snapshots table on every call (EXPLAIN cost
+  // ~938k vs ~12k) — concurrent calls to that CTE saturated the 0.1-CPU
+  // database and starved the shared connection pool during the 2026-07-15
+  // outage.
   const sql = `
-    WITH latest_stock AS (
-      SELECT DISTINCT ON (ps.product_code)
-        ps.product_code,
-        ps.stock_current,
-        ps.stock_retail,
-        ps.stock_warehouse,
-        ps.snapshot_at
-      FROM analytics.product_stock_snapshots ps
-      ORDER BY ps.product_code, ps.snapshot_at DESC, ps.stock_snapshot_id DESC
-    ),
-    sales AS (
+    WITH sales AS (
       SELECT
         ss.product_code,
         SUM(ss.sold_qty_base) AS sold_qty_period
@@ -707,8 +704,13 @@ async function queryStockDayBase(db, periodDays, productCode) {
       ORDER BY is_primary DESC, updated_at DESC NULLS LAST, barcode ASC
       LIMIT 1
     ) b ON TRUE
-    LEFT JOIN latest_stock ls
-      ON ls.product_code = s.company_code
+    LEFT JOIN LATERAL (
+      SELECT ps.stock_current
+      FROM analytics.product_stock_snapshots ps
+      WHERE ps.product_code = s.company_code
+      ORDER BY ps.snapshot_at DESC, ps.stock_snapshot_id DESC
+      LIMIT 1
+    ) ls ON TRUE
     LEFT JOIN sales sa
       ON sa.product_code = s.company_code
     LEFT JOIN purchases pu
@@ -1257,13 +1259,30 @@ function createOrderingRouter(deps) {
     }
   });
 
+  // Stock levels only change when a branch sync lands (twice daily), so a
+  // short shared cache is safe. Storing the in-flight promise (not just the
+  // resolved rows) coalesces concurrent requests into one DB query — the
+  // request-burst pattern is what took the whole API down on 2026-07-15,
+  // since every simultaneous page load used to cost its own full-table query.
+  const stockDayCache = new Map(); // periodDays -> { promise, expiresAt }
+  const STOCK_DAY_CACHE_TTL_MS = 60_000;
+
+  function loadStockDayRows(periodDays) {
+    const cached = stockDayCache.get(periodDays);
+    if (cached && cached.expiresAt > Date.now()) return cached.promise;
+    const promise = queryStockDayBase(db, periodDays, null);
+    stockDayCache.set(periodDays, { promise, expiresAt: Date.now() + STOCK_DAY_CACHE_TTL_MS });
+    promise.catch(() => stockDayCache.delete(periodDays));
+    return promise;
+  }
+
   router.get("/admin/stock-day", requireAuthMiddleware, async (req, res, next) => {
     const periodDays = parsePositiveInt(req.query.periodDays, config.defaultPeriodDays);
     if (periodDays == null) {
       return res.status(400).json({ message: "periodDays must be a positive number." });
     }
     try {
-      const rows = await queryStockDayBase(db, periodDays, null);
+      const rows = await loadStockDayRows(periodDays);
       return res.json(rows.map((row) => buildStockDayRow(row, periodDays)));
     } catch (error) {
       return next(error);
