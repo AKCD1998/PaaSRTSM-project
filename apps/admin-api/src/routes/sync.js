@@ -310,6 +310,55 @@ async function upsertProductBatch(client, records) {
   };
 }
 
+const SNAPSHOT_RETENTION_DAYS = 365;
+const PRUNE_THROTTLE_HOURS = 24;
+const PRUNE_BATCH_SIZE = 20_000;
+const PRUNE_TASK_NAME = "prune_product_stock_snapshots";
+
+// CP3.2 retention, piggybacked onto normal sync traffic rather than a
+// separate scheduled job (deliberately no new Render Cron service — avoids
+// growing billed infrastructure). The claim UPSERT is atomic, so concurrent
+// /products calls from multiple branches can't double-run this; almost
+// every call will just no-op past the throttle check. Batch-bounded delete
+// (not a single unbounded DELETE) keeps any one run's lock/duration small —
+// worth revisiting the batch size if daily insert volume ever outpaces it,
+// see docs/sync-program/STATE.md.
+async function pruneOldSnapshotsIfDue(db) {
+  const claim = await db.query(
+    `
+      INSERT INTO analytics.maintenance_runs (task_name, last_run_at)
+      VALUES ($1, now())
+      ON CONFLICT (task_name) DO UPDATE SET last_run_at = now()
+      WHERE analytics.maintenance_runs.last_run_at IS NULL
+         OR analytics.maintenance_runs.last_run_at < now() - ($2 || ' hours')::interval
+      RETURNING task_name
+    `,
+    [PRUNE_TASK_NAME, PRUNE_THROTTLE_HOURS],
+  );
+  if (claim.rowCount === 0) return { ran: false };
+
+  const deleted = await db.query(
+    `
+      DELETE FROM analytics.product_stock_snapshots
+      WHERE stock_snapshot_id IN (
+        SELECT stock_snapshot_id
+        FROM analytics.product_stock_snapshots
+        WHERE snapshot_at < now() - ($1 || ' days')::interval
+        ORDER BY snapshot_at ASC
+        LIMIT $2
+      )
+    `,
+    [SNAPSHOT_RETENTION_DAYS, PRUNE_BATCH_SIZE],
+  );
+
+  await db.query(
+    `UPDATE analytics.maintenance_runs SET last_run_deleted_count = $1 WHERE task_name = $2`,
+    [deleted.rowCount, PRUNE_TASK_NAME],
+  );
+
+  return { ran: true, deletedCount: deleted.rowCount };
+}
+
 function createSyncRouter(deps) {
   const { config, db } = deps;
   const router = express.Router();
@@ -335,6 +384,12 @@ function createSyncRouter(deps) {
       // set-based queries instead of one query loop per record.
       await upsertProductBatch(client, records);
       await client.query("COMMIT");
+      // Best-effort, throttled retention pruning — must never affect this
+      // response either way, so it runs after commit, on the pool (not the
+      // just-released client), fire-and-forget with its own error handling.
+      pruneOldSnapshotsIfDue(db).catch((pruneError) => {
+        console.error("pruneOldSnapshotsIfDue failed:", pruneError.message);
+      });
       return res.json({ accepted: records.length });
     } catch (e) {
       await client.query("ROLLBACK");
@@ -560,4 +615,5 @@ function createSyncRouter(deps) {
 module.exports = {
   createSyncRouter,
   upsertProductBatch,
+  pruneOldSnapshotsIfDue,
 };
