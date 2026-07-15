@@ -40,6 +40,11 @@ function daysInMonth(monthStartIso) {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
 }
 
+function toIsoDateOnly(value) {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
 async function listSalesTargets({ db, branchCode, month }) {
   const monthStart = normalizeMonth(month);
   const result = await db.query(
@@ -116,7 +121,7 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
   // produce a nonsensical days-elapsed count.
   const clampedAsOf = requestedAsOf < monthStart ? monthStart : requestedAsOf > monthEndIso ? monthEndIso : requestedAsOf;
 
-  const [targetsResult, actualResult] = await Promise.all([
+  const [targetsResult, actualResult, dailyResult] = await Promise.all([
     listSalesTargets({ db, branchCode, month: monthStart }),
     db.query(
       `
@@ -129,9 +134,28 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
       `,
       [branchCode, monthStart, clampedAsOf],
     ),
+    db.query(
+      `
+        SELECT doc_date::text AS doc_date, COALESCE(SUM(grand_amount), 0) AS actual
+        FROM ada.sales_headers
+        WHERE branch_code = $1
+          AND doc_date >= $2::date
+          AND doc_date <= $3::date
+          AND ${ACTUAL_SALES_FILTER}
+        GROUP BY doc_date
+        ORDER BY doc_date
+      `,
+      [branchCode, monthStart, clampedAsOf],
+    ),
   ]);
 
   const actualSoFar = Number(actualResult.rows[0].actual);
+  const byDate = new Map(dailyResult.rows.map((r) => [r.doc_date.slice(0, 10), Number(r.actual)]));
+  const dailyActuals = [];
+  for (let d = new Date(monthStart + "T00:00:00Z"); toIsoDateOnly(d) <= clampedAsOf; d.setUTCDate(d.getUTCDate() + 1)) {
+    const iso = toIsoDateOnly(d);
+    dailyActuals.push({ date: iso, actual: byDate.get(iso) || 0 });
+  }
   const daysElapsed = Math.floor(
     (new Date(clampedAsOf + "T00:00:00Z") - new Date(monthStart + "T00:00:00Z")) / 86400000,
   ) + 1;
@@ -161,6 +185,7 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
     daysRemaining,
     actualSoFar,
     tiers,
+    dailyActuals,
   };
 }
 
