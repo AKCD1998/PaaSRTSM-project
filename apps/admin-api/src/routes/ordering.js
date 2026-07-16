@@ -1605,17 +1605,52 @@ function createOrderingRouter(deps) {
             (started_at AT TIME ZONE 'Asia/Bangkok')::date     AS run_date,
             bool_or(status = 'success')                        AS any_success,
             bool_or(status = 'failed')                         AS any_failed,
-            bool_or(status = 'running')                        AS any_running
+            bool_or(status = 'running')                        AS any_running,
+            COUNT(*)                                           AS total_runs,
+            COALESCE(SUM(records_sent), 0)                     AS total_sent
           FROM ingest.sync_runs
           WHERE sync_type LIKE 'adapos_branch_%'
             AND started_at >= (CURRENT_DATE - ($1::int - 1)) - INTERVAL '1 day'
           GROUP BY 1, 2
         ),
+        -- CP2: the single most recent run per (branch, date) — its own
+        -- fields (message, per-dataset breakdown) are what a clicked cell
+        -- drills into, separate from runs_agg's whole-day totals above.
+        latest_run AS (
+          SELECT DISTINCT ON (branch_code, run_date)
+            sync_run_id, branch_code, run_date, sync_type, status,
+            started_at, finished_at, records_read, records_sent, message
+          FROM (
+            SELECT
+              sync_run_id, sync_type, status, started_at, finished_at,
+              records_read, records_sent, message,
+              substring(sync_type FROM 'adapos_branch_([0-9]+)') AS branch_code,
+              (started_at AT TIME ZONE 'Asia/Bangkok')::date     AS run_date
+            FROM ingest.sync_runs
+            WHERE sync_type LIKE 'adapos_branch_%'
+              AND started_at >= (CURRENT_DATE - ($1::int - 1)) - INTERVAL '1 day'
+          ) x
+          ORDER BY branch_code, run_date, started_at DESC
+        ),
+        latest_run_datasets AS (
+          SELECT
+            lr.branch_code, lr.run_date,
+            json_agg(
+              json_build_object(
+                'dataset', d.dataset_name, 'status', d.status,
+                'recordsSent', d.records_sent, 'error', d.error_message
+              ) ORDER BY d.sync_run_dataset_id
+            ) AS datasets
+          FROM latest_run lr
+          JOIN ingest.sync_run_datasets d ON d.sync_run_id = lr.sync_run_id
+          GROUP BY lr.branch_code, lr.run_date
+        ),
         heartbeats_agg AS (
           SELECT
             branch_code,
             (created_at AT TIME ZONE 'Asia/Bangkok')::date AS hb_date,
-            COUNT(*) AS hb_count
+            COUNT(*) AS hb_count,
+            MAX(created_at) AS latest_heartbeat_at
           FROM ingest.laptop_heartbeats
           WHERE created_at >= (CURRENT_DATE - ($1::int - 1)) - INTERVAL '1 day'
           GROUP BY 1, 2
@@ -1632,11 +1667,25 @@ function createOrderingRouter(deps) {
             WHEN COALESCE(r.any_running, false) THEN 'running'
             WHEN COALESCE(h.hb_count, 0) > 0     THEN 'failed'
             ELSE 'offline'
-          END AS status
+          END AS status,
+          r.total_runs,
+          r.total_sent,
+          lr.sync_type       AS latest_sync_type,
+          lr.status          AS latest_run_status,
+          lr.started_at      AS latest_started_at,
+          lr.finished_at     AS latest_finished_at,
+          lr.records_read    AS latest_records_read,
+          lr.records_sent    AS latest_records_sent,
+          lr.message         AS latest_message,
+          lrd.datasets       AS datasets,
+          h.latest_heartbeat_at,
+          h.hb_count
         FROM date_series d
         CROSS JOIN known_branches b
-        LEFT JOIN runs_agg       r ON r.branch_code = b.branch_code AND r.run_date = d.d
-        LEFT JOIN heartbeats_agg h ON h.branch_code = b.branch_code AND h.hb_date  = d.d
+        LEFT JOIN runs_agg            r   ON r.branch_code = b.branch_code AND r.run_date = d.d
+        LEFT JOIN latest_run          lr  ON lr.branch_code = b.branch_code AND lr.run_date = d.d
+        LEFT JOIN latest_run_datasets lrd ON lrd.branch_code = b.branch_code AND lrd.run_date = d.d
+        LEFT JOIN heartbeats_agg      h   ON h.branch_code = b.branch_code AND h.hb_date  = d.d
         ORDER BY b.branch_code, d.d DESC
       `;
 
@@ -1651,7 +1700,21 @@ function createOrderingRouter(deps) {
           dates.push(r.iso_date);
         }
         if (!rows[r.branch_code]) rows[r.branch_code] = {};
-        rows[r.branch_code][r.iso_date] = r.status;
+        rows[r.branch_code][r.iso_date] = {
+          status: r.status,
+          totalRuns: Number(r.total_runs ?? 0),
+          totalSent: Number(r.total_sent ?? 0),
+          syncType: r.latest_sync_type || null,
+          latestRunStatus: r.latest_run_status || null,
+          latestStartedAt: r.latest_started_at || null,
+          latestFinishedAt: r.latest_finished_at || null,
+          recordsRead: Number(r.latest_records_read ?? 0),
+          recordsSent: Number(r.latest_records_sent ?? 0),
+          message: r.latest_message || null,
+          datasets: r.datasets || null,
+          latestHeartbeatAt: r.latest_heartbeat_at || null,
+          heartbeatCount: Number(r.hb_count ?? 0),
+        };
       }
 
       return res.json({ dates, branches: knownBranches, rows });
