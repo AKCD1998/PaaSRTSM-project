@@ -402,7 +402,12 @@ function createMovementAnalyticsRouter(deps) {
   // Sources: ada.transfer_lines, ada.approved_receipt_lines, ada.sales_lines
   router.get("/movement-transactions", requireAuthMiddleware, async (req, res, next) => {
     const branchCode  = normalizeText(req.query.branch_code);
-    const dateFrom    = normalizeText(req.query.date_from) || null;
+    // Same unbounded-scan shape branch-product-sales had (fixed 2026-07-16,
+    // commit d130069) — a cleared/absent date filter here means "every
+    // transfer/receipt/sale ever", across transfer_lines (~50k) and
+    // sales_lines (~950k). Preventive fix applied before this one actually
+    // caused an incident, per the 2026-07-16 pg_stat_statements audit.
+    const dateFrom    = normalizeText(req.query.date_from) || DEFAULT_SALES_LOOKBACK_DATE();
     const dateTo      = normalizeText(req.query.date_to)   || null;
     const docSearch   = normalizeText(req.query.doc_search);
     const productCode = normalizeText(req.query.product_code);
@@ -570,7 +575,8 @@ function createMovementAnalyticsRouter(deps) {
   // Click a document to load its line items via /:document_no/items.
   router.get("/movement-documents", requireAuthMiddleware, async (req, res, next) => {
     const branchCode = normalizeText(req.query.branch_code);
-    const dateFrom   = normalizeText(req.query.date_from) || null;
+    // Same preventive floor as /movement-transactions above.
+    const dateFrom   = normalizeText(req.query.date_from) || DEFAULT_SALES_LOOKBACK_DATE();
     const dateTo     = normalizeText(req.query.date_to)   || null;
     const docSearch  = normalizeText(req.query.doc_search);
     const types      = parseTypes(req.query.types);

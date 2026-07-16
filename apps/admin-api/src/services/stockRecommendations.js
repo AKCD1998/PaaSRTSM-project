@@ -473,15 +473,39 @@ async function loadCurrentStockByProduct(db, { productCodes }) {
 // (migration 017), which filters on paid_status IN ('1', ...) — real data uses
 // paid_status='3' (see movement-analytics.js / focusProducts.js), so that
 // function's output is effectively empty and hasn't refreshed since
-// 2026-05-20. The only live feed (adapos_sync, from the branch senders) only
-// ever pushes period_days=30, so soldQty90d was always 0 and every product
-// looked like a 90-day non-mover. Querying the raw tables directly with the
-// correct paid filter fixes both windows at the source.
+// 2026-05-20 (re-confirmed 2026-07-16: still 1 stale row). The only live feed
+// (adapos_sync, from the branch senders) only ever pushes period_days=30, so
+// soldQty90d was always 0 and every product looked like a 90-day non-mover.
+// Querying the raw tables directly with the correct paid filter fixes both
+// windows at the source — do not switch this back to the summary table
+// without fixing that refresh function first.
+//
+// This join costs 20-30s regardless of plan (measured via EXPLAIN ANALYZE,
+// both Nested Loop and Hash Join): sales_lines carries no date column, so a
+// 90-day, 5-branch rollup genuinely has to touch a large slice of real data
+// either way. anchorDate only changes once/day by design (see
+// resolveAnchorDate's own comment), so branchCodes+anchorDate is a stable
+// cache key for the vast majority of real traffic — cached rather than
+// query-rewritten, same lever as the stock-day fix.
+const RAW_SALES_AGG_CACHE_TTL_MS = 15 * 60_000;
+const rawSalesAggCache = new Map(); // cacheKey -> { promise, expiresAt }
+
 async function loadRawSalesAggByBranch(db, { branchCodes, window30From, window90From, anchorDate }) {
   if (!Array.isArray(branchCodes) || branchCodes.length === 0) {
     return new Map();
   }
 
+  const cacheKey = `${[...branchCodes].sort().join(",")}|${anchorDate}`;
+  const cached = rawSalesAggCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.promise;
+
+  const promise = loadRawSalesAggByBranchUncached(db, { branchCodes, window30From, window90From, anchorDate });
+  rawSalesAggCache.set(cacheKey, { promise, expiresAt: Date.now() + RAW_SALES_AGG_CACHE_TTL_MS });
+  promise.catch(() => rawSalesAggCache.delete(cacheKey));
+  return promise;
+}
+
+async function loadRawSalesAggByBranchUncached(db, { branchCodes, window30From, window90From, anchorDate }) {
   const result = await db.query(
     `
       SELECT

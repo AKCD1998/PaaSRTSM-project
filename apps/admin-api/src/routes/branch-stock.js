@@ -1344,29 +1344,37 @@ function createBranchStockRouter(deps) {
     const search = normalizeQuery(req.query.search || "");
 
     try {
-      const countResult = await db.query(
-        `
-          SELECT COUNT(*)::int AS total
-          FROM ada.branch_stock_snapshots bs
-          LEFT JOIN ada.products p
-            ON p.product_code = bs.product_code
-          LEFT JOIN LATERAL (
-            SELECT barcode
-            FROM ada.product_barcodes pb
-            WHERE pb.product_code = bs.product_code
-            ORDER BY
-              CASE pb.barcode_role
-                WHEN 'primary' THEN 0
-                ELSE 1
-              END,
-              pb.updated_at DESC,
-              pb.barcode ASC
-            LIMIT 1
-          ) pb ON TRUE
-          WHERE ${branchStockSearchCondition()}
-        `,
-        [search],
-      );
+      // The default page load (no search) is most of this endpoint's
+      // traffic. products/LATERAL barcode below only exist to support the
+      // ILIKE search match — with no search string, they're unused work:
+      // ~4.5k calls/table-scan pairs measured at up to 54s/23s. Skipping
+      // straight to a bare count avoids that entirely when there's nothing
+      // to filter on.
+      const countResult = search
+        ? await db.query(
+            `
+              SELECT COUNT(*)::int AS total
+              FROM ada.branch_stock_snapshots bs
+              LEFT JOIN ada.products p
+                ON p.product_code = bs.product_code
+              LEFT JOIN LATERAL (
+                SELECT barcode
+                FROM ada.product_barcodes pb
+                WHERE pb.product_code = bs.product_code
+                ORDER BY
+                  CASE pb.barcode_role
+                    WHEN 'primary' THEN 0
+                    ELSE 1
+                  END,
+                  pb.updated_at DESC,
+                  pb.barcode ASC
+                LIMIT 1
+              ) pb ON TRUE
+              WHERE ${branchStockSearchCondition()}
+            `,
+            [search],
+          )
+        : await db.query(`SELECT COUNT(*)::int AS total FROM ada.branch_stock_snapshots`);
 
       const rowsResult = await db.query(
         `
@@ -1407,7 +1415,7 @@ function createBranchStockRouter(deps) {
               pb.barcode ASC
             LIMIT 1
           ) pb ON TRUE
-          WHERE ${branchStockSearchCondition()}
+          ${search ? `WHERE ${branchStockSearchCondition()}` : ""}
           ORDER BY bs.product_code ASC
           LIMIT $2 OFFSET $3
         `,
