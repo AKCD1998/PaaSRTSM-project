@@ -1376,8 +1376,7 @@ function createBranchStockRouter(deps) {
           )
         : await db.query(`SELECT COUNT(*)::int AS total FROM ada.branch_stock_snapshots`);
 
-      const rowsResult = await db.query(
-        `
+      const rowsBaseQuery = `
           SELECT
             bs.product_code,
             COALESCE(bs.product_name_thai, p.product_name_th) AS product_name_thai,
@@ -1415,12 +1414,26 @@ function createBranchStockRouter(deps) {
               pb.barcode ASC
             LIMIT 1
           ) pb ON TRUE
-          ${search ? `WHERE ${branchStockSearchCondition()}` : ""}
-          ORDER BY bs.product_code ASC
-          LIMIT $2 OFFSET $3
-        `,
-        [search, limit, offset],
-      );
+      `;
+
+      const rowsResult = search
+        ? await db.query(
+            `
+              ${rowsBaseQuery}
+              WHERE ${branchStockSearchCondition()}
+              ORDER BY bs.product_code ASC
+              LIMIT $2 OFFSET $3
+            `,
+            [search, limit, offset],
+          )
+        : await db.query(
+            `
+              ${rowsBaseQuery}
+              ORDER BY bs.product_code ASC
+              LIMIT $1 OFFSET $2
+            `,
+            [limit, offset],
+          );
 
       return res.json({
         records: rowsResult.rows.map(mapBranchStockRow),
