@@ -20,6 +20,13 @@ function normalizeQuery(value = "") {
   return normalizeText(value).toLowerCase();
 }
 
+// Server-side floor under branch-product-sales' date_from — see call site.
+function DEFAULT_SALES_LOOKBACK_DATE() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - 90);
+  return d.toISOString().slice(0, 10);
+}
+
 function parsePositiveInt(value, fallback) {
   if (value == null || value === "") return fallback;
   const n = Number(value);
@@ -160,7 +167,13 @@ function createMovementAnalyticsRouter(deps) {
   // branch_stock_snapshots is the same reliably-synced source the working
   // "สต็อกสาขา" page already depends on.
   router.get("/branch-product-sales", requireAuthMiddleware, async (req, res, next) => {
-    const dateFrom = normalizeText(req.query.date_from) || null;
+    // The frontend always sends a date range (defaults to last 30 days on its
+    // own), but nothing server-side enforced that — an empty/cleared filter
+    // means "sum all of ada.sales_lines history" (~950k rows), which measured
+    // at 40-90+s even with a supporting index, vs. ~6-7s for a normal 30-day
+    // window. This default is the actual safety net; the frontend default is
+    // just UX.
+    const dateFrom = normalizeText(req.query.date_from) || DEFAULT_SALES_LOOKBACK_DATE();
     const dateTo = normalizeText(req.query.date_to) || null;
     const search = normalizeQuery(req.query.product_search || "");
     const sortBy = normalizeText(req.query.sort_by) || "qty_total";
