@@ -371,6 +371,67 @@ function createSyncRouter(deps) {
     return next();
   });
 
+  // CP2 (observability): if the agent sent a run correlation ID (see
+  // /run-start below), record this dataset's outcome under that run —
+  // fire-and-forget, must never affect the real response either way.
+  // Also logs to stdout (captured by Render) tagged with the run ID, so
+  // Render logs become filterable by run instead of eyeballed by timestamp.
+  router.use((req, res, next) => {
+    const runId = normalizeText(req.headers["x-sync-run-id"]);
+    if (!runId || req.path === "/run-start") return next();
+
+    const startedAt = new Date();
+    let recordsSent = null;
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+      if (body && typeof body === "object") {
+        recordsSent = Number(body.accepted ?? body.headersAccepted ?? body.sent ?? NaN);
+        if (!Number.isFinite(recordsSent)) recordsSent = null;
+      }
+      return originalJson(body);
+    };
+
+    res.on("finish", () => {
+      const success = res.statusCode >= 200 && res.statusCode < 300;
+      const datasetName = req.path.replace(/^\//, "") || "unknown";
+      console.log(`[sync run ${runId}] ${datasetName}: ${success ? "success" : "failed"} (HTTP ${res.statusCode})`);
+      db.query(
+        `
+          INSERT INTO ingest.sync_run_datasets
+            (sync_run_id, dataset_name, status, records_sent, error_message, started_at, finished_at)
+          VALUES ($1, $2, $3, $4, $5, $6, now())
+        `,
+        [runId, datasetName, success ? "success" : "failed", recordsSent, success ? null : `HTTP ${res.statusCode}`, startedAt],
+      ).catch((e) => console.error(`[sync run ${runId}] failed to log ${datasetName}:`, e.message));
+    });
+
+    next();
+  });
+
+  // POST /api/sync/run-start — call this FIRST, before any dataset POSTs.
+  // Creates the ingest.sync_runs row immediately (status='running') instead
+  // of only ever recording a run after it finished — a run that crashes
+  // mid-way now leaves a row stuck 'running' past its expected finish time,
+  // which is visible, instead of leaving no trace anywhere.
+  router.post("/run-start", async (req, res, next) => {
+    try {
+      const syncType = normalizeText(req.body?.syncType) || "manual";
+      const branchCode = normalizeNullableText(req.body?.branchCode);
+      const result = await db.query(
+        `
+          INSERT INTO ingest.sync_runs
+            (sync_type, source_name, branch_code, started_at, status, records_read, records_sent)
+          VALUES ($1, $2, $3, now(), 'running', 0, 0)
+          RETURNING sync_run_id
+        `,
+        [syncType, normalizeText(req.body?.sourceName) || "adapos_sync", branchCode],
+      );
+      return res.json({ runId: String(result.rows[0].sync_run_id) });
+    } catch (e) {
+      return next(e);
+    }
+  });
+
   router.post("/products", async (req, res, next) => {
     const { error, records } = parseApiRecords(req.body);
     if (error) {
@@ -496,24 +557,51 @@ function createSyncRouter(deps) {
 
   router.post("/run-log", async (req, res, next) => {
     try {
-      const result = await db.query(
-        `
-          INSERT INTO ingest.sync_runs
-            (sync_type, source_name, started_at, finished_at, status, records_read, records_sent, message)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-          RETURNING sync_run_id
-        `,
-        [
-          normalizeText(req.body?.syncType) || "manual",
-          normalizeText(req.body?.sourceName) || "adapos_sync",
-          req.body?.startedAt || new Date().toISOString(),
-          req.body?.finishedAt || null,
-          normalizeText(req.body?.status) || "success",
-          Math.max(0, Math.floor(toNumber(req.body?.recordsRead, 0))),
-          Math.max(0, Math.floor(toNumber(req.body?.recordsSent, 0))),
-          normalizeText(req.body?.message) || "",
-        ],
-      );
+      // runId present (agent called /run-start first, current agent
+      // version) -> finish that same row instead of creating a new one, so
+      // the run's whole lifecycle (running -> success/failed) lives on one
+      // row. runId absent -> old agent still mid-self-update, fall back to
+      // the pre-CP2 insert-once-at-the-end behavior so it keeps working
+      // exactly as before until it picks up the newer code.
+      const runId = normalizeText(req.body?.runId);
+      const status = normalizeText(req.body?.status) || "success";
+      const finishedAt = req.body?.finishedAt || new Date().toISOString();
+      const recordsRead = Math.max(0, Math.floor(toNumber(req.body?.recordsRead, 0)));
+      const recordsSent = Math.max(0, Math.floor(toNumber(req.body?.recordsSent, 0)));
+      const message = normalizeText(req.body?.message) || "";
+
+      const result = runId
+        ? await db.query(
+            `
+              UPDATE ingest.sync_runs
+              SET finished_at = $2, status = $3, records_read = $4, records_sent = $5, message = $6
+              WHERE sync_run_id = $1::bigint
+              RETURNING sync_run_id
+            `,
+            [runId, finishedAt, status, recordsRead, recordsSent, message],
+          )
+        : await db.query(
+            `
+              INSERT INTO ingest.sync_runs
+                (sync_type, source_name, started_at, finished_at, status, records_read, records_sent, message)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+              RETURNING sync_run_id
+            `,
+            [
+              normalizeText(req.body?.syncType) || "manual",
+              normalizeText(req.body?.sourceName) || "adapos_sync",
+              req.body?.startedAt || new Date().toISOString(),
+              finishedAt,
+              status,
+              recordsRead,
+              recordsSent,
+              message,
+            ],
+          );
+
+      if (runId && result.rowCount === 0) {
+        return res.status(404).json({ message: `No sync run found for runId ${runId}.` });
+      }
 
       let adaSyncRunId = null;
       if (shouldMirrorAdaRunLog(req.body)) {
