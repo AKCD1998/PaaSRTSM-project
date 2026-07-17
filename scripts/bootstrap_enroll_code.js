@@ -2,11 +2,21 @@
 
 // One-time bootstrap: insert an enrollment code directly into the DB
 // for a branch that has no enrolled devices yet.
-// Usage: node scripts/bootstrap_enroll_code.js 005
+// Usage:
+//   Set DATABASE_URL in the environment, then run:
+//   node scripts/bootstrap_enroll_code.js 005
+//
+// Do not commit a real DATABASE_URL into this file.
 
 const { Client } = require("pg");
 const crypto = require("crypto");
-const DATABASE_URL = "postgresql://sc_drug_db_user:7s8SrRnOLxpjUa4kSOv5QdA3m6VfIWjV@dpg-d6apu9i4d50c73c7sas0-a.virginia-postgres.render.com/sc_drug_db";
+
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL is required in the environment.");
+  process.exit(1);
+}
 
 async function main() {
   const branchCode = process.argv[2];
@@ -15,7 +25,10 @@ async function main() {
     process.exit(1);
   }
 
-  const client = new Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const client = new Client({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+  });
   await client.connect();
 
   const code = crypto.randomBytes(10).toString("base64url");
