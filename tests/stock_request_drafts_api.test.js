@@ -6,7 +6,10 @@ const bcrypt = require("bcryptjs");
 const request = require("supertest");
 
 const { createApp } = require("../apps/admin-api/src/server");
-const { formatDraftPublicId } = require("../apps/admin-api/src/services/stockRequestDrafts");
+const {
+  formatDraftPublicId,
+  getOwnerUsername,
+} = require("../apps/admin-api/src/services/stockRequestDrafts");
 
 // ---------------------------------------------------------------------------
 // Unit tests
@@ -24,6 +27,12 @@ test("formatDraftPublicId handles invalid date", () => {
     formatDraftPublicId(new Date("invalid"), "003", 42),
     "SRQD-00000000-003-000042",
   );
+});
+
+test("OnlineMarketingstaff shares the staff000 cart owner", () => {
+  assert.equal(getOwnerUsername({ userId: "OnlineMarketingstaff" }), "staff000");
+  assert.equal(getOwnerUsername({ userId: "staff000" }), "staff000");
+  assert.equal(getOwnerUsername({ userId: "staff001" }), "staff001");
 });
 
 // ---------------------------------------------------------------------------

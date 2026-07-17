@@ -15,6 +15,9 @@ const VALID_RECOMMENDED_ACTIONS = new Set([
   "NO_PURCHASE_SLOW_MOVING",
 ]);
 const VALID_INCOMING_MODES = new Set(["UNKNOWN", "EQUAL_SPLIT", "BRANCH_SPECIFIC", "MANUAL", "LIVE_RECEIPTS"]);
+const SHARED_CART_OWNER_BY_USERNAME = new Map([
+  ["onlinemarketingstaff", "staff000"],
+]);
 
 function createHttpError(message, statusCode, extra = {}) {
   return Object.assign(new Error(message), { statusCode, ...extra });
@@ -182,7 +185,8 @@ function validateDraftAccess(auth) {
 }
 
 function getOwnerUsername(auth) {
-  return String(auth.userId || "");
+  const username = String(auth.userId || "").trim().toLowerCase();
+  return SHARED_CART_OWNER_BY_USERNAME.get(username) || username;
 }
 
 const LOAD_DRAFT_COLUMNS = `draft_id, draft_public_id, owner_user_id, owner_username,
@@ -673,4 +677,5 @@ module.exports = {
   discardActiveDraft,
   markDraftSubmitted,
   formatDraftPublicId,
+  getOwnerUsername,
 };
