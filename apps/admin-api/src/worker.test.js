@@ -14,12 +14,23 @@ test("claim query only claims queued/retry_wait and uses SKIP LOCKED, never stag
 
 test("branch stock applier updates only the whitelisted branch columns and guards freshness", async () => {
   const calls = [];
-  await applyBranchStockBatch({ query: async (sql, params) => { calls.push({ sql, params }); } }, [{ productCode: "P1", qty: 4, costAvg: 2.5, syncedAt: "2026-01-02T00:00:00Z" }], "001");
+  await applyBranchStockBatch({ query: async (sql, params) => { calls.push({ sql, params }); } }, [{ productCode: "P1", productNameThai: "ไทย", productNameEng: "English", barcode: "123", unit: "EA", qty: 4, costAvg: 2.5, syncedAt: "2026-01-02T00:00:00Z", rawPayload: { source: "test" } }], "001");
   assert.match(calls[0].sql, /qty_branch_001 = EXCLUDED\.qty_branch_001/);
-  assert.match(calls[0].sql, /cost_avg_branch_001 = EXCLUDED\.cost_avg_branch_001/);
+  assert.match(calls[0].sql, /cost_avg_branch_001 = COALESCE\(EXCLUDED\.cost_avg_branch_001/);
   assert.match(calls[0].sql, /synced_at_branch_001 <= EXCLUDED\.synced_at_branch_001/);
+  assert.match(calls[0].sql, /qty_total_all_branches =/);
+  assert.match(calls[0].sql, /synced_at = GREATEST/);
+  assert.deepEqual(calls[0].params.slice(1, 5).map((values) => values[0]), ["ไทย", "English", "123", "EA"]);
+  assert.deepEqual(JSON.parse(calls[0].params[10][0]), { source: "test" });
   assert.doesNotMatch(calls[0].sql, /qty_branch_000 = EXCLUDED/);
   await assert.rejects(() => applyBranchStockBatch({ query: async () => {} }, [], "999"), /Unsupported branch/);
+  await assert.rejects(
+    () => applyBranchStockBatch({ query: async () => assert.fail("SQL must not execute") }, [
+      { productCode: "P1", qty: 1, syncedAt: "2026-01-01" },
+      { productCode: "P1", qty: 2, syncedAt: "2026-01-02" },
+    ], "000"),
+    /Duplicate productCode/,
+  );
 });
 
 test("apply, batch status, and recomputed counters share one transaction", async () => {
@@ -44,8 +55,12 @@ test("failed apply rolls back live writes before retry status transaction", asyn
 });
 
 test("reaper returns crashed work to retry_wait and retry backoff is bounded", async () => {
-  let sql; await reapStuckBatches({ query: async (q) => { sql = q; return { rows: [{ batch_id: 1 }], rowCount: 1 }; } });
-  assert.match(sql, /status = 'retry_wait'/); assert.match(sql, /status = 'processing'/);
+  const calls = [];
+  const client = { async query(q) { calls.push(q); return /RETURNING batch_id/.test(q) ? { rows: [{ batch_id: 1, sync_run_id: 7, status: "retry_wait" }], rowCount: 1 } : { rows: [] }; }, release() {} };
+  await reapStuckBatches({ connect: async () => client });
+  const sql = calls.find((q) => /UPDATE ingest\.sync_batches/.test(q));
+  assert.match(sql, /attempts >= max_attempts THEN 'dead_letter'/); assert.match(sql, /ELSE 'retry_wait'/);
+  assert.match(sql, /maximum attempts/);
   assert.equal(backoffMs(1), 2000); assert.equal(backoffMs(99), 60000);
 });
 
@@ -60,9 +75,10 @@ test("branch 000 and 001 writes preserve both values and older branch data is ig
   const row = {};
   const client = { async query(sql, params) {
     const branch = /qty_branch_(\d{3}) = EXCLUDED/.exec(sql)[1];
-    const incomingAt = new Date(params[3][0]);
+    const incomingAt = new Date(params[7][0]);
     if (!row[`at_${branch}`] || row[`at_${branch}`] <= incomingAt) {
-      row[`qty_${branch}`] = params[1][0]; row[`at_${branch}`] = incomingAt;
+      row[`qty_${branch}`] = params[5][0]; row[`at_${branch}`] = incomingAt;
+      row.total = (row.qty_000 || 0) + (row.qty_001 || 0);
     }
   } };
   await Promise.all([
@@ -70,7 +86,14 @@ test("branch 000 and 001 writes preserve both values and older branch data is ig
     applyBranchStockBatch(client, [{ productCode: "P1", qty: 20, syncedAt: "2026-01-02" }], "001"),
   ]);
   await applyBranchStockBatch(client, [{ productCode: "P1", qty: 5, syncedAt: "2026-01-01" }], "000");
-  assert.equal(row.qty_000, 10); assert.equal(row.qty_001, 20);
+  assert.equal(row.qty_000, 10); assert.equal(row.qty_001, 20); assert.equal(row.total, 30);
+});
+
+test("null incoming cost uses COALESCE to preserve stored cost", async () => {
+  let call;
+  await applyBranchStockBatch({ query: async (sql, params) => { call = { sql, params }; } }, [{ productCode: "P1", qty: 3, costAvg: null, syncedAt: "2026-01-02" }], "000");
+  assert.equal(call.params[6][0], null);
+  assert.match(call.sql, /cost_avg_branch_000 = COALESCE\(EXCLUDED\.cost_avg_branch_000, ada\.branch_stock_snapshots\.cost_avg_branch_000\)/);
 });
 
 test("exhausted retry becomes dead_letter and marks the run failed from recomputed counts", async () => {

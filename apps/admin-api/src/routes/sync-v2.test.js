@@ -9,7 +9,7 @@ const { loadConfig } = require("../config");
 
 function makeDb(seedRun = {}) {
   const state = {
-    run: { sync_run_id: "7", ingestion_mode: "hybrid_v2", branch_code: "000", status: "running", finalized_at: null, manifest_hash: null, ...seedRun },
+    run: { sync_run_id: "7", ingestion_mode: "hybrid_v2", branch_code: "000", status: "running", handoff_status: "running", apply_status: "waiting", finalized_at: null, manifest_hash: null, ...seedRun },
     batches: [], nextBatchId: 1,
   };
   const client = {
@@ -82,13 +82,44 @@ test("batch endpoint enforces auth, dataset allowlist, validation, and max size"
 
 test("identical duplicate is accepted but conflicting duplicate returns 409", async () => {
   const db = makeDb(); const app = makeApp(enabledConfig, db);
-  const body = { syncRunId: "7", dataset: "branch_stock", batchSeq: 1, records: [{ qty: 2, productCode: "P1", syncedAt: "2026-01-01T00:00:00Z" }] };
+  const body = { syncRunId: "7", dataset: "branch_stock", batchSeq: 1, records: [{ branchCode: "000", qty: 2, productCode: "P1", syncedAt: "2026-01-01T00:00:00Z" }] };
   const first = await request(app).post("/api/sync/v2/batches").set(auth).send(body);
-  const same = await request(app).post("/api/sync/v2/batches").set(auth).send({ ...body, records: [{ syncedAt: "2026-01-01T00:00:00Z", productCode: "P1", qty: 2 }] });
-  const conflict = await request(app).post("/api/sync/v2/batches").set(auth).send({ ...body, records: [{ productCode: "P1", qty: 3, syncedAt: "2026-01-01T00:00:00Z" }] });
+  const same = await request(app).post("/api/sync/v2/batches").set(auth).send({ ...body, records: [{ syncedAt: "2026-01-01T00:00:00Z", productCode: "P1", qty: 2, branchCode: "000" }] });
+  const conflict = await request(app).post("/api/sync/v2/batches").set(auth).send({ ...body, records: [{ productCode: "P1", qty: 3, syncedAt: "2026-01-01T00:00:00Z", branchCode: "000" }] });
   assert.equal(first.status, 202); assert.equal(first.body.status, "staged");
   assert.equal(same.status, 202); assert.equal(same.body.payloadHash, first.body.payloadHash);
   assert.equal(conflict.status, 409);
+});
+
+test("hybrid run-start requires exact identity/dataset gates before insert", async () => {
+  const db = makeDb(); const app = makeApp(enabledConfig, db);
+  assert.equal((await request(app).post("/api/sync/run-start").set(auth).send({ ingestionMode: "hybrid_v2", branchCode: "000" })).status, 400);
+  assert.equal((await request(app).post("/api/sync/run-start").set(auth).send({ ingestionMode: "hybrid_v2", branchCode: "999", v2Datasets: ["branch_stock"] })).status, 400);
+  assert.equal((await request(app).post("/api/sync/run-start").set(auth).send({ ingestionMode: "hybrid_v2", branchCode: "000", v2Datasets: ["products"] })).status, 400);
+  const ok = await request(app).post("/api/sync/run-start").set(auth).send({ ingestionMode: "hybrid_v2", branchCode: "000", v2Datasets: ["branch_stock"] });
+  assert.equal(ok.status, 200);
+  const disabled = { ...enabledConfig, syncV2AllowedBranches: new Set() };
+  assert.equal((await request(makeApp(disabled, makeDb())).post("/api/sync/run-start").set(auth).send({ ingestionMode: "hybrid_v2", branchCode: "000", v2Datasets: ["branch_stock"] })).status, 403);
+});
+
+test("batch records require run-matching branch identity", async () => {
+  const app = makeApp(enabledConfig, makeDb());
+  const base = { syncRunId: "7", dataset: "branch_stock", batchSeq: 1 };
+  assert.equal((await request(app).post("/api/sync/v2/batches").set(auth).send({ ...base, records: [{ productCode: "P1", qty: 1, syncedAt: "2026-01-01" }] })).status, 400);
+  assert.equal((await request(app).post("/api/sync/v2/batches").set(auth).send({ ...base, records: [{ branchCode: "001", productCode: "P1", qty: 1, syncedAt: "2026-01-01" }] })).status, 400);
+});
+
+test("finalize rechecks flags and terminal handoff state", async () => {
+  const manifest = { dataset: "branch_stock", batchCount: 1, recordCount: 1 };
+  const failedDb = makeDb({ status: "failed", handoff_status: "failed", apply_status: "failed" });
+  failedDb.state.batches = [{ dataset: "branch_stock", batch_seq: 1, record_count: 1, status: "staged" }];
+  assert.equal((await request(makeApp(enabledConfig, failedDb)).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifest)).status, 409);
+  assert.equal(failedDb.state.batches[0].status, "staged");
+  const disabledDb = makeDb(); disabledDb.state.batches = [{ dataset: "branch_stock", batch_seq: 1, record_count: 1, status: "staged" }];
+  const disabled = { ...enabledConfig, syncV2AllowedDatasets: new Set() };
+  assert.equal((await request(makeApp(disabled, disabledDb)).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifest)).status, 403);
+  assert.equal(disabledDb.state.batches[0].status, "staged");
+  assert.equal((await request(makeApp(enabledConfig, makeDb())).post("/api/sync/v2/runs/not-a-number/finalize").set(auth).send(manifest)).status, 400);
 });
 
 test("finalize rejects count, record, and sequence mismatches", async () => {
@@ -131,4 +162,36 @@ test("hybrid run-log cannot report overall success and pre-finalize failure is t
   assert.equal(failed.status, 200);
   assert.match(queries[0].sql, /finalized_at IS NULL THEN 'failed'/);
   assert.match(queries[0].sql, /THEN 'handoff'/);
+});
+
+test("hybrid success mirrors to ADA only after apply is terminal", async () => {
+  for (const [runState, expectedAdaInserts] of [
+    [{ ingestion_mode: "hybrid_v2", status: "running", apply_status: "pending" }, 0],
+    [{ ingestion_mode: "hybrid_v2", status: "success", apply_status: "applied" }, 1],
+  ]) {
+    let adaInserts = 0;
+    const db = { async query(sql) {
+      if (/UPDATE ingest\.sync_runs/i.test(sql)) return { rows: [{ sync_run_id: 7, ...runState }], rowCount: 1 };
+      if (/INSERT INTO ada\.sync_runs/i.test(sql)) { adaInserts += 1; return { rows: [{ sync_run_id: 88 }], rowCount: 1 }; }
+      return { rows: [], rowCount: 0 };
+    } };
+    const response = await request(makeApp(enabledConfig, db)).post("/api/sync/run-log").set(auth).send({ runId: "7", sourceName: "adapos_sync", status: "success" });
+    assert.equal(response.status, 200); assert.equal(adaInserts, expectedAdaInserts);
+  }
+});
+
+test("v2 status polling never writes sync_run_datasets", async () => {
+  let datasetWrites = 0;
+  const db = { async query(sql) {
+    if (/INSERT INTO ingest\.sync_run_datasets/i.test(sql)) datasetWrites += 1;
+    if (/SELECT sync_run_id, sync_type/i.test(sql)) return { rows: [{ sync_run_id: 7, sync_type: "manual", branch_code: "000", status: "running", ingestion_mode: "hybrid_v2", handoff_status: "success", apply_status: "pending", total_batches: 1, applied_batches: 0, failed_batches: 0 }], rowCount: 1 };
+    if (/MIN\(queued_at\)/i.test(sql)) return { rows: [{ oldest_pending_queued_at: null, terminal_batch_error: null }], rowCount: 1 };
+    return { rows: [], rowCount: 0 };
+  } };
+  const app = makeApp(enabledConfig, db);
+  for (let i = 0; i < 3; i += 1) {
+    const response = await request(app).get("/api/sync/v2/runs/7").set(auth).set("x-sync-run-id", "7");
+    assert.equal(response.status, 200);
+  }
+  assert.equal(datasetWrites, 0);
 });

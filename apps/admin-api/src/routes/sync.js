@@ -48,6 +48,9 @@ function validateBranchStockRecords(records, branchCode) {
   for (const [index, record] of records.entries()) {
     if (!record || typeof record !== "object" || Array.isArray(record)) return `records[${index}] must be an object.`;
     if (!normalizeText(record.productCode ?? record.product_code)) return `records[${index}].productCode is required.`;
+    const recordBranch = normalizeText(record.branchCode ?? record.branch_code);
+    if (!recordBranch) return `records[${index}].branchCode is required.`;
+    if (recordBranch !== branchCode) return `records[${index}].branchCode must match run branch ${branchCode}.`;
     const qty = qtyKeys.map((key) => record[key]).find((item) => item !== undefined);
     if (qty === undefined || !Number.isFinite(Number(qty))) return `records[${index}].qty is invalid.`;
     const cost = costKeys.map((key) => record[key]).find((item) => item !== undefined);
@@ -415,7 +418,7 @@ function createSyncRouter(deps) {
   // Render logs become filterable by run instead of eyeballed by timestamp.
   router.use((req, res, next) => {
     const runId = normalizeText(req.headers["x-sync-run-id"]);
-    if (!runId || req.path === "/run-start") return next();
+    if (!runId || req.path === "/run-start" || req.path.startsWith("/v2/")) return next();
 
     const startedAt = new Date();
     let recordsSent = null;
@@ -457,6 +460,22 @@ function createSyncRouter(deps) {
       const ingestionMode = normalizeText(req.body?.ingestionMode) || "v1";
       if (!["v1", "hybrid_v2"].includes(ingestionMode)) {
         return res.status(400).json({ message: "ingestionMode must be v1 or hybrid_v2." });
+      }
+      if (ingestionMode === "hybrid_v2") {
+        const v2Datasets = req.body?.v2Datasets;
+        const flags = getSyncV2Config(config);
+        if (!branchCode || !/^00[0-5]$/.test(branchCode)) {
+          return res.status(400).json({ message: "branchCode must be one of 000-005 for hybrid_v2." });
+        }
+        if (!Array.isArray(v2Datasets) || v2Datasets.length !== 1 || v2Datasets[0] !== "branch_stock") {
+          return res.status(400).json({ message: "v2Datasets must be exactly [\"branch_stock\"] for this release." });
+        }
+        if (!flags.datasets.has("branch_stock")) {
+          return res.status(403).json({ message: "Dataset is disabled for sync v2." });
+        }
+        if (!flags.branches.has(branchCode)) {
+          return res.status(403).json({ message: "Branch is disabled for sync v2." });
+        }
       }
       const result = await db.query(
         `
@@ -619,7 +638,11 @@ function createSyncRouter(deps) {
         ? await db.query(
             `
               UPDATE ingest.sync_runs
-              SET finished_at = CASE WHEN ingestion_mode = 'v1' THEN $2 ELSE finished_at END,
+              SET finished_at = CASE
+                    WHEN ingestion_mode = 'v1' THEN $2
+                    WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN $2
+                    ELSE finished_at
+                  END,
                   status = CASE
                     WHEN ingestion_mode = 'v1' THEN $3
                     WHEN $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
@@ -643,7 +666,7 @@ function createSyncRouter(deps) {
                   END,
                   records_read = $4, records_sent = $5, message = $6
               WHERE sync_run_id = $1::bigint
-              RETURNING sync_run_id
+              RETURNING sync_run_id, ingestion_mode, status, apply_status
             `,
             [runId, finishedAt, status, recordsRead, recordsSent, message],
           )
@@ -671,11 +694,16 @@ function createSyncRouter(deps) {
       }
 
       let adaSyncRunId = null;
-      if (shouldMirrorAdaRunLog(req.body)) {
+      const updatedRun = result.rows[0];
+      const mayMirrorHybridSuccess =
+        updatedRun.ingestion_mode !== "hybrid_v2" ||
+        status !== "success" ||
+        (updatedRun.status === "success" && updatedRun.apply_status === "applied");
+      if (shouldMirrorAdaRunLog(req.body) && mayMirrorHybridSuccess) {
         adaSyncRunId = await insertAdaRunLog(db, req.body);
       }
 
-      if (String(req.body?.status || "").toLowerCase() === "failed") {
+      if (status.toLowerCase() === "failed") {
         await db.query(
           `
             INSERT INTO ingest.sync_errors
@@ -853,6 +881,9 @@ function createSyncRouter(deps) {
       const dataset = normalizeText(req.body?.dataset).toLowerCase();
       const batchCount = Number(req.body?.batchCount);
       const recordCount = Number(req.body?.recordCount);
+      if (!/^\d+$/.test(syncRunId)) {
+        return res.status(400).json({ message: "syncRunId must be numeric." });
+      }
       if (dataset !== "branch_stock" || !Number.isInteger(batchCount) || batchCount < 1 ||
           !Number.isInteger(recordCount) || recordCount < 1) {
         return res.status(400).json({ message: "A valid branch_stock manifest is required." });
@@ -865,10 +896,17 @@ function createSyncRouter(deps) {
       )).rows[0];
       if (!run) { await client.query("ROLLBACK"); return res.status(404).json({ message: "Sync run not found." }); }
       if (run.ingestion_mode !== "hybrid_v2") { await client.query("ROLLBACK"); return res.status(409).json({ message: "Run is not hybrid_v2." }); }
+      const flags = getSyncV2Config(config);
+      if (!flags.datasets.has(dataset)) { await client.query("ROLLBACK"); return res.status(403).json({ message: "Dataset is disabled for sync v2." }); }
+      if (!flags.branches.has(run.branch_code)) { await client.query("ROLLBACK"); return res.status(403).json({ message: "Branch is disabled for sync v2." }); }
       if (run.finalized_at) {
         await client.query("ROLLBACK");
         if (run.manifest_hash !== manifestHash) return res.status(409).json({ message: "Run was finalized with a different manifest." });
         return res.json({ syncRunId, status: "finalized", idempotent: true, manifestHash });
+      }
+      if (run.status !== "running" || run.handoff_status !== "running") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: "Run is not in a finalizable handoff state." });
       }
       const summary = (await client.query(
         `SELECT COUNT(*)::int AS batch_count, COALESCE(SUM(record_count), 0)::int AS record_count,
@@ -925,9 +963,11 @@ function createSyncRouter(deps) {
 
       const staleResult = await db.query(
         `
-          SELECT MIN(queued_at) AS oldest_pending_queued_at
+          SELECT MIN(queued_at) FILTER (WHERE status IN ('queued', 'processing', 'retry_wait')) AS oldest_pending_queued_at,
+                 (ARRAY_AGG(last_error ORDER BY batch_id DESC)
+                    FILTER (WHERE status = 'dead_letter' AND last_error IS NOT NULL))[1] AS terminal_batch_error
           FROM ingest.sync_batches
-          WHERE sync_run_id = $1::bigint AND status IN ('queued', 'processing', 'retry_wait')
+          WHERE sync_run_id = $1::bigint
         `,
         [syncRunId],
       );
@@ -949,7 +989,9 @@ function createSyncRouter(deps) {
         handoffFinishedAt: run.handoff_finished_at,
         finalizedAt: run.finalized_at,
         appliedAt: run.applied_at,
-        terminalFailure: run.status === "failed" ? { stage: run.failure_stage, message: run.message } : null,
+        terminalFailure: run.status === "failed"
+          ? { stage: run.failure_stage, message: staleResult.rows[0].terminal_batch_error || run.message }
+          : null,
         message: run.message,
         oldestPendingQueuedAt: staleResult.rows[0].oldest_pending_queued_at,
       });

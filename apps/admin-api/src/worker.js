@@ -28,6 +28,7 @@ function value(record, ...keys) {
 function normalizeBranchStock(records, branchCode) {
   const columns = BRANCH_COLUMNS[branchCode];
   if (!columns) throw new Error(`Unsupported branch code "${branchCode}".`);
+  const seen = new Set();
   return records.map((record, index) => {
     const productCode = String(value(record, "productCode", "product_code") || "").trim();
     const qty = Number(value(record, "qty", "quantity", columns.qty));
@@ -35,10 +36,24 @@ function normalizeBranchStock(records, branchCode) {
     const cost = rawCost === undefined || rawCost === null || rawCost === "" ? null : Number(rawCost);
     const sourceTimestamp = new Date(value(record, "syncedAt", "synced_at", "sourceSyncedAt", "source_synced_at"));
     if (!productCode) throw new Error(`records[${index}] requires productCode.`);
+    if (seen.has(productCode)) throw new Error(`Duplicate productCode "${productCode}" in one batch.`);
+    seen.add(productCode);
     if (!Number.isFinite(qty)) throw new Error(`records[${index}] has invalid qty.`);
     if (cost !== null && !Number.isFinite(cost)) throw new Error(`records[${index}] has invalid costAvg.`);
     if (Number.isNaN(sourceTimestamp.getTime())) throw new Error(`records[${index}] has invalid syncedAt.`);
-    return { productCode, qty, cost, sourceTimestamp: sourceTimestamp.toISOString() };
+    return {
+      productCode,
+      productNameThai: String(value(record, "productNameThai", "product_name_thai") || "").trim() || null,
+      productNameEng: String(value(record, "productNameEng", "product_name_eng") || "").trim() || null,
+      barcode: String(value(record, "barcode") || "").trim() || null,
+      unit: String(value(record, "unit") || "").trim() || null,
+      qty,
+      cost,
+      sourceTimestamp: sourceTimestamp.toISOString(),
+      sourceSystem: String(value(record, "sourceSystem", "source_system") || "AdaAcc").trim(),
+      sourceTable: String(value(record, "sourceTable", "source_table") || "TCNTPdtInWha").trim(),
+      rawPayload: value(record, "rawPayload", "raw_payload") ?? record,
+    };
   }).sort((a, b) => a.productCode.localeCompare(b.productCode));
 }
 
@@ -49,22 +64,47 @@ async function applyBranchStockBatch(client, records, branchCode) {
   // Column names come only from BRANCH_COLUMNS, never from request input.
   await client.query(
     `INSERT INTO ada.branch_stock_snapshots
-       (product_code, ${columns.qty}, ${columns.cost}, ${columns.freshness},
-        synced_at, source_synced_at, updated_at)
-     SELECT x.product_code, x.qty, x.cost, x.source_timestamp,
-            x.source_timestamp, x.source_timestamp, now()
-     FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::timestamptz[])
-       AS x(product_code, qty, cost, source_timestamp)
+       (product_code, product_name_thai, product_name_eng, barcode, unit,
+        ${columns.qty}, ${columns.cost}, ${columns.freshness}, qty_total_all_branches,
+        synced_at, source_system, source_table, source_synced_at, raw_payload, updated_at)
+     SELECT x.product_code, x.product_name_thai, x.product_name_eng, x.barcode, x.unit,
+            x.qty, x.cost, x.source_timestamp, x.qty,
+            x.source_timestamp, x.source_system, x.source_table, x.source_timestamp, x.raw_payload, now()
+     FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                 $6::numeric[], $7::numeric[], $8::timestamptz[], $9::text[],
+                 $10::text[], $11::jsonb[])
+       AS x(product_code, product_name_thai, product_name_eng, barcode, unit,
+            qty, cost, source_timestamp, source_system, source_table, raw_payload)
      ON CONFLICT (product_code) DO UPDATE SET
+       product_name_thai = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.product_name_thai ELSE ada.branch_stock_snapshots.product_name_thai END,
+       product_name_eng = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.product_name_eng ELSE ada.branch_stock_snapshots.product_name_eng END,
+       barcode = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.barcode ELSE ada.branch_stock_snapshots.barcode END,
+       unit = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.unit ELSE ada.branch_stock_snapshots.unit END,
        ${columns.qty} = EXCLUDED.${columns.qty},
-       ${columns.cost} = EXCLUDED.${columns.cost},
+       ${columns.cost} = COALESCE(EXCLUDED.${columns.cost}, ada.branch_stock_snapshots.${columns.cost}),
        ${columns.freshness} = EXCLUDED.${columns.freshness},
+       qty_total_all_branches =
+         ${columns.qty === "qty_branch_000" ? `EXCLUDED.${columns.qty}` : "ada.branch_stock_snapshots.qty_branch_000"} +
+         ${columns.qty === "qty_branch_001" ? `EXCLUDED.${columns.qty}` : "ada.branch_stock_snapshots.qty_branch_001"} +
+         ${columns.qty === "qty_branch_002" ? `EXCLUDED.${columns.qty}` : "ada.branch_stock_snapshots.qty_branch_002"} +
+         ${columns.qty === "qty_branch_003" ? `EXCLUDED.${columns.qty}` : "ada.branch_stock_snapshots.qty_branch_003"} +
+         ${columns.qty === "qty_branch_004" ? `EXCLUDED.${columns.qty}` : "ada.branch_stock_snapshots.qty_branch_004"} +
+         ${columns.qty === "qty_branch_005" ? `EXCLUDED.${columns.qty}` : "ada.branch_stock_snapshots.qty_branch_005"},
+       synced_at = GREATEST(ada.branch_stock_snapshots.synced_at, EXCLUDED.synced_at),
+       source_synced_at = GREATEST(ada.branch_stock_snapshots.source_synced_at, EXCLUDED.source_synced_at),
+       source_system = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.source_system ELSE ada.branch_stock_snapshots.source_system END,
+       source_table = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.source_table ELSE ada.branch_stock_snapshots.source_table END,
+       raw_payload = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.raw_payload ELSE ada.branch_stock_snapshots.raw_payload END,
        updated_at = now()
      WHERE ada.branch_stock_snapshots.${columns.freshness} IS NULL
         OR ada.branch_stock_snapshots.${columns.freshness} <= EXCLUDED.${columns.freshness}`,
     [
-      normalized.map((r) => r.productCode), normalized.map((r) => r.qty),
+      normalized.map((r) => r.productCode), normalized.map((r) => r.productNameThai),
+      normalized.map((r) => r.productNameEng), normalized.map((r) => r.barcode),
+      normalized.map((r) => r.unit), normalized.map((r) => r.qty),
       normalized.map((r) => r.cost), normalized.map((r) => r.sourceTimestamp),
+      normalized.map((r) => r.sourceSystem), normalized.map((r) => r.sourceTable),
+      normalized.map((r) => JSON.stringify(r.rawPayload)),
     ],
   );
 }
@@ -96,7 +136,9 @@ async function recomputeRunStatus(client, syncRunId) {
   await client.query(`
     WITH counts AS (
       SELECT COUNT(*) FILTER (WHERE status = 'applied')::int AS applied,
-             COUNT(*) FILTER (WHERE status = 'dead_letter')::int AS failed
+             COUNT(*) FILTER (WHERE status = 'dead_letter')::int AS failed,
+             (ARRAY_AGG(last_error ORDER BY batch_id DESC)
+                FILTER (WHERE status = 'dead_letter' AND last_error IS NOT NULL))[1] AS terminal_error
       FROM ingest.sync_batches WHERE sync_run_id = $1::bigint
     )
     UPDATE ingest.sync_runs r SET
@@ -112,6 +154,7 @@ async function recomputeRunStatus(client, syncRunId) {
         WHEN r.total_batches > 0 AND counts.applied = r.total_batches THEN 'success'
         ELSE 'running' END,
       failure_stage = CASE WHEN counts.failed > 0 THEN 'apply' ELSE r.failure_stage END,
+      message = CASE WHEN counts.failed > 0 THEN counts.terminal_error ELSE r.message END,
       applied_at = CASE WHEN r.total_batches > 0 AND counts.applied = r.total_batches THEN COALESCE(r.applied_at, now()) ELSE r.applied_at END,
       finished_at = CASE WHEN counts.failed > 0 OR (r.total_batches > 0 AND counts.applied = r.total_batches) THEN COALESCE(r.finished_at, now()) ELSE r.finished_at END
     FROM counts WHERE r.sync_run_id = $1::bigint`, [syncRunId]);
@@ -153,11 +196,27 @@ async function processOneBatch(db) {
 }
 
 async function reapStuckBatches(db) {
-  return db.query(
-    `UPDATE ingest.sync_batches SET status = 'retry_wait', next_attempt_at = now(), claimed_at = NULL,
-       last_error = COALESCE(last_error, 'Reaped: worker did not finish processing.')
-     WHERE status = 'processing' AND claimed_at < now() - ($1 || ' minutes')::interval
-     RETURNING batch_id`, [STUCK_PROCESSING_MINUTES]);
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
+      `UPDATE ingest.sync_batches
+       SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'retry_wait' END,
+           next_attempt_at = CASE WHEN attempts >= max_attempts THEN NULL ELSE now() END,
+           claimed_at = NULL,
+           last_error = CASE
+             WHEN attempts >= max_attempts THEN 'Reaped: processing lease expired at maximum attempts.'
+             ELSE 'Reaped: processing lease expired; retry scheduled.' END
+       WHERE status = 'processing' AND claimed_at < now() - ($1 || ' minutes')::interval
+       RETURNING batch_id, sync_run_id, status`, [STUCK_PROCESSING_MINUTES]);
+    const deadRunIds = [...new Set(result.rows.filter((row) => row.status === "dead_letter").map((row) => row.sync_run_id))];
+    for (const syncRunId of deadRunIds) await recomputeRunStatus(client, syncRunId);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
+    throw error;
+  } finally { client.release(); }
 }
 
 async function runWorkerLoop(db, { signal } = {}) {
