@@ -5,6 +5,7 @@
   "type": "commonjs",
   "scripts": {
     "admin-api:start": "node apps/admin-api/src/server.js",
+    "sync:worker": "node apps/admin-api/src/worker.js",
     "db:migrate": "node scripts/db_migrate.js",
     "derive:ada-foundations": "node scripts/derive_ada_foundations.js",
     "derive:ada-analytics": "node scripts/derive_ada_analytics.js",

@@ -207,6 +207,9 @@ function loadConfig(env = process.env) {
       normalizeValue: (entry) => String(entry || "").trim(),
     }),
     posApiKeys: parseCsvSet(env.POS_API_KEYS || ""),
+    syncV2AllowedDatasets: parseCsvSet(env.SYNC_V2_ALLOWED_DATASETS || "", { lowercase: true }),
+    syncV2AllowedBranches: parseCsvSet(env.SYNC_V2_ALLOWED_BRANCHES || ""),
+    syncV2MaxBatchRecords: parseIntWithFallback(env.SYNC_V2_MAX_BATCH_RECORDS, 100),
     crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
     crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",
     staffBranchAllowlists: parseMultiValueMap(env.STAFF_BRANCH_ALLOWLISTS || "", {
