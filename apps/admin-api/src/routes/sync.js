@@ -45,9 +45,13 @@ function getSyncV2Config(config) {
 function validateBranchStockRecords(records, branchCode) {
   const qtyKeys = ["qty", "quantity", `qty_branch_${branchCode}`, `qtyBranch${branchCode}`];
   const costKeys = ["costAvg", "cost_avg", `cost_avg_branch_${branchCode}`, `costAvgBranch${branchCode}`];
+  const productCodes = new Set();
   for (const [index, record] of records.entries()) {
     if (!record || typeof record !== "object" || Array.isArray(record)) return `records[${index}] must be an object.`;
-    if (!normalizeText(record.productCode ?? record.product_code)) return `records[${index}].productCode is required.`;
+    const productCode = normalizeText(record.productCode ?? record.product_code);
+    if (!productCode) return `records[${index}].productCode is required.`;
+    if (productCodes.has(productCode)) return `records[${index}].productCode duplicates ${productCode}.`;
+    productCodes.add(productCode);
     const recordBranch = normalizeText(record.branchCode ?? record.branch_code);
     if (!recordBranch) return `records[${index}].branchCode is required.`;
     if (recordBranch !== branchCode) return `records[${index}].branchCode must match run branch ${branchCode}.`;
@@ -695,15 +699,17 @@ function createSyncRouter(deps) {
 
       let adaSyncRunId = null;
       const updatedRun = result.rows[0];
-      const mayMirrorHybridSuccess =
-        updatedRun.ingestion_mode !== "hybrid_v2" ||
-        status !== "success" ||
-        (updatedRun.status === "success" && updatedRun.apply_status === "applied");
-      if (shouldMirrorAdaRunLog(req.body) && mayMirrorHybridSuccess) {
+      const isHybrid = updatedRun.ingestion_mode === "hybrid_v2";
+      const isActualHybridSuccess = updatedRun.status === "success" && updatedRun.apply_status === "applied";
+      const isActualHybridFailure = updatedRun.status === "failed";
+      const mayMirror = !isHybrid ||
+        (status === "success" && isActualHybridSuccess) ||
+        (status === "failed" && isActualHybridFailure);
+      if (shouldMirrorAdaRunLog(req.body) && mayMirror) {
         adaSyncRunId = await insertAdaRunLog(db, req.body);
       }
 
-      if (status.toLowerCase() === "failed") {
+      if (status.toLowerCase() === "failed" && (!isHybrid || isActualHybridFailure)) {
         await db.query(
           `
             INSERT INTO ingest.sync_errors

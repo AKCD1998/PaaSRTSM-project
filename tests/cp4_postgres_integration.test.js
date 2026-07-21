@@ -22,16 +22,16 @@ async function resetData() {
 async function insertRun(overrides = {}) {
   const values = {
     sync_type: "test", source_name: "cp4-test", branch_code: "000", ingestion_mode: "hybrid_v2",
-    handoff_status: "success", apply_status: "pending", status: "running", total_batches: 1,
+    handoff_status: "success", apply_status: "pending", status: "running", total_batches: 1, finalized: true,
     ...overrides,
   };
   const result = await pool.query(
     `INSERT INTO ingest.sync_runs
        (sync_type, source_name, branch_code, ingestion_mode, handoff_status, apply_status,
-        started_at, status, total_batches)
-     VALUES ($1,$2,$3,$4,$5,$6,now(),$7,$8) RETURNING sync_run_id`,
+        started_at, status, total_batches, finalized_at)
+     VALUES ($1,$2,$3,$4,$5,$6,now(),$7,$8,CASE WHEN $9 THEN now() ELSE NULL END) RETURNING sync_run_id`,
     [values.sync_type, values.source_name, values.branch_code, values.ingestion_mode,
-      values.handoff_status, values.apply_status, values.status, values.total_batches],
+      values.handoff_status, values.apply_status, values.status, values.total_batches, values.finalized],
   );
   return result.rows[0].sync_run_id;
 }
@@ -95,13 +95,31 @@ integration("REAL POSTGRES: concurrent branches preserve quantities, exact total
   } finally { c0.release(); c1.release(); }
   await applyBranchStockBatch(pool, [{ ...record, branchCode: "000", qty: 99, costAvg: 9, syncedAt: "2026-01-01T00:00:00Z" }], "000");
   await applyBranchStockBatch(pool, [{ ...record, branchCode: "000", qty: 11, costAvg: null, syncedAt: "2026-01-03T00:00:00Z" }], "000");
-  const row = (await pool.query("SELECT * FROM ada.branch_stock_snapshots WHERE product_code='P1'")).rows[0];
+  let row = (await pool.query("SELECT * FROM ada.branch_stock_snapshots WHERE product_code='P1'")).rows[0];
   assert.equal(Number(row.qty_branch_000), 11); assert.equal(Number(row.qty_branch_001), 20);
   assert.equal(Number(row.qty_total_all_branches), 31); assert.equal(Number(row.cost_avg_branch_000), 5);
   assert.equal(row.product_name_thai, "สินค้า"); assert.equal(row.product_name_eng, "Product");
   assert.equal(row.barcode, "885"); assert.equal(row.unit, "EA"); assert.deepEqual(row.raw_payload, { source: "acceptance" });
   assert.equal(row.synced_at.toISOString(), "2026-01-03T00:00:00.000Z");
   assert.equal(row.source_synced_at.toISOString(), "2026-01-03T00:00:00.000Z");
+  await applyBranchStockBatch(pool, [{ ...record, branchCode: "000", productNameThai: null, productNameEng: "", barcode: null, unit: "", qty: 12, syncedAt: "2026-01-04T00:00:00Z" }], "000");
+  row = (await pool.query("SELECT * FROM ada.branch_stock_snapshots WHERE product_code='P1'")).rows[0];
+  assert.equal(row.product_name_thai, "สินค้า"); assert.equal(row.product_name_eng, "Product");
+  assert.equal(row.barcode, "885"); assert.equal(row.unit, "EA");
+  await applyBranchStockBatch(pool, [{ ...record, branchCode: "000", productNameThai: "สินค้าใหม่", productNameEng: "Updated", barcode: "999", unit: "BOX", qty: 13, syncedAt: "2026-01-05T00:00:00Z" }], "000");
+  row = (await pool.query("SELECT * FROM ada.branch_stock_snapshots WHERE product_code='P1'")).rows[0];
+  assert.equal(row.product_name_thai, "สินค้าใหม่"); assert.equal(row.product_name_eng, "Updated");
+  assert.equal(row.barcode, "999"); assert.equal(row.unit, "BOX");
+});
+
+integration("REAL POSTGRES: duplicate upload is rejected before staging", async () => {
+  await resetData(); const runId = await insertRun({ handoff_status: "running", apply_status: "waiting", finalized: false, total_batches: 0 });
+  const config = { posApiKeys: new Set(["secret"]), syncV2AllowedDatasets: new Set(["branch_stock"]), syncV2AllowedBranches: new Set(["000"]), syncV2MaxBatchRecords: 100 };
+  const app = express(); app.use(express.json()); app.use("/api/sync", createSyncRouter({ config, db: pool })); app.use((error, req, res, next) => res.status(500).json({ message: error.message }));
+  const record = { branchCode: "000", productCode: " DUP ", qty: 1, syncedAt: "2026-01-01" };
+  const response = await request(app).post("/api/sync/v2/batches").set("x-api-key", "secret").send({ syncRunId: String(runId), dataset: "branch_stock", batchSeq: 1, records: [record, { ...record, productCode: "DUP" }] });
+  assert.equal(response.status, 400);
+  assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM ingest.sync_batches")).rows[0].count, 0);
 });
 
 integration("REAL POSTGRES: apply failure rolls back live data; success commits data and applied state atomically", async () => {
@@ -144,8 +162,26 @@ integration("REAL POSTGRES: max-attempt crashed work dead-letters and exposes cr
   assert.equal(statusResponse.status, 200); assert.match(statusResponse.body.terminalFailure.message, /maximum attempts/);
 });
 
+integration("REAL POSTGRES: one dead-letter does not strand the remaining finalized queue", async () => {
+  await resetData(); const runId = await insertRun({ total_batches: 2 });
+  const bad = [{ branchCode: "000", productCode: "BAD", qty: 1, syncedAt: "2026-01-01" }, { branchCode: "000", productCode: "BAD", qty: 2, syncedAt: "2026-01-01" }];
+  const good = [{ branchCode: "000", productCode: "GOOD", qty: 9, syncedAt: "2026-01-01" }];
+  await pool.query(`INSERT INTO ingest.sync_batches (sync_run_id,dataset,batch_seq,payload_hash,payload,record_count,status,queued_at,next_attempt_at,max_attempts)
+    VALUES ($1,'branch_stock',1,'bad',$2,2,'queued',now(),now(),1), ($1,'branch_stock',2,'good',$3,1,'queued',now(),now(),5)`, [runId, JSON.stringify(bad), JSON.stringify(good)]);
+  assert.equal(await processOneBatch(pool), true);
+  assert.equal((await pool.query("SELECT status FROM ingest.sync_runs WHERE sync_run_id=$1", [runId])).rows[0].status, "failed");
+  assert.equal(await processOneBatch(pool), true);
+  assert.equal(await processOneBatch(pool), false);
+  const result = await pool.query(`SELECT r.status,r.apply_status,r.applied_batches,r.failed_batches,
+    COUNT(*) FILTER (WHERE b.status IN ('queued','retry_wait','processing'))::int AS pending
+    FROM ingest.sync_runs r JOIN ingest.sync_batches b ON b.sync_run_id=r.sync_run_id
+    WHERE r.sync_run_id=$1 GROUP BY r.sync_run_id`, [runId]);
+  assert.deepEqual(result.rows[0], { status: "failed", apply_status: "failed", applied_batches: 1, failed_batches: 1, pending: 0 });
+  assert.equal(Number((await pool.query("SELECT qty_branch_000 FROM ada.branch_stock_snapshots WHERE product_code='GOOD'")).rows[0].qty_branch_000), 9);
+});
+
 integration("REAL POSTGRES: finalize mismatch rolls back without queueing staged work", async () => {
-  await resetData(); const runId = await insertRun({ handoff_status: "running", apply_status: "waiting", total_batches: 0 });
+  await resetData(); const runId = await insertRun({ handoff_status: "running", apply_status: "waiting", total_batches: 0, finalized: false });
   await pool.query(`INSERT INTO ingest.sync_batches (sync_run_id,dataset,batch_seq,payload_hash,payload,record_count,status)
                     VALUES ($1,'branch_stock',1,'m','[{}]',1,'staged')`, [runId]);
   const config = { posApiKeys: new Set(["secret"]), syncV2AllowedDatasets: new Set(["branch_stock"]), syncV2AllowedBranches: new Set(["000"]), syncV2MaxBatchRecords: 100 };

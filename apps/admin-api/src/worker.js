@@ -20,6 +20,19 @@ function backoffMs(attempts) {
   return Math.min(60_000, 1_000 * 2 ** attempts);
 }
 
+function logWorkerEvent(event, batch, extra = {}) {
+  console.log(JSON.stringify({
+    component: "sync-worker",
+    event,
+    runId: batch.sync_run_id == null ? null : String(batch.sync_run_id),
+    batchId: batch.batch_id == null ? null : String(batch.batch_id),
+    dataset: batch.dataset || null,
+    batchSeq: batch.batch_seq == null ? null : batch.batch_seq,
+    attempts: batch.attempts == null ? null : batch.attempts,
+    ...extra,
+  }));
+}
+
 function value(record, ...keys) {
   for (const key of keys) if (record[key] !== undefined) return record[key];
   return undefined;
@@ -76,10 +89,10 @@ async function applyBranchStockBatch(client, records, branchCode) {
        AS x(product_code, product_name_thai, product_name_eng, barcode, unit,
             qty, cost, source_timestamp, source_system, source_table, raw_payload)
      ON CONFLICT (product_code) DO UPDATE SET
-       product_name_thai = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.product_name_thai ELSE ada.branch_stock_snapshots.product_name_thai END,
-       product_name_eng = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.product_name_eng ELSE ada.branch_stock_snapshots.product_name_eng END,
-       barcode = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.barcode ELSE ada.branch_stock_snapshots.barcode END,
-       unit = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN EXCLUDED.unit ELSE ada.branch_stock_snapshots.unit END,
+       product_name_thai = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN COALESCE(EXCLUDED.product_name_thai, ada.branch_stock_snapshots.product_name_thai) ELSE ada.branch_stock_snapshots.product_name_thai END,
+       product_name_eng = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN COALESCE(EXCLUDED.product_name_eng, ada.branch_stock_snapshots.product_name_eng) ELSE ada.branch_stock_snapshots.product_name_eng END,
+       barcode = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN COALESCE(EXCLUDED.barcode, ada.branch_stock_snapshots.barcode) ELSE ada.branch_stock_snapshots.barcode END,
+       unit = CASE WHEN ada.branch_stock_snapshots.synced_at <= EXCLUDED.synced_at THEN COALESCE(EXCLUDED.unit, ada.branch_stock_snapshots.unit) ELSE ada.branch_stock_snapshots.unit END,
        ${columns.qty} = EXCLUDED.${columns.qty},
        ${columns.cost} = COALESCE(EXCLUDED.${columns.cost}, ada.branch_stock_snapshots.${columns.cost}),
        ${columns.freshness} = EXCLUDED.${columns.freshness},
@@ -121,15 +134,18 @@ async function claimNextBatch(db) {
       JOIN ingest.sync_runs candidate_run ON candidate_run.sync_run_id = candidate.sync_run_id
       WHERE candidate.status IN ('queued', 'retry_wait')
         AND candidate.next_attempt_at <= now()
-        AND candidate_run.status = 'running'
+        AND candidate_run.status IN ('running', 'failed')
         AND candidate_run.handoff_status = 'success'
+        AND candidate_run.finalized_at IS NOT NULL
       ORDER BY candidate.queued_at, candidate.batch_id
       FOR UPDATE OF candidate SKIP LOCKED LIMIT 1
     ) AND r.sync_run_id = b.sync_run_id
     RETURNING b.batch_id, b.sync_run_id, b.dataset, b.batch_seq, b.payload,
               b.attempts, b.max_attempts, r.branch_code
   `);
-  return result.rows[0] || null;
+  const batch = result.rows[0] || null;
+  if (batch) logWorkerEvent("CLAIMED", batch);
+  return batch;
 }
 
 async function recomputeRunStatus(client, syncRunId) {
@@ -174,6 +190,7 @@ async function processOneBatch(db) {
        WHERE batch_id = $1::bigint AND status = 'processing'`, [batch.batch_id]);
     await recomputeRunStatus(client, batch.sync_run_id);
     await client.query("COMMIT");
+    logWorkerEvent("APPLIED", batch);
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
     await client.query("BEGIN");
@@ -187,6 +204,7 @@ async function processOneBatch(db) {
       );
       await recomputeRunStatus(client, batch.sync_run_id);
       await client.query("COMMIT");
+      logWorkerEvent(exhausted ? "DEAD_LETTER" : "RETRY_WAIT", batch);
     } catch (statusError) {
       try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
       throw statusError;
@@ -208,10 +226,11 @@ async function reapStuckBatches(db) {
              WHEN attempts >= max_attempts THEN 'Reaped: processing lease expired at maximum attempts.'
              ELSE 'Reaped: processing lease expired; retry scheduled.' END
        WHERE status = 'processing' AND claimed_at < now() - ($1 || ' minutes')::interval
-       RETURNING batch_id, sync_run_id, status`, [STUCK_PROCESSING_MINUTES]);
+       RETURNING batch_id, sync_run_id, dataset, batch_seq, attempts, status`, [STUCK_PROCESSING_MINUTES]);
     const deadRunIds = [...new Set(result.rows.filter((row) => row.status === "dead_letter").map((row) => row.sync_run_id))];
     for (const syncRunId of deadRunIds) await recomputeRunStatus(client, syncRunId);
     await client.query("COMMIT");
+    for (const batch of result.rows) logWorkerEvent("REAPED", batch, { outcome: batch.status });
     return result;
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
@@ -236,5 +255,5 @@ if (require.main === module) {
 
 module.exports = {
   BRANCH_COLUMNS, APPLIERS, backoffMs, normalizeBranchStock, applyBranchStockBatch,
-  claimNextBatch, recomputeRunStatus, processOneBatch, reapStuckBatches, runWorkerLoop,
+  claimNextBatch, recomputeRunStatus, processOneBatch, reapStuckBatches, runWorkerLoop, logWorkerEvent,
 };

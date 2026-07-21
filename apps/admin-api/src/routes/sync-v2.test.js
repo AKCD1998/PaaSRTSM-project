@@ -109,6 +109,18 @@ test("batch records require run-matching branch identity", async () => {
   assert.equal((await request(app).post("/api/sync/v2/batches").set(auth).send({ ...base, records: [{ branchCode: "001", productCode: "P1", qty: 1, syncedAt: "2026-01-01" }] })).status, 400);
 });
 
+test("duplicate normalized product codes are rejected before staging", async () => {
+  const db = makeDb(); const app = makeApp(enabledConfig, db);
+  const response = await request(app).post("/api/sync/v2/batches").set(auth).send({
+    syncRunId: "7", dataset: "branch_stock", batchSeq: 1,
+    records: [
+      { branchCode: "000", productCode: " DUP ", qty: 1, syncedAt: "2026-01-01" },
+      { branchCode: "000", productCode: "DUP", qty: 2, syncedAt: "2026-01-01" },
+    ],
+  });
+  assert.equal(response.status, 400); assert.equal(db.state.batches.length, 0);
+});
+
 test("finalize rechecks flags and terminal handoff state", async () => {
   const manifest = { dataset: "branch_stock", batchCount: 1, recordCount: 1 };
   const failedDb = makeDb({ status: "failed", handoff_status: "failed", apply_status: "failed" });
@@ -177,6 +189,24 @@ test("hybrid success mirrors to ADA only after apply is terminal", async () => {
     } };
     const response = await request(makeApp(enabledConfig, db)).post("/api/sync/run-log").set(auth).send({ runId: "7", sourceName: "adapos_sync", status: "success" });
     assert.equal(response.status, 200); assert.equal(adaInserts, expectedAdaInserts);
+  }
+});
+
+test("hybrid requested failure mirrors and records errors only when actual status is failed", async () => {
+  for (const [runState, expectedWrites] of [
+    [{ ingestion_mode: "hybrid_v2", status: "running", apply_status: "pending" }, { ada: 0, errors: 0 }],
+    [{ ingestion_mode: "hybrid_v2", status: "failed", apply_status: "failed" }, { ada: 1, errors: 1 }],
+    [{ ingestion_mode: "v1", status: "failed", apply_status: "not_applicable" }, { ada: 1, errors: 1 }],
+  ]) {
+    const writes = { ada: 0, errors: 0 };
+    const db = { async query(sql) {
+      if (/UPDATE ingest\.sync_runs/i.test(sql)) return { rows: [{ sync_run_id: 7, ...runState }], rowCount: 1 };
+      if (/INSERT INTO ada\.sync_runs/i.test(sql)) { writes.ada += 1; return { rows: [{ sync_run_id: 88 }], rowCount: 1 }; }
+      if (/INSERT INTO ingest\.sync_errors/i.test(sql)) { writes.errors += 1; return { rows: [], rowCount: 1 }; }
+      return { rows: [], rowCount: 0 };
+    } };
+    const response = await request(makeApp(enabledConfig, db)).post("/api/sync/run-log").set(auth).send({ runId: "7", sourceName: "adapos_sync", status: "failed" });
+    assert.equal(response.status, 200); assert.deepEqual(writes, expectedWrites);
   }
 });
 

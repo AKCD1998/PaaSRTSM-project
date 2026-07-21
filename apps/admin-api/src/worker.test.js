@@ -2,13 +2,15 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches, backoffMs } = require("./worker");
+const { applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches, backoffMs, logWorkerEvent } = require("./worker");
 
 test("claim query only claims queued/retry_wait and uses SKIP LOCKED, never staged", async () => {
   let sql;
   await claimNextBatch({ query: async (query) => { sql = query; return { rows: [] }; } });
   assert.match(sql, /status IN \('queued', 'retry_wait'\)/);
   assert.match(sql, /FOR UPDATE OF candidate SKIP LOCKED/);
+  assert.match(sql, /candidate_run\.status IN \('running', 'failed'\)/);
+  assert.match(sql, /candidate_run\.finalized_at IS NOT NULL/);
   assert.doesNotMatch(sql, /status IN \([^)]*staged/);
 });
 
@@ -20,6 +22,7 @@ test("branch stock applier updates only the whitelisted branch columns and guard
   assert.match(calls[0].sql, /synced_at_branch_001 <= EXCLUDED\.synced_at_branch_001/);
   assert.match(calls[0].sql, /qty_total_all_branches =/);
   assert.match(calls[0].sql, /synced_at = GREATEST/);
+  assert.match(calls[0].sql, /COALESCE\(EXCLUDED\.product_name_thai, ada\.branch_stock_snapshots\.product_name_thai\)/);
   assert.deepEqual(calls[0].params.slice(1, 5).map((values) => values[0]), ["ไทย", "English", "123", "EA"]);
   assert.deepEqual(JSON.parse(calls[0].params[10][0]), { source: "test" });
   assert.doesNotMatch(calls[0].sql, /qty_branch_000 = EXCLUDED/);
@@ -31,6 +34,15 @@ test("branch stock applier updates only the whitelisted branch columns and guard
     ], "000"),
     /Duplicate productCode/,
   );
+});
+
+test("worker terminal logs are structured and never contain payloads or secrets", () => {
+  const original = console.log; const lines = []; console.log = (line) => lines.push(line);
+  try { logWorkerEvent("DEAD_LETTER", { sync_run_id: 7, batch_id: 8, dataset: "branch_stock", batch_seq: 2, attempts: 5, payload: [{ secret: "must-not-log" }] }, { error: "failed safely" }); }
+  finally { console.log = original; }
+  const entry = JSON.parse(lines[0]);
+  assert.deepEqual(entry, { component: "sync-worker", event: "DEAD_LETTER", runId: "7", batchId: "8", dataset: "branch_stock", batchSeq: 2, attempts: 5, error: "failed safely" });
+  assert.doesNotMatch(lines[0], /must-not-log|api.?key|postgresql:\/\//i);
 });
 
 test("apply, batch status, and recomputed counters share one transaction", async () => {
