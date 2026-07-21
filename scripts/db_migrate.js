@@ -228,6 +228,37 @@ function splitSqlStatements(sql) {
   return statements;
 }
 
+// schema_migrations is shared across machines: Render applies migrations on
+// Linux, developers apply them from Windows. `path.relative` returns the host
+// separator, so keying on it directly means a Windows run never matches the
+// rows Render wrote — and every migration gets re-applied. Observed 2026-07-21,
+// when 051-060 silently re-ran against production. Always key on '/'.
+function migrationKey(rootDir, filePath) {
+  return path.relative(rootDir, filePath).split(path.sep).join("/");
+}
+
+// Repairs rows written by an earlier Windows run. Backslash duplicates of an
+// already-canonical row are dropped first, otherwise rewriting them would
+// collide with the primary key.
+async function normalizeMigrationKeys(client) {
+  await client.query(`
+    DELETE FROM public.schema_migrations bad
+    WHERE strpos(bad.filename, '\\') > 0
+      AND EXISTS (
+        SELECT 1 FROM public.schema_migrations good
+        WHERE good.filename = replace(bad.filename, '\\', '/')
+      )
+  `);
+  const result = await client.query(`
+    UPDATE public.schema_migrations
+    SET filename = replace(filename, '\\', '/')
+    WHERE strpos(filename, '\\') > 0
+  `);
+  if (result.rowCount > 0) {
+    console.log(`Normalised ${result.rowCount} migration key(s) to forward slashes.`);
+  }
+}
+
 async function ensureMigrationsTable(client) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.schema_migrations (
@@ -300,7 +331,7 @@ async function seedLegacyMigrations(client) {
 
 async function applySqlFile(client, filePath, rootDir) {
   const sql = await fs.readFile(filePath, "utf8");
-  const relativePath = path.relative(rootDir, filePath);
+  const relativePath = migrationKey(rootDir, filePath);
   const statements = splitSqlStatements(sql).filter((statement) => {
     const normalized = statement.replace(/\s+/g, " ").trim().toUpperCase();
     return normalized !== "BEGIN" && normalized !== "COMMIT";
@@ -330,13 +361,14 @@ async function run() {
 
   try {
     await ensureMigrationsTable(client);
+    await normalizeMigrationKeys(client);
     await seedLegacyMigrations(client);
     const applied = await getAppliedMigrations(client);
     const sqlFiles = await loadSqlFiles(rootDir);
 
     let skipped = 0;
     for (const file of sqlFiles) {
-      const relativePath = path.relative(rootDir, file);
+      const relativePath = migrationKey(rootDir, file);
       if (applied.has(relativePath)) {
         skipped += 1;
         continue;
