@@ -20,6 +20,38 @@ function normalizeNullableText(value, maxChars = null) {
   return normalized.slice(0, maxChars);
 }
 
+const MAX_PRODUCT_CODES = 10;
+
+// A focus row may cover several product codes that share ONE target: staff can
+// sell any mix of them as long as the combined quantity clears the number (e.g.
+// Vicks Vapodrop honey-lemon + orange against a single target of 50). The first
+// element stays the leading/display code and must equal `product_code` — see the
+// focus_products_product_code_leads CHECK added in migration 061.
+function normalizeProductCodes(rawCodes, leadCode) {
+  const list = Array.isArray(rawCodes) ? rawCodes : (rawCodes == null ? [] : [rawCodes]);
+  const seen = new Set();
+  const codes = [];
+  for (const value of [leadCode, ...list]) {
+    const code = normalizeText(value);
+    if (!code) continue;
+    const key = code.toLowerCase();
+    if (seen.has(key)) continue; // same product listed twice would double-count sales
+    seen.add(key);
+    codes.push(code);
+  }
+  if (!codes.length) throw createHttpError("productCode is required.", 400);
+  if (codes.length > MAX_PRODUCT_CODES) {
+    throw createHttpError(`รวมสินค้าได้สูงสุด ${MAX_PRODUCT_CODES} รหัสต่อหนึ่งเป้า`, 400);
+  }
+  return codes;
+}
+
+// Rows read before migration 061 ran (or from tests using older fixtures) may
+// have no array yet; fall back to the single legacy column.
+function rowProductCodes(row) {
+  return row.product_codes?.length ? row.product_codes : [row.product_code];
+}
+
 function normalizeDate(value, field) {
   const text = normalizeText(value);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
@@ -132,6 +164,7 @@ function mapFocusProductRow(row) {
   return {
     id: Number(row.id),
     productCode: row.product_code,
+    productCodes: rowProductCodes(row),
     focusType: row.focus_type,
     targetQty: Number(row.target_qty),
     dateFrom: row.date_from,
@@ -217,6 +250,21 @@ async function fetchSoldQtyBatch(db, productCodes, dateFrom, dateTo) {
   return map;
 }
 
+// Collapse a multi-code focus row into one per-branch total. Any mix of the
+// grouped codes counts toward the same target, so the branch figure is their sum.
+function sumSoldAcrossCodes(codeMap, productCodes) {
+  const totals = {};
+  if (!codeMap) return totals;
+  for (const code of productCodes) {
+    const perBranch = codeMap.get(code);
+    if (!perBranch) continue;
+    for (const [branchCode, qty] of Object.entries(perBranch)) {
+      totals[branchCode] = (totals[branchCode] || 0) + qty;
+    }
+  }
+  return totals;
+}
+
 function computeStatus(focusType, targetQty, soldByBranch, branchCodes, branchTargets) {
   const relevantBranches = branchCodes;
   const totalSold = relevantBranches.reduce((sum, code) => sum + (soldByBranch[code] || 0), 0);
@@ -274,7 +322,7 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
   };
 
   let t = Date.now();
-  const productCodes = [...new Set(focusRows.map((row) => row.product_code))];
+  const productCodes = [...new Set(focusRows.flatMap(rowProductCodes))];
   const nameMap = await fetchProductNames(db, productCodes);
   mark("fetchProductNames", t);
   const today = todayBangkokIso();
@@ -288,7 +336,7 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
   for (const row of unfrozenRows) {
     const key = `${toIsoDateOnly(row.date_from)}|${toIsoDateOnly(row.date_to)}`;
     if (!rangeGroups.has(key)) rangeGroups.set(key, new Set());
-    rangeGroups.get(key).add(row.product_code);
+    for (const code of rowProductCodes(row)) rangeGroups.get(key).add(code);
   }
   const batchByRange = new Map(); // "dateFrom|dateTo" -> Map<productCode, {branchCode: qty}>
   for (const [key, codes] of rangeGroups) {
@@ -310,7 +358,7 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
       isFrozen = true;
     } else {
       const key = `${toIsoDateOnly(row.date_from)}|${toIsoDateOnly(row.date_to)}`;
-      soldByBranch = batchByRange.get(key)?.get(row.product_code) || {};
+      soldByBranch = sumSoldAcrossCodes(batchByRange.get(key), rowProductCodes(row));
       if (toIsoDateOnly(row.date_to) < today) {
         const totalSold = Object.values(soldByBranch).reduce((sum, v) => sum + v, 0);
         const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold);
@@ -327,6 +375,11 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
     results.push({
       ...mapFocusProductRow(row),
       productName: nameMap.get(row.product_code) || null,
+      // Every code in the group, so the UI can list each product sharing the target.
+      products: rowProductCodes(row).map((code) => ({
+        productCode: code,
+        productName: nameMap.get(code) || null,
+      })),
       branchCodes,
       soldByBranch,
       isFrozen,
@@ -367,8 +420,8 @@ async function createFocusProduct(db, fields) {
   // this at the service boundary so API callers cannot bypass the admin UI.
   const [completeFields] = validateBulkRows([fields]);
   fields = completeFields;
-  const productCode = normalizeText(fields.productCode);
-  if (!productCode) throw createHttpError("productCode is required.", 400);
+  const productCodes = normalizeProductCodes(fields.productCodes, fields.productCode);
+  const productCode = productCodes[0];
 
   const focusType = normalizeText(fields.focusType);
   if (!FOCUS_TYPES.has(focusType)) throw createHttpError("focusType is invalid.", 400);
@@ -406,13 +459,14 @@ async function createFocusProduct(db, fields) {
 
   const inserted = await db.query(
     `INSERT INTO focus.focus_products
-       (product_code, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by,
+       (product_code, product_codes, focus_type, target_qty, date_from, date_to, branch_codes, note, created_by,
         assigned_person_name, branch_targets, publication_status, scheduled_publish_at, published_at, published_by, assigned_staff_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15)
+     VALUES ($1, $16::text[], $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15)
      RETURNING id`,
     [productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, createdBy,
       assignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
-      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy, assignedStaffId],
+      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy, assignedStaffId,
+      productCodes],
   );
   const row = await fetchFocusProductRow(db, inserted.rows[0].id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);
@@ -439,6 +493,7 @@ function validateBulkRows(rows) {
     const missingBranches = REQUIRED_FOCUS_BRANCHES.filter((code) => !branchCodes.includes(code));
 
     if (!productCode) throw createHttpError(`รายการที่ ${index + 1}: ต้องเลือกสินค้า`, 400, { rowIndex: index });
+    const productCodes = normalizeProductCodes(row.productCodes, productCode);
     if (!FOCUS_TYPES.has(focusType)) throw createHttpError(`รายการที่ ${index + 1}: ประเภทโฟกัสไม่ถูกต้อง`, 400, { rowIndex: index });
     if (!Number.isFinite(targetQty) || targetQty <= 0) throw createHttpError(`รายการที่ ${index + 1}: เป้าหมายต้องมากกว่า 0`, 400, { rowIndex: index });
     if (missingBranches.length || branchCodes.some((code) => !REQUIRED_FOCUS_BRANCHES.includes(code))) {
@@ -453,12 +508,17 @@ function validateBulkRows(rows) {
         throw createHttpError(`รายการที่ ${index + 1}: เป้าสาขา ${incomplete.join(", ")} ต้องมากกว่า 0`, 400, { rowIndex: index });
       }
     }
-    const duplicateKey = focusType === "salesperson"
-      ? `${focusType}|${productCode.toLowerCase()}|${assignedStaffId}`
-      : `${focusType}|${productCode.toLowerCase()}`;
-    if (seen.has(duplicateKey)) throw createHttpError(`รายการที่ ${index + 1}: มีสินค้า/ผู้รับผิดชอบซ้ำในชุดนี้`, 409, { rowIndex: index });
-    seen.add(duplicateKey);
-    return { ...row, productCode, focusType, targetQty, assignedPersonName, assignedStaffId, branchCodes: [...REQUIRED_FOCUS_BRANCHES], branchTargets };
+    // Checked per code, not per row: two rows must not claim the same product
+    // even when only one of them lists it as a secondary code, or its sales
+    // would be counted toward both targets.
+    for (const code of productCodes) {
+      const duplicateKey = focusType === "salesperson"
+        ? `${focusType}|${code.toLowerCase()}|${assignedStaffId}`
+        : `${focusType}|${code.toLowerCase()}`;
+      if (seen.has(duplicateKey)) throw createHttpError(`รายการที่ ${index + 1}: มีสินค้า/ผู้รับผิดชอบซ้ำในชุดนี้`, 409, { rowIndex: index });
+      seen.add(duplicateKey);
+    }
+    return { ...row, productCode, productCodes, focusType, targetQty, assignedPersonName, assignedStaffId, branchCodes: [...REQUIRED_FOCUS_BRANCHES], branchTargets };
   });
 }
 
@@ -473,7 +533,7 @@ async function createFocusProductsBulk(db, fields) {
   const ownsClient = client !== db;
   try {
     await client.query("BEGIN");
-    const productCodes = [...new Set(rows.map((row) => row.productCode))];
+    const productCodes = [...new Set(rows.flatMap((row) => row.productCodes))];
     const productResult = await client.query(
       `SELECT company_code FROM public.skus WHERE company_code = ANY($1::text[])`,
       [productCodes],
@@ -483,20 +543,22 @@ async function createFocusProductsBulk(db, fields) {
     if (invalidCodes.length) throw createHttpError(`ไม่พบรหัสสินค้า: ${invalidCodes.join(", ")}`, 400);
 
     for (const row of rows) {
-      const duplicateParams = [row.productCode, row.focusType, dateFrom, dateTo];
+      const duplicateParams = [row.productCodes, row.focusType, dateFrom, dateTo];
       let personSql = "";
       if (row.focusType === "salesperson") {
         duplicateParams.push(row.assignedStaffId);
         personSql = `AND assigned_staff_id = $5`;
       }
+      // Overlap (&&), not equality: a clash is any shared code between the two
+      // groups, since that product's sales would otherwise feed two targets.
       const duplicate = await client.query(
         `SELECT id FROM focus.focus_products
-         WHERE is_active = TRUE AND product_code = $1 AND focus_type = $2
+         WHERE is_active = TRUE AND product_codes && $1::text[] AND focus_type = $2
            AND date_from <= $4::date AND date_to >= $3::date ${personSql}
          LIMIT 1`,
         duplicateParams,
       );
-      if (duplicate.rowCount) throw createHttpError(`มีสินค้าโฟกัสซ้ำอยู่แล้ว: ${row.productCode}`, 409, { existingId: Number(duplicate.rows[0].id) });
+      if (duplicate.rowCount) throw createHttpError(`มีสินค้าโฟกัสซ้ำอยู่แล้ว: ${row.productCodes.join(", ")}`, 409, { existingId: Number(duplicate.rows[0].id) });
     }
 
     const created = [];
@@ -524,8 +586,13 @@ async function updateFocusProduct(db, id, fields) {
   const before = await fetchFocusProductRow(db, id);
   if (!before) throw createHttpError("Focus product not found.", 404);
 
-  const productCode = fields.productCode === undefined ? before.product_code : normalizeText(fields.productCode);
-  if (!productCode) throw createHttpError("productCode is required.", 400);
+  const productCodes = fields.productCode === undefined && fields.productCodes === undefined
+    ? rowProductCodes(before)
+    : normalizeProductCodes(
+      fields.productCodes === undefined ? rowProductCodes(before).slice(1) : fields.productCodes,
+      fields.productCode === undefined ? before.product_code : fields.productCode,
+    );
+  const productCode = productCodes[0];
 
   const focusType = fields.focusType === undefined ? before.focus_type : normalizeText(fields.focusType);
   if (!FOCUS_TYPES.has(focusType)) throw createHttpError("focusType is invalid.", 400);
@@ -574,7 +641,7 @@ async function updateFocusProduct(db, id, fields) {
 
   await db.query(
     `UPDATE focus.focus_products
-     SET product_code = $2, focus_type = $3, target_qty = $4, date_from = $5, date_to = $6,
+     SET product_code = $2, product_codes = $17::text[], focus_type = $3, target_qty = $4, date_from = $5, date_to = $6,
          branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, branch_targets = $11::jsonb,
          publication_status = $12, scheduled_publish_at = $13, published_at = $14, published_by = $15, assigned_staff_id = $16,
          updated_at = now()
@@ -582,7 +649,8 @@ async function updateFocusProduct(db, id, fields) {
      WHERE id = $1`,
     [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive,
       resolvedAssignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
-      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy, assignedStaffId],
+      publication.status, publication.scheduledPublishAt, publication.publishedAt, publishedBy, assignedStaffId,
+      productCodes],
   );
   const row = await fetchFocusProductRow(db, id);
   const activeBranchCodes = await fetchActiveBranchCodes(db);

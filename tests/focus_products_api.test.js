@@ -108,6 +108,7 @@ function createMockDb() {
         const row = {
           id,
           product_code: params[0],
+          product_codes: params[15], // $16 — every code sharing this row's target
           focus_type: params[1],
           target_qty: String(params[2]),
           date_from: params[3],
@@ -137,6 +138,7 @@ function createMockDb() {
         if (row) {
           Object.assign(row, {
             product_code: params[1],
+            product_codes: params[16], // $17
             focus_type: params[2],
             target_qty: String(params[3]),
             date_from: params[4],
@@ -460,6 +462,69 @@ test("admin can set branchTargets on create and it round-trips", async () => {
   assert.deepEqual(created.body.focusProduct.branchTargets, { "001": 8, "003": 3, "004": 3, "005": 3 });
   assert.equal(created.body.focusProduct.branchTargetsEffective["001"], 8);
   assert.equal(created.body.focusProduct.branchTargetsEffective["005"], 3);
+});
+
+// Multi-product focus groups: several product codes share ONE target and staff
+// may sell any mix of them. The mock returns 001:10 / 003:5 for every requested
+// code, so a two-code group must report exactly double a one-code group.
+test("a focus row spanning several product codes counts their sales together", async () => {
+  const { app, db } = createTestApp();
+  db.state.rows.get(1).target_qty = "20";
+  db.state.rows.get(1).product_codes = ["IC-004754", "IC-004755"];
+
+  const staff = request.agent(app);
+  await loginAs(staff, "staff@example.com", "staff-pass-123");
+  const res = await staff.get("/api/focus-products");
+  const row = res.body.focusProducts[0];
+
+  assert.equal(row.soldByBranch["001"], 20); // 10 + 10
+  assert.equal(row.soldByBranch["003"], 10); // 5 + 5
+  assert.equal(row.totalSold, 30);
+  // The regression this guards: counting only the leading code gives 15, which
+  // misses the target of 20 and wrongly reports the group as failed.
+  assert.equal(row.achieved, true);
+  assert.deepEqual(row.productCodes, ["IC-004754", "IC-004755"]);
+  assert.deepEqual(row.products.map((p) => p.productCode), ["IC-004754", "IC-004755"]);
+});
+
+test("a row with no product_codes array falls back to the legacy single code", async () => {
+  const { app, db } = createTestApp();
+  db.state.rows.get(1).target_qty = "20";
+  delete db.state.rows.get(1).product_codes;
+
+  const staff = request.agent(app);
+  await loginAs(staff, "staff@example.com", "staff-pass-123");
+  const res = await staff.get("/api/focus-products");
+  const row = res.body.focusProducts[0];
+
+  assert.equal(row.totalSold, 15); // 10 + 5 from the one code only
+  assert.equal(row.achieved, false);
+  assert.deepEqual(row.productCodes, ["IC-005834"]);
+});
+
+test("admin can create a focus row spanning several product codes", async () => {
+  const { app } = createTestApp();
+  const admin = request.agent(app);
+  const csrf = await loginAs(admin);
+
+  const created = await admin
+    .post("/api/admin/focus-products")
+    .set("x-csrf-token", csrf)
+    .send({
+      productCode: "IC-004754",
+      // The leading code is implied; listing it again must not double-count.
+      productCodes: ["IC-004754", "IC-004755"],
+      focusType: "store_manager",
+      targetQty: 50,
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31",
+      branchCodes: ["001", "003", "004", "005"],
+      branchTargets: { "001": 50, "003": 50, "004": 20, "005": 20 },
+    });
+
+  assert.equal(created.status, 201);
+  assert.equal(created.body.focusProduct.productCode, "IC-004754");
+  assert.deepEqual(created.body.focusProduct.productCodes, ["IC-004754", "IC-004755"]);
 });
 
 test("branchTargets rejects negative and incomplete/zero targets", async () => {
