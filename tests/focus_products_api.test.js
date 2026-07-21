@@ -559,3 +559,44 @@ test("branchTargets rejects negative and incomplete/zero targets", async () => {
     });
   assert.equal(incomplete.status, 400);
 });
+
+// Batch (barcode) creation can merge scanned rows so they share one target.
+// validateBulkRows is exercised directly: it owns the cross-row duplicate rule,
+// which now has to compare every code in a group, not just the leading one.
+test("bulk validation groups merged product codes onto one target", () => {
+  const { validateBulkRows } = require("../apps/admin-api/src/services/focusProducts");
+
+  const [row] = validateBulkRows([{
+    productCode: "IC-004754",
+    productCodes: ["IC-004754", "IC-004755"],
+    focusType: "store_manager",
+    targetQty: 50,
+    branchCodes: ["001", "003", "004", "005"],
+    branchTargets: { "001": 50, "003": 50, "004": 20, "005": 20 },
+  }]);
+
+  assert.equal(row.productCode, "IC-004754");
+  assert.deepEqual(row.productCodes, ["IC-004754", "IC-004755"]);
+});
+
+test("bulk validation rejects a product claimed by two targets in the same batch", () => {
+  const { validateBulkRows } = require("../apps/admin-api/src/services/focusProducts");
+
+  const branchTargets = { "001": 5, "003": 5, "004": 5, "005": 5 };
+  const base = {
+    focusType: "store_manager",
+    targetQty: 5,
+    branchCodes: ["001", "003", "004", "005"],
+    branchTargets,
+  };
+
+  // IC-004755 appears as a secondary code on row 1 and the primary on row 2 —
+  // left unchecked its sales would count toward both targets.
+  assert.throws(
+    () => validateBulkRows([
+      { ...base, productCode: "IC-004754", productCodes: ["IC-004754", "IC-004755"] },
+      { ...base, productCode: "IC-004755" },
+    ]),
+    (error) => error.statusCode === 409,
+  );
+});
