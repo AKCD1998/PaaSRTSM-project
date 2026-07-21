@@ -2,7 +2,26 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches, backoffMs, logWorkerEvent } = require("./worker");
+const {
+  applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches,
+  pruneExpiredBatches, recomputeRunStatus, backoffMs, logWorkerEvent, normalizeBranchStock,
+} = require("./worker");
+
+test("run recomputation locks the run before taking a fresh aggregate snapshot", async () => {
+  const calls = [];
+  await recomputeRunStatus({ query: async (sql) => { calls.push(sql.replace(/\s+/g, " ").trim()); return { rows: [] }; } }, 7);
+  assert.match(calls[0], /SELECT sync_run_id FROM ingest\.sync_runs/);
+  assert.match(calls[0], /FOR UPDATE/);
+  assert.match(calls[1], /WITH counts AS/);
+});
+
+test("route and worker share camel and snake branch-stock value aliases", () => {
+  const timestamp = "2026-01-01T00:00:00Z";
+  const [camel] = normalizeBranchStock([{ productCode: "P1", qtyBranch001: 5, costAvgBranch001: 2, syncedAt: timestamp }], "001");
+  const [snake] = normalizeBranchStock([{ productCode: "P1", qty_branch_001: 6, cost_avg_branch_001: 3, syncedAt: timestamp }], "001");
+  assert.deepEqual([camel.qty, camel.cost], [5, 2]);
+  assert.deepEqual([snake.qty, snake.cost], [6, 3]);
+});
 
 test("claim query only claims queued/retry_wait and uses SKIP LOCKED, never staged", async () => {
   let sql;
@@ -74,6 +93,23 @@ test("reaper returns crashed work to retry_wait and retry backoff is bounded", a
   assert.match(sql, /attempts >= max_attempts THEN 'dead_letter'/); assert.match(sql, /ELSE 'retry_wait'/);
   assert.match(sql, /maximum attempts/);
   assert.equal(backoffMs(1), 2000); assert.equal(backoffMs(99), 60000);
+});
+
+test("retention deletes only aged terminal batch classes with bounded settings", async () => {
+  let call;
+  const result = await pruneExpiredBatches({ query: async (sql, params) => {
+    call = { sql: sql.replace(/\s+/g, " ").trim(), params };
+    return { rows: [], rowCount: 0 };
+  } }, { appliedRetentionDays: 30, terminalRetentionDays: 90, abandonedStagedRetentionDays: 7 });
+  assert.equal(result.rowCount, 0);
+  assert.deepEqual(call.params, [30, 90, 7]);
+  assert.match(call.sql, /b\.status = 'applied' AND r\.status = 'success'/);
+  assert.match(call.sql, /b\.status IN \('applied', 'dead_letter'\) AND r\.status = 'failed'/);
+  assert.match(call.sql, /NOT EXISTS.*active\.status IN \('queued', 'processing', 'retry_wait'\)/);
+  assert.match(call.sql, /COALESCE\(b\.applied_at, b\.created_at\)/);
+  assert.match(call.sql, /b\.status = 'staged' AND r\.status = 'failed' AND r\.finalized_at IS NULL/);
+  assert.doesNotMatch(call.sql, /b\.status = 'queued'|b\.status = 'processing'|b\.status = 'retry_wait'/);
+  await assert.rejects(() => pruneExpiredBatches({ query: async () => assert.fail("must validate first") }, { appliedRetentionDays: 0 }), /positive/);
 });
 
 test("two concurrent claimers receive different batches", async () => {

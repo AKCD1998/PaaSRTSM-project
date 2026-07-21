@@ -109,6 +109,16 @@ test("batch records require run-matching branch identity", async () => {
   assert.equal((await request(app).post("/api/sync/v2/batches").set(auth).send({ ...base, records: [{ branchCode: "001", productCode: "P1", qty: 1, syncedAt: "2026-01-01" }] })).status, 400);
 });
 
+test("camel per-branch quantity and cost aliases pass staging validation", async () => {
+  const db = makeDb();
+  const response = await request(makeApp(enabledConfig, db)).post("/api/sync/v2/batches").set(auth).send({
+    syncRunId: "7", dataset: "branch_stock", batchSeq: 1,
+    records: [{ branchCode: "000", productCode: "P1", qtyBranch000: 2, costAvgBranch000: 1.5, syncedAt: "2026-01-01" }],
+  });
+  assert.equal(response.status, 202);
+  assert.equal(db.state.batches.length, 1);
+});
+
 test("duplicate normalized product codes are rejected before staging", async () => {
   const db = makeDb(); const app = makeApp(enabledConfig, db);
   const response = await request(app).post("/api/sync/v2/batches").set(auth).send({

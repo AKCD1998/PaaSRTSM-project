@@ -8,7 +8,10 @@ const express = require("express");
 const request = require("supertest");
 const { Pool } = require("pg");
 const { createSyncRouter } = require("../apps/admin-api/src/routes/sync");
-const { applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches } = require("../apps/admin-api/src/worker");
+const {
+  applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches,
+  pruneExpiredBatches, recomputeRunStatus,
+} = require("../apps/admin-api/src/worker");
 
 const databaseUrl = process.env.CP4_TEST_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
@@ -79,6 +82,34 @@ integration("REAL POSTGRES: staged work is invisible and two claimers get differ
   assert.notEqual(first.batch_id, second.batch_id);
   assert.deepEqual(new Set([first.batch_seq, second.batch_seq]), new Set([2, 3]));
   assert.equal((await pool.query("SELECT status FROM ingest.sync_batches WHERE batch_seq=1")).rows[0].status, "staged");
+});
+
+integration("REAL POSTGRES: concurrent final batches serialize recomputation and reach applied success", async () => {
+  await resetData(); const runId = await insertRun({ total_batches: 2 });
+  await pool.query(`INSERT INTO ingest.sync_batches
+    (sync_run_id,dataset,batch_seq,payload_hash,payload,record_count,status,attempts,max_attempts)
+    VALUES ($1,'branch_stock',1,'a','[]',0,'processing',1,5),
+           ($1,'branch_stock',2,'b','[]',0,'processing',1,5)`, [runId]);
+  const first = await pool.connect(); const second = await pool.connect();
+  try {
+    await first.query("BEGIN");
+    await first.query("UPDATE ingest.sync_batches SET status='applied', applied_at=now() WHERE sync_run_id=$1 AND batch_seq=1", [runId]);
+    await recomputeRunStatus(first, runId);
+
+    await second.query("BEGIN");
+    await second.query("UPDATE ingest.sync_batches SET status='applied', applied_at=now() WHERE sync_run_id=$1 AND batch_seq=2", [runId]);
+    const secondRecompute = recomputeRunStatus(second, runId);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await first.query("COMMIT");
+    await secondRecompute;
+    await second.query("COMMIT");
+  } catch (error) {
+    await first.query("ROLLBACK").catch(() => {});
+    await second.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { first.release(); second.release(); }
+  const run = (await pool.query("SELECT status,apply_status,applied_batches,total_batches FROM ingest.sync_runs WHERE sync_run_id=$1", [runId])).rows[0];
+  assert.deepEqual(run, { status: "success", apply_status: "applied", applied_batches: 2, total_batches: 2 });
 });
 
 integration("REAL POSTGRES: concurrent branches preserve quantities, exact total, metadata, freshness, and null cost", async () => {
@@ -190,6 +221,30 @@ integration("REAL POSTGRES: finalize mismatch rolls back without queueing staged
   assert.equal(response.status, 409);
   assert.equal((await pool.query("SELECT status FROM ingest.sync_batches WHERE sync_run_id=$1", [runId])).rows[0].status, "staged");
   assert.equal((await pool.query("SELECT finalized_at FROM ingest.sync_runs WHERE sync_run_id=$1", [runId])).rows[0].finalized_at, null);
+});
+
+integration("REAL POSTGRES: retention removes only expired terminal and abandoned staged payloads", async () => {
+  await resetData();
+  const successRun = await insertRun({ status: "success", apply_status: "applied" });
+  const failedFinalizedRun = await insertRun({ status: "failed", apply_status: "failed" });
+  const failedStagedRun = await insertRun({ status: "failed", handoff_status: "failed", apply_status: "failed", finalized: false });
+  const activeRun = await insertRun({ status: "running", apply_status: "pending" });
+  const drainingFailedRun = await insertRun({ status: "failed", apply_status: "failed", total_batches: 2 });
+  await pool.query(`INSERT INTO ingest.sync_batches
+    (sync_run_id,dataset,batch_seq,payload_hash,payload,record_count,status,created_at,applied_at,queued_at,next_attempt_at)
+    VALUES
+      ($1,'branch_stock',1,'a','[]',0,'applied',now()-interval '40 days',now()-interval '40 days',now()-interval '40 days',NULL),
+      ($2,'branch_stock',1,'b','[]',0,'dead_letter',now()-interval '100 days',NULL,now()-interval '100 days',NULL),
+      ($3,'branch_stock',1,'c','[]',0,'staged',now()-interval '8 days',NULL,NULL,NULL),
+      ($4,'branch_stock',1,'d','[]',0,'queued',now()-interval '100 days',NULL,now()-interval '100 days',now()),
+      ($5,'branch_stock',1,'e','[]',0,'dead_letter',now()-interval '100 days',NULL,now()-interval '100 days',NULL),
+      ($5,'branch_stock',2,'f','[]',0,'queued',now()-interval '100 days',NULL,now()-interval '100 days',now()),
+      ($2,'branch_stock',2,'g','[]',0,'applied',now()-interval '100 days',now()-interval '100 days',now()-interval '100 days',NULL)`,
+  [successRun, failedFinalizedRun, failedStagedRun, activeRun, drainingFailedRun]);
+  const pruned = await pruneExpiredBatches(pool, { appliedRetentionDays: 30, terminalRetentionDays: 90, abandonedStagedRetentionDays: 7 });
+  assert.equal(pruned.rowCount, 4);
+  const remaining = await pool.query("SELECT status FROM ingest.sync_batches ORDER BY batch_id");
+  assert.deepEqual(remaining.rows, [{ status: "queued" }, { status: "dead_letter" }, { status: "queued" }]);
 });
 
 if (pool) test.after(async () => pool.end());

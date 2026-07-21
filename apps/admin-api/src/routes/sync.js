@@ -2,6 +2,7 @@
 
 const express = require("express");
 const crypto = require("node:crypto");
+const { branchStockValueKeys, firstDefined } = require("../sync-v2-contract");
 
 // Legacy-compatible simplified sync endpoints.
 // Keep these working during the transition to /api/sync/ada/*.
@@ -43,8 +44,7 @@ function getSyncV2Config(config) {
 }
 
 function validateBranchStockRecords(records, branchCode) {
-  const qtyKeys = ["qty", "quantity", `qty_branch_${branchCode}`, `qtyBranch${branchCode}`];
-  const costKeys = ["costAvg", "cost_avg", `cost_avg_branch_${branchCode}`, `costAvgBranch${branchCode}`];
+  const keys = branchStockValueKeys(branchCode);
   const productCodes = new Set();
   for (const [index, record] of records.entries()) {
     if (!record || typeof record !== "object" || Array.isArray(record)) return `records[${index}] must be an object.`;
@@ -55,9 +55,9 @@ function validateBranchStockRecords(records, branchCode) {
     const recordBranch = normalizeText(record.branchCode ?? record.branch_code);
     if (!recordBranch) return `records[${index}].branchCode is required.`;
     if (recordBranch !== branchCode) return `records[${index}].branchCode must match run branch ${branchCode}.`;
-    const qty = qtyKeys.map((key) => record[key]).find((item) => item !== undefined);
+    const qty = firstDefined(record, keys.qty);
     if (qty === undefined || !Number.isFinite(Number(qty))) return `records[${index}].qty is invalid.`;
-    const cost = costKeys.map((key) => record[key]).find((item) => item !== undefined);
+    const cost = firstDefined(record, keys.cost);
     if (cost !== undefined && cost !== null && cost !== "" && !Number.isFinite(Number(cost))) return `records[${index}].costAvg is invalid.`;
     const timestamp = record.syncedAt ?? record.synced_at ?? record.sourceSyncedAt ?? record.source_synced_at;
     if (!timestamp || Number.isNaN(new Date(timestamp).getTime())) return `records[${index}].syncedAt is invalid.`;

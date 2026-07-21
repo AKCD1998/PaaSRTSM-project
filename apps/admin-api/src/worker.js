@@ -2,10 +2,16 @@
 
 const { loadConfig } = require("./config");
 const { createDbPool } = require("./db");
+const { branchStockValueKeys, firstDefined } = require("./sync-v2-contract");
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 2_000);
 const STUCK_PROCESSING_MINUTES = Number(process.env.WORKER_STUCK_PROCESSING_MINUTES || 10);
 const REAPER_INTERVAL_MS = Number(process.env.WORKER_REAPER_INTERVAL_MS || 60_000);
+const HEARTBEAT_INTERVAL_MS = Number(process.env.WORKER_HEARTBEAT_INTERVAL_MS || 60_000);
+const PRUNE_INTERVAL_MS = Number(process.env.WORKER_PRUNE_INTERVAL_MS || 6 * 60 * 60 * 1_000);
+const APPLIED_RETENTION_DAYS = Number(process.env.WORKER_APPLIED_RETENTION_DAYS || 30);
+const TERMINAL_RETENTION_DAYS = Number(process.env.WORKER_TERMINAL_RETENTION_DAYS || 90);
+const ABANDONED_STAGED_RETENTION_DAYS = Number(process.env.WORKER_ABANDONED_STAGED_RETENTION_DAYS || 7);
 
 const BRANCH_COLUMNS = Object.freeze({
   "000": { qty: "qty_branch_000", cost: "cost_avg_branch_000", freshness: "synced_at_branch_000" },
@@ -41,11 +47,12 @@ function value(record, ...keys) {
 function normalizeBranchStock(records, branchCode) {
   const columns = BRANCH_COLUMNS[branchCode];
   if (!columns) throw new Error(`Unsupported branch code "${branchCode}".`);
+  const keys = branchStockValueKeys(branchCode);
   const seen = new Set();
   return records.map((record, index) => {
     const productCode = String(value(record, "productCode", "product_code") || "").trim();
-    const qty = Number(value(record, "qty", "quantity", columns.qty));
-    const rawCost = value(record, "costAvg", "cost_avg", columns.cost);
+    const qty = Number(firstDefined(record, keys.qty));
+    const rawCost = firstDefined(record, keys.cost);
     const cost = rawCost === undefined || rawCost === null || rawCost === "" ? null : Number(rawCost);
     const sourceTimestamp = new Date(value(record, "syncedAt", "synced_at", "sourceSyncedAt", "source_synced_at"));
     if (!productCode) throw new Error(`records[${index}] requires productCode.`);
@@ -149,6 +156,15 @@ async function claimNextBatch(db) {
 }
 
 async function recomputeRunStatus(client, syncRunId) {
+  // Serialize recomputations for one run before taking the aggregate snapshot.
+  // Without this lock, two workers finishing the last batches concurrently can
+  // each count before the other commits, then overwrite the run with a stale
+  // partial count even though every batch is already applied.
+  await client.query(
+    `SELECT sync_run_id FROM ingest.sync_runs
+     WHERE sync_run_id = $1::bigint FOR UPDATE`,
+    [syncRunId],
+  );
   await client.query(`
     WITH counts AS (
       SELECT COUNT(*) FILTER (WHERE status = 'applied')::int AS applied,
@@ -174,6 +190,41 @@ async function recomputeRunStatus(client, syncRunId) {
       applied_at = CASE WHEN r.total_batches > 0 AND counts.applied = r.total_batches THEN COALESCE(r.applied_at, now()) ELSE r.applied_at END,
       finished_at = CASE WHEN counts.failed > 0 OR (r.total_batches > 0 AND counts.applied = r.total_batches) THEN COALESCE(r.finished_at, now()) ELSE r.finished_at END
     FROM counts WHERE r.sync_run_id = $1::bigint`, [syncRunId]);
+}
+
+function positiveDays(value, name) {
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number of days.`);
+  return value;
+}
+
+async function pruneExpiredBatches(db, options = {}) {
+  const appliedDays = positiveDays(options.appliedRetentionDays ?? APPLIED_RETENTION_DAYS, "appliedRetentionDays");
+  const terminalDays = positiveDays(options.terminalRetentionDays ?? TERMINAL_RETENTION_DAYS, "terminalRetentionDays");
+  const abandonedDays = positiveDays(options.abandonedStagedRetentionDays ?? ABANDONED_STAGED_RETENTION_DAYS, "abandonedStagedRetentionDays");
+  const result = await db.query(
+    `DELETE FROM ingest.sync_batches b
+     USING ingest.sync_runs r
+     WHERE r.sync_run_id = b.sync_run_id
+       AND (
+         (b.status = 'applied' AND r.status = 'success'
+           AND b.applied_at < now() - ($1::double precision * interval '1 day'))
+         OR (b.status IN ('applied', 'dead_letter') AND r.status = 'failed'
+           AND NOT EXISTS (
+             SELECT 1 FROM ingest.sync_batches active
+             WHERE active.sync_run_id = r.sync_run_id
+               AND active.status IN ('queued', 'processing', 'retry_wait')
+           )
+           AND COALESCE(b.applied_at, b.created_at) < now() - ($2::double precision * interval '1 day'))
+         OR (b.status = 'staged' AND r.status = 'failed' AND r.finalized_at IS NULL
+           AND b.created_at < now() - ($3::double precision * interval '1 day'))
+       )
+     RETURNING b.batch_id, b.sync_run_id, b.dataset, b.batch_seq, b.status`,
+    [appliedDays, terminalDays, abandonedDays],
+  );
+  if (result.rowCount > 0) {
+    console.log(JSON.stringify({ component: "sync-worker", event: "PRUNED", batches: result.rowCount }));
+  }
+  return result;
 }
 
 async function processOneBatch(db) {
@@ -240,12 +291,21 @@ async function reapStuckBatches(db) {
 
 async function runWorkerLoop(db, { signal } = {}) {
   const reaperTimer = setInterval(() => reapStuckBatches(db).catch(console.error), REAPER_INTERVAL_MS);
+  const pruneTimer = setInterval(() => pruneExpiredBatches(db).catch(console.error), PRUNE_INTERVAL_MS);
+  const heartbeatTimer = setInterval(() => {
+    console.log(JSON.stringify({ component: "sync-worker", event: "HEARTBEAT" }));
+  }, HEARTBEAT_INTERVAL_MS);
+  console.log(JSON.stringify({ component: "sync-worker", event: "STARTED" }));
   try {
     while (!signal?.aborted) {
       const didWork = await processOneBatch(db).catch((e) => { console.error(e); return false; });
       if (!didWork) await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
-  } finally { clearInterval(reaperTimer); }
+  } finally {
+    clearInterval(reaperTimer);
+    clearInterval(pruneTimer);
+    clearInterval(heartbeatTimer);
+  }
 }
 
 if (require.main === module) {
@@ -255,5 +315,6 @@ if (require.main === module) {
 
 module.exports = {
   BRANCH_COLUMNS, APPLIERS, backoffMs, normalizeBranchStock, applyBranchStockBatch,
-  claimNextBatch, recomputeRunStatus, processOneBatch, reapStuckBatches, runWorkerLoop, logWorkerEvent,
+  claimNextBatch, recomputeRunStatus, processOneBatch, reapStuckBatches, pruneExpiredBatches,
+  runWorkerLoop, logWorkerEvent,
 };
