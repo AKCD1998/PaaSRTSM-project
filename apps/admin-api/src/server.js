@@ -48,10 +48,13 @@ const {
 } = require("./routes/mobile-enroll");
 const { createMobileProductsRouter } = require("./routes/mobile-products");
 const { createVideoContentRouter } = require("./routes/video-content");
+const { createCustomerPreordersRouter } = require("./routes/customer-preorders");
+const { createR2PreorderStorageProvider } = require("./services/storage/r2PreorderStorageProvider");
 const { getVideoProvider } = require("./services/video-providers/providerRegistry");
 const { getStorageProvider } = require("./services/storage/storageRegistry");
 const { createVideoJobRunner } = require("./services/videoJobRunner");
 const { startAssetCleanupSchedule } = require("./services/videoAssetCleanup");
+const { startPreorderAttachmentCleanupSchedule } = require("./services/preorderAttachmentCleanup");
 const { startStockRecommendationSchedule } = require("./services/stockRecommendationSchedule");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
@@ -126,6 +129,8 @@ function createApp(overrides = {}) {
   const crmMirrorClient =
     overrides.crmMirrorClient || createCrmMirrorClient(config, overrides.fetchImpl || global.fetch);
   const videoStorageProvider = overrides.videoStorageProvider || getStorageProvider(config);
+  const preorderStorageProvider = overrides.preorderStorageProvider ||
+    (config.featureCustomerPreorders ? createR2PreorderStorageProvider(config) : null);
   const videoJobRunner =
     overrides.videoJobRunner ||
     createVideoJobRunner({
@@ -429,6 +434,16 @@ function createApp(overrides = {}) {
     }),
   );
   app.use(
+    "/api/customer-preorders",
+    createCustomerPreordersRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+      requireCsrfMiddleware: requireCsrf,
+      storageProvider: preorderStorageProvider,
+    }),
+  );
+  app.use(
     "/api/content",
     createVideoContentRouter({
       config,
@@ -494,6 +509,12 @@ async function startServer() {
     config,
     logger: console,
   });
+  const preorderAttachmentCleanupTimer = startPreorderAttachmentCleanupSchedule({
+    db,
+    storageProvider: config.featureCustomerPreorders ? createR2PreorderStorageProvider(config) : null,
+    config,
+    logger: console,
+  });
 
   // Nightly ordering.stock_recommendation_snapshots refresh. No-ops unless
   // FEATURE_STOCK_RECOMMENDATION_CRON is set — see stockRecommendationSchedule.js.
@@ -505,6 +526,7 @@ async function startServer() {
 
   const shutdown = async () => {
     if (assetCleanupTimer) clearInterval(assetCleanupTimer);
+    if (preorderAttachmentCleanupTimer) clearInterval(preorderAttachmentCleanupTimer);
     if (stockRecommendationCronTask) stockRecommendationCronTask.stop();
     server.close(async () => {
       if (db && typeof db.end === "function") {
