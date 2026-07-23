@@ -6,20 +6,34 @@
 // amount — is computed live from ada.sales_headers on every read, never
 // cached, so it's always as current as the last successful branch sync.
 //
-// The "actual sales" filter below was verified against real production data
-// for all 4 storefront branches on 2026-07-14 (exact match to POS-reported
-// daily totals): a sale counts only if it's a normal sale document
-// (FTShdDocType='1'), fully paid (FTShdStaPaid='3'), and not a refund
-// (FTShdStaRefund='1'). Note: apps/admin-api/src/routes/movement-analytics.js
-// uses a very similar filter but omits the FTShdStaRefund check — that's a
-// known small inaccuracy there (it would have overcounted branch 001 by ~70
-// on the date this was verified), out of scope to fix here, flagged in
-// docs/sync-program for follow-up.
-const ACTUAL_SALES_FILTER = `
-  COALESCE(NULLIF(raw_payload->>'FTShdDocType', ''), '1') = '1'
-  AND COALESCE(NULLIF(raw_payload->>'FTShdStaPaid', ''), paid_status, '') = '3'
-  AND COALESCE(NULLIF(raw_payload->>'FTShdStaRefund', ''), '1') = '1'
-`;
+// "Actual sales" = the AdaSoft "ยอดขายตามช่วงเวลา" net total, which the business
+// treats as authoritative. Reverse-engineered and proven to the baht (total AND
+// every hourly bucket) on branch 005, 2026-07-23 — see
+// SC-StockDay-Ordering/docs/EVIDENCE_2026-07-23_ADASOFT_SALES_LOGIC_BRANCH005.md.
+//
+// Crystal formula {@nTotal}:
+//   sale line   = FCSdtNet − FCSdtDisAvg − FCSdtFootAvg − FCSdtRePackAvg
+//   return line = the same amount × -1
+//
+// The OLD filter kept only DocType=1 / Refund=1 and dropped Refund=2 originals
+// entirely. That is wrong for a *partial* refund: the DocType 9 return is smaller
+// than the original it references, so discarding the whole original undercounts by
+// the residual (e.g. branch 005 was short by 248 for 2026-07-01..22; branch 001 by
+// 2,774 in July). The correct rule keeps the original and subtracts only the
+// actual return. Refund status is therefore NOT filtered; DocType 9 is subtracted.
+// The report also zeroes cancelled documents (FTShdStaDoc 2/3).
+const DOC_TYPE_EXPR = `COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1')`;
+const PAID_OK_EXPR = `COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'`;
+const NOT_CANCELLED_EXPR = `COALESCE(NULLIF(sh.raw_payload->>'FTShdStaDoc', ''), '1') NOT IN ('2', '3')`;
+// Documents that make up the net total: paid sale docs (1) and paid return docs (9).
+const SALES_NET_SCOPE = `${DOC_TYPE_EXPR} IN ('1', '9') AND ${PAID_OK_EXPR} AND ${NOT_CANCELLED_EXPR}`;
+const DETAIL_ALLOCATIONS = [
+  "FCSdtDisAvg",
+  "FCSdtFootAvg",
+  "FCSdtRePackAvg",
+].map((field) => `COALESCE(NULLIF(sl.raw_payload->>'${field}', '')::numeric, 0)`).join(" - ");
+// This is the report's {@nTotalCur}; SP_nMnyFactor is fixed to 1 in the .rpt.
+const SALES_NET_AMOUNT = `(CASE WHEN ${DOC_TYPE_EXPR} = '9' THEN -1 ELSE 1 END) * (COALESCE(sl.line_amount, 0) - ${DETAIL_ALLOCATIONS})`;
 
 const TIERS = [1, 2, 3];
 
@@ -125,25 +139,31 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
     listSalesTargets({ db, branchCode, month: monthStart }),
     db.query(
       `
-        SELECT COALESCE(SUM(grand_amount), 0) AS actual
-        FROM ada.sales_headers
-        WHERE branch_code = $1
-          AND doc_date >= $2::date
-          AND doc_date <= $3::date
-          AND ${ACTUAL_SALES_FILTER}
+        SELECT COALESCE(SUM(${SALES_NET_AMOUNT}), 0) AS actual
+        FROM ada.sales_headers sh
+        JOIN ada.sales_lines sl
+          ON sl.branch_code = sh.branch_code
+         AND sl.doc_no = sh.doc_no
+        WHERE sh.branch_code = $1
+          AND sh.doc_date >= $2::date
+          AND sh.doc_date <= $3::date
+          AND ${SALES_NET_SCOPE}
       `,
       [branchCode, monthStart, clampedAsOf],
     ),
     db.query(
       `
-        SELECT doc_date::text AS doc_date, COALESCE(SUM(grand_amount), 0) AS actual
-        FROM ada.sales_headers
-        WHERE branch_code = $1
-          AND doc_date >= $2::date
-          AND doc_date <= $3::date
-          AND ${ACTUAL_SALES_FILTER}
-        GROUP BY doc_date
-        ORDER BY doc_date
+        SELECT sh.doc_date::text AS doc_date, COALESCE(SUM(${SALES_NET_AMOUNT}), 0) AS actual
+        FROM ada.sales_headers sh
+        JOIN ada.sales_lines sl
+          ON sl.branch_code = sh.branch_code
+         AND sl.doc_no = sh.doc_no
+        WHERE sh.branch_code = $1
+          AND sh.doc_date >= $2::date
+          AND sh.doc_date <= $3::date
+          AND ${SALES_NET_SCOPE}
+        GROUP BY sh.doc_date
+        ORDER BY sh.doc_date
       `,
       [branchCode, monthStart, clampedAsOf],
     ),
@@ -193,5 +213,6 @@ module.exports = {
   listSalesTargets,
   upsertSalesTargets,
   getSalesProgress,
-  ACTUAL_SALES_FILTER,
+  SALES_NET_SCOPE,
+  SALES_NET_AMOUNT,
 };
