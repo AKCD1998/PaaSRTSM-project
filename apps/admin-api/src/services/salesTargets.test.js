@@ -8,10 +8,8 @@ const {
   SALES_NET_AMOUNT,
 } = require("./salesTargets");
 
-// The proven AdaSoft rule (branch 005, 2026-07-23): net = Σ grand over paid sale
-// docs (DocType 1, both refund statuses) minus Σ grand over paid return docs
-// (DocType 9). These tests guard against regressing back to the old
-// DocType=1/Refund=1-only filter that dropped partial-refund residuals.
+// Exact Crystal {@nTotal} rule: signed detail FCSdtNet minus its three allocated
+// discount fields. Both refund statuses remain in scope; DocType 9 subtracts.
 
 test("net scope includes both sale and return documents, paid only", () => {
   assert.match(SALES_NET_SCOPE, /IN \('1', '9'\)/);
@@ -23,7 +21,11 @@ test("net scope no longer filters on refund status (keeps refunded originals)", 
 });
 
 test("net amount adds sales and subtracts DocType 9 returns", () => {
-  assert.match(SALES_NET_AMOUNT, /WHEN .* = '9' THEN -grand_amount ELSE grand_amount/);
+  assert.match(SALES_NET_AMOUNT, /WHEN .* = '9' THEN -1 ELSE 1/);
+  assert.match(SALES_NET_AMOUNT, /sl\.line_amount/);
+  assert.match(SALES_NET_AMOUNT, /FCSdtDisAvg/);
+  assert.match(SALES_NET_AMOUNT, /FCSdtFootAvg/);
+  assert.match(SALES_NET_AMOUNT, /FCSdtRePackAvg/);
 });
 
 // Fake pg pool: routes each query by its SQL text and records the actual-sum SQL.
@@ -35,7 +37,7 @@ function fakeDb({ totalActual, dailyRows }) {
       if (/branch_sales_targets/.test(sql)) {
         return { rows: [] }; // no targets configured
       }
-      if (/GROUP BY doc_date/.test(sql)) {
+      if (/GROUP BY (?:sh\.)?doc_date/.test(sql)) {
         return { rows: dailyRows };
       }
       captured.actualSql = sql; // the month-to-date total
@@ -56,7 +58,9 @@ test("getSalesProgress returns the signed net total and issues the corrected SQL
   assert.equal(result.branchCode, "005");
   // The month-to-date query must use the signed sale/return expression and scope,
   // and must NOT restrict to a single refund status.
-  assert.match(db.captured.actualSql, /CASE WHEN .* = '9' THEN -grand_amount/);
+  assert.match(db.captured.actualSql, /CASE WHEN .* = '9' THEN -1 ELSE 1/);
+  assert.match(db.captured.actualSql, /JOIN ada\.sales_lines sl/);
+  assert.match(db.captured.actualSql, /FCSdtDisAvg/);
   assert.match(db.captured.actualSql, /IN \('1', '9'\)/);
   assert.doesNotMatch(db.captured.actualSql, /FTShdStaRefund/);
 });

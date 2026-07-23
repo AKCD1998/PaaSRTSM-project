@@ -11,8 +11,9 @@
 // every hourly bucket) on branch 005, 2026-07-23 — see
 // SC-StockDay-Ordering/docs/EVIDENCE_2026-07-23_ADASOFT_SALES_LOGIC_BRANCH005.md.
 //
-//   net = Σ FCShdGrand over paid sale docs  (DocType 1, BOTH refund statuses)
-//       − Σ FCShdGrand over paid return docs (DocType 9)
+// Crystal formula {@nTotal}:
+//   sale line   = FCSdtNet − FCSdtDisAvg − FCSdtFootAvg − FCSdtRePackAvg
+//   return line = the same amount × -1
 //
 // The OLD filter kept only DocType=1 / Refund=1 and dropped Refund=2 originals
 // entirely. That is wrong for a *partial* refund: the DocType 9 return is smaller
@@ -20,12 +21,19 @@
 // the residual (e.g. branch 005 was short by 248 for 2026-07-01..22; branch 001 by
 // 2,774 in July). The correct rule keeps the original and subtracts only the
 // actual return. Refund status is therefore NOT filtered; DocType 9 is subtracted.
-const DOC_TYPE_EXPR = `COALESCE(NULLIF(raw_payload->>'FTShdDocType', ''), '1')`;
-const PAID_OK_EXPR = `COALESCE(NULLIF(raw_payload->>'FTShdStaPaid', ''), paid_status, '') = '3'`;
+// The report also zeroes cancelled documents (FTShdStaDoc 2/3).
+const DOC_TYPE_EXPR = `COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1')`;
+const PAID_OK_EXPR = `COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'`;
+const NOT_CANCELLED_EXPR = `COALESCE(NULLIF(sh.raw_payload->>'FTShdStaDoc', ''), '1') NOT IN ('2', '3')`;
 // Documents that make up the net total: paid sale docs (1) and paid return docs (9).
-const SALES_NET_SCOPE = `${DOC_TYPE_EXPR} IN ('1', '9') AND ${PAID_OK_EXPR}`;
-// Sales add, returns subtract.
-const SALES_NET_AMOUNT = `CASE WHEN ${DOC_TYPE_EXPR} = '9' THEN -grand_amount ELSE grand_amount END`;
+const SALES_NET_SCOPE = `${DOC_TYPE_EXPR} IN ('1', '9') AND ${PAID_OK_EXPR} AND ${NOT_CANCELLED_EXPR}`;
+const DETAIL_ALLOCATIONS = [
+  "FCSdtDisAvg",
+  "FCSdtFootAvg",
+  "FCSdtRePackAvg",
+].map((field) => `COALESCE(NULLIF(sl.raw_payload->>'${field}', '')::numeric, 0)`).join(" - ");
+// This is the report's {@nTotalCur}; SP_nMnyFactor is fixed to 1 in the .rpt.
+const SALES_NET_AMOUNT = `(CASE WHEN ${DOC_TYPE_EXPR} = '9' THEN -1 ELSE 1 END) * (COALESCE(sl.line_amount, 0) - ${DETAIL_ALLOCATIONS})`;
 
 const TIERS = [1, 2, 3];
 
@@ -132,24 +140,30 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
     db.query(
       `
         SELECT COALESCE(SUM(${SALES_NET_AMOUNT}), 0) AS actual
-        FROM ada.sales_headers
-        WHERE branch_code = $1
-          AND doc_date >= $2::date
-          AND doc_date <= $3::date
+        FROM ada.sales_headers sh
+        JOIN ada.sales_lines sl
+          ON sl.branch_code = sh.branch_code
+         AND sl.doc_no = sh.doc_no
+        WHERE sh.branch_code = $1
+          AND sh.doc_date >= $2::date
+          AND sh.doc_date <= $3::date
           AND ${SALES_NET_SCOPE}
       `,
       [branchCode, monthStart, clampedAsOf],
     ),
     db.query(
       `
-        SELECT doc_date::text AS doc_date, COALESCE(SUM(${SALES_NET_AMOUNT}), 0) AS actual
-        FROM ada.sales_headers
-        WHERE branch_code = $1
-          AND doc_date >= $2::date
-          AND doc_date <= $3::date
+        SELECT sh.doc_date::text AS doc_date, COALESCE(SUM(${SALES_NET_AMOUNT}), 0) AS actual
+        FROM ada.sales_headers sh
+        JOIN ada.sales_lines sl
+          ON sl.branch_code = sh.branch_code
+         AND sl.doc_no = sh.doc_no
+        WHERE sh.branch_code = $1
+          AND sh.doc_date >= $2::date
+          AND sh.doc_date <= $3::date
           AND ${SALES_NET_SCOPE}
-        GROUP BY doc_date
-        ORDER BY doc_date
+        GROUP BY sh.doc_date
+        ORDER BY sh.doc_date
       `,
       [branchCode, monthStart, clampedAsOf],
     ),
