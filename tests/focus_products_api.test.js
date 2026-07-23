@@ -26,6 +26,7 @@ function buildConfig() {
     adminPasswordHash: bcrypt.hashSync("admin-pass-123", 10),
     staffPasswordHash: bcrypt.hashSync("staff-pass-123", 10),
     posApiKeys: new Set(["test-pos-key"]),
+    r2BucketName: "test-line-packages",
   };
 }
 
@@ -61,6 +62,7 @@ function createMockDb() {
         published_by: "admin@example.com",
       }],
     ]),
+    linePackages: new Map(),
   };
 
   const db = {
@@ -177,6 +179,37 @@ function createMockDb() {
         }
         return { rowCount: 0, rows: [] };
       }
+      if (q.startsWith("select * from focus.line_chat_packages where package_key = $1")) {
+        const row = state.linePackages.get(params[0]);
+        return row ? { rowCount: 1, rows: [row] } : { rowCount: 0, rows: [] };
+      }
+      if (q.startsWith("insert into focus.line_chat_packages")) {
+        if (state.linePackages.has(params[0])) {
+          return { rowCount: 0, rows: [] };
+        }
+        const row = {
+          id: state.linePackages.size + 1,
+          package_key: params[0],
+          focus_type: params[1],
+          branch_code: params[2],
+          date_from: params[3],
+          date_to: params[4],
+          ci_count: params[5],
+          message_text: params[6],
+          row_fingerprint: params[7],
+          image_sha256: params[8],
+          bucket_name: params[9],
+          object_key: params[10],
+          mime_type: "image/png",
+          size_bytes: params[11],
+          created_by: params[12],
+          expires_at: params[13],
+          created_at: new Date().toISOString(),
+          upload_state: "ready",
+        };
+        state.linePackages.set(row.package_key, row);
+        return { rowCount: 1, rows: [row] };
+      }
 
       throw new Error(`Unhandled mock query: ${q}`);
     },
@@ -188,14 +221,29 @@ function createMockDb() {
 
 function createTestApp() {
   const db = createMockDb();
+  const storageProvider = {
+    uploaded: [],
+    async putObject(object) {
+      this.uploaded.push(object);
+      return { ETag: "\"test\"" };
+    },
+    async headObject(key) {
+      const uploaded = this.uploaded.find((object) => object.key === key);
+      return { ContentLength: uploaded?.body?.length || 0, ETag: "\"test\"" };
+    },
+    async createSignedGetUrl(key) {
+      return `https://r2.example.test/${encodeURIComponent(key)}`;
+    },
+  };
   const { app } = createApp({
     config: buildConfig(),
     db,
+    r2StorageProvider: storageProvider,
     runImporter: async () => ({}),
     runExcelPriceImporter: async () => ({}),
     runRuleApplication: async () => ({}),
   });
-  return { app, db };
+  return { app, db, storageProvider };
 }
 
 async function loginAs(agent, username = "admin@example.com", password = "admin-pass-123") {
@@ -283,6 +331,41 @@ test("admin CRUD requires admin role and CSRF for writes", async () => {
 
   const afterDelete = await admin.get("/api/focus-products");
   assert.ok(!afterDelete.body.focusProducts.some((r) => r.id === created.body.focusProduct.id));
+});
+
+test("admin can save a LINE package and duplicate saves reuse it", async () => {
+  const { app, storageProvider } = createTestApp();
+  const admin = request.agent(app);
+  const csrf = await loginAs(admin);
+  const payload = {
+    focusType: "pharmacist",
+    branchCode: "003",
+    dateFrom: "2026-07-01",
+    dateTo: "2026-07-23",
+    ciCount: 16,
+    messageText: "รายงานยอดขาย\nสาขา 003",
+    rowFingerprint: JSON.stringify([{ code: "IC-004615", target: 8, sold: 4 }]),
+    imageDataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+  };
+
+  const first = await admin
+    .post("/api/admin/focus-products/line-packages")
+    .set("x-csrf-token", csrf)
+    .send(payload);
+  assert.equal(first.status, 201);
+  assert.equal(first.body.ok, true);
+  assert.equal(first.body.duplicate, false);
+  assert.equal(first.body.linePackage.branchCode, "003");
+  assert.equal(storageProvider.uploaded.length, 1);
+
+  const second = await admin
+    .post("/api/admin/focus-products/line-packages")
+    .set("x-csrf-token", csrf)
+    .send(payload);
+  assert.equal(second.status, 200);
+  assert.equal(second.body.duplicate, true);
+  assert.equal(second.body.linePackage.packageKey, first.body.linePackage.packageKey);
+  assert.equal(storageProvider.uploaded.length, 1);
 });
 
 test("admin can save a draft and publish it when ready", async () => {

@@ -8,6 +8,7 @@ const {
   deactivateFocusProduct,
   createFocusProductsBulk,
 } = require("../services/focusProducts");
+const { saveFocusLineChatPackage } = require("../services/focusLineChatPackages");
 
 function toIntOrNull(value) {
   const n = Number(value);
@@ -36,7 +37,7 @@ function createFocusProductsRouter(deps) {
 
 // Admin-only CRUD.
 function createFocusProductsAdminRouter(deps) {
-  const { db, requireAuthMiddleware, requireRoleMiddleware, requireCsrfMiddleware } = deps;
+  const { db, config, storageProvider, requireAuthMiddleware, requireRoleMiddleware, requireCsrfMiddleware } = deps;
   const router = express.Router();
   const auth = [requireAuthMiddleware, requireRoleMiddleware("admin")];
   const write = [requireAuthMiddleware, requireRoleMiddleware("admin"), requireCsrfMiddleware];
@@ -71,6 +72,26 @@ function createFocusProductsAdminRouter(deps) {
         createdBy: req.auth?.userId || null,
       });
       return res.status(201).json({ ok: true, focusProducts, count: focusProducts.length, request_id: req.requestId || null });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post("/focus-products/line-packages", write, async (req, res, next) => {
+    try {
+      const linePackage = await saveFocusLineChatPackage({
+        db,
+        config,
+        storageProvider,
+        auth: req.auth,
+        body: req.body || {},
+      });
+      return res.status(linePackage.duplicate ? 200 : 201).json({
+        ok: true,
+        linePackage,
+        duplicate: linePackage.duplicate,
+        request_id: req.requestId || null,
+      });
     } catch (error) {
       return next(error);
     }

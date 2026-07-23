@@ -56,6 +56,7 @@ const { createVideoJobRunner } = require("./services/videoJobRunner");
 const { startAssetCleanupSchedule } = require("./services/videoAssetCleanup");
 const { startPreorderAttachmentCleanupSchedule } = require("./services/preorderAttachmentCleanup");
 const { startStockRecommendationSchedule } = require("./services/stockRecommendationSchedule");
+const { startFocusLinePackageCleanupSchedule } = require("./services/focusLineChatPackages");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 
 function appendVaryHeader(res, value) {
@@ -129,8 +130,10 @@ function createApp(overrides = {}) {
   const crmMirrorClient =
     overrides.crmMirrorClient || createCrmMirrorClient(config, overrides.fetchImpl || global.fetch);
   const videoStorageProvider = overrides.videoStorageProvider || getStorageProvider(config);
+  const hasR2Config = Boolean(config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint && config.r2BucketName);
+  const r2StorageProvider = overrides.r2StorageProvider || (hasR2Config ? createR2PreorderStorageProvider(config) : null);
   const preorderStorageProvider = overrides.preorderStorageProvider ||
-    (config.featureCustomerPreorders ? createR2PreorderStorageProvider(config) : null);
+    (config.featureCustomerPreorders ? r2StorageProvider : null);
   const videoJobRunner =
     overrides.videoJobRunner ||
     createVideoJobRunner({
@@ -162,6 +165,7 @@ function createApp(overrides = {}) {
   // instead of raising it app-wide. Body-parser marks the request body as already
   // parsed, so the app-wide express.json() below is a no-op for these requests.
   app.use("/api/sync/ada", express.json({ limit: "10mb" }));
+  app.use("/api/admin/focus-products/line-packages", express.json({ limit: "8mb" }));
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: false, limit: "1mb" }));
   app.use(cookieParser());
@@ -338,6 +342,8 @@ function createApp(overrides = {}) {
     "/api/admin",
     createFocusProductsAdminRouter({
       db,
+      config,
+      storageProvider: r2StorageProvider,
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
@@ -515,6 +521,14 @@ async function startServer() {
     config,
     logger: console,
   });
+  const focusLinePackageCleanupTimer = startFocusLinePackageCleanupSchedule({
+    db,
+    storageProvider: config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint && config.r2BucketName
+      ? createR2PreorderStorageProvider(config)
+      : null,
+    config,
+    logger: console,
+  });
 
   // Nightly ordering.stock_recommendation_snapshots refresh. No-ops unless
   // FEATURE_STOCK_RECOMMENDATION_CRON is set — see stockRecommendationSchedule.js.
@@ -527,6 +541,7 @@ async function startServer() {
   const shutdown = async () => {
     if (assetCleanupTimer) clearInterval(assetCleanupTimer);
     if (preorderAttachmentCleanupTimer) clearInterval(preorderAttachmentCleanupTimer);
+    if (focusLinePackageCleanupTimer) clearInterval(focusLinePackageCleanupTimer);
     if (stockRecommendationCronTask) stockRecommendationCronTask.stop();
     server.close(async () => {
       if (db && typeof db.end === "function") {

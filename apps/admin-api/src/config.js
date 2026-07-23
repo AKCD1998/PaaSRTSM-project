@@ -192,6 +192,7 @@ function loadConfig(env = process.env) {
     r2BucketName: env.R2_BUCKET_NAME || "",
     r2Region: env.R2_REGION || "auto",
     r2SignedUrlTtlSeconds: parseIntWithFallback(env.R2_SIGNED_URL_TTL_SECONDS, 300),
+    focusLinePackageCleanupIntervalMs: parseIntWithFallback(env.FOCUS_LINE_PACKAGE_CLEANUP_INTERVAL_MS, 6 * 60 * 60 * 1000),
     preorderAttachmentCleanupIntervalMs: parseIntWithFallback(env.PREORDER_ATTACHMENT_CLEANUP_INTERVAL_MS, 15 * 60 * 1000),
     preorderPendingUploadMaxAgeMinutes: parseIntWithFallback(env.PREORDER_PENDING_UPLOAD_MAX_AGE_MINUTES, 60),
     featureMobilePda: parseBool(env.FEATURE_MOBILE_PDA, false),

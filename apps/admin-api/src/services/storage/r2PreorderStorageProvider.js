@@ -14,7 +14,18 @@ function createR2PreorderStorageProvider(config, options = {}) {
   const bucket = config.r2BucketName;
   return {
     providerName: "R2", bucket,
-    async putObject({ key, body, contentType, checksumSha256 }) { return client.send(new PutObjectCommand({ Bucket:bucket, Key:key, Body:body, ContentType:contentType, ChecksumSHA256:checksumSha256, CacheControl:"private, no-store" })); },
+    async putObject({ key, body, contentType, checksumSha256, metadata, expiresAt }) {
+      return client.send(new PutObjectCommand({
+        Bucket:bucket,
+        Key:key,
+        Body:body,
+        ContentType:contentType,
+        ChecksumSHA256:checksumSha256,
+        CacheControl:"private, no-store",
+        Metadata:metadata || undefined,
+        Expires:expiresAt ? new Date(expiresAt) : undefined,
+      }));
+    },
     async headObject(key) { return client.send(new HeadObjectCommand({ Bucket:bucket, Key:key })); },
     async deleteObject(key) { return client.send(new DeleteObjectCommand({ Bucket:bucket, Key:key })); },
     async createSignedGetUrl(key) { return (options.signer || getSignedUrl)(client,new GetObjectCommand({ Bucket:bucket, Key:key, ResponseCacheControl:"private, no-store",ResponseContentDisposition:"inline" }),{ expiresIn:config.r2SignedUrlTtlSeconds || 300 }); },
