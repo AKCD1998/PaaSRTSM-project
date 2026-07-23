@@ -41,6 +41,7 @@ function createFocusProductsAdminRouter(deps) {
   const router = express.Router();
   const auth = [requireAuthMiddleware, requireRoleMiddleware("admin")];
   const write = [requireAuthMiddleware, requireRoleMiddleware("admin"), requireCsrfMiddleware];
+  const linePackageWrite = [requireAuthMiddleware, requireCsrfMiddleware];
 
   router.get("/focus-products", auth, async (req, res, next) => {
     try {
@@ -77,7 +78,7 @@ function createFocusProductsAdminRouter(deps) {
     }
   });
 
-  router.post("/focus-products/line-packages", write, async (req, res, next) => {
+  router.post("/focus-products/line-packages", linePackageWrite, async (req, res, next) => {
     try {
       const linePackage = await saveFocusLineChatPackage({
         db,

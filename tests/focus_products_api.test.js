@@ -22,7 +22,7 @@ function buildConfig() {
     loginRateLimitWindowMs: 60_000,
     maxUploadBytes: 5 * 1024 * 1024,
     adminUsers: new Set(["admin@example.com"]),
-    staffUsers: new Set(["staff@example.com"]),
+    staffUsers: new Set(["staff@example.com", "staff003@example.com"]),
     adminPasswordHash: bcrypt.hashSync("admin-pass-123", 10),
     staffPasswordHash: bcrypt.hashSync("staff-pass-123", 10),
     posApiKeys: new Set(["test-pos-key"]),
@@ -91,6 +91,13 @@ function createMockDb() {
       }
       if (q.startsWith("select branch_code from core.branches where is_active = true")) {
         return { rowCount: 3, rows: [{ branch_code: "001" }, { branch_code: "003" }, { branch_code: "005" }] };
+      }
+      if (q.startsWith("select branch_code, branch_name, is_active, is_hq from core.branches where branch_code = $1")) {
+        const branchCode = params[0];
+        return {
+          rowCount: 1,
+          rows: [{ branch_code: branchCode, branch_name: `Branch ${branchCode}`, is_active: true, is_hq: false }],
+        };
       }
       if (q.includes("unnest($1::text[])")) {
         return { rowCount: 1, rows: [{ product_code: params[0][0], product_name: "สาบัญ ทูน่า วิ๊ส" }] };
@@ -365,6 +372,37 @@ test("admin can save a LINE package and duplicate saves reuse it", async () => {
   assert.equal(second.status, 200);
   assert.equal(second.body.duplicate, true);
   assert.equal(second.body.linePackage.packageKey, first.body.linePackage.packageKey);
+  assert.equal(storageProvider.uploaded.length, 1);
+});
+
+test("staff can save LINE packages only for their effective branch", async () => {
+  const { app, storageProvider } = createTestApp();
+  const staff = request.agent(app);
+  const csrf = await loginAs(staff, "staff003@example.com", "staff-pass-123");
+  const payload = {
+    focusType: "group_manager",
+    branchCode: "003",
+    dateFrom: "2026-07-01",
+    dateTo: "2026-07-23",
+    ciCount: 16,
+    messageText: "รายงานยอดขาย\nสาขา 003",
+    rowFingerprint: JSON.stringify({ branchCode: "003", hash: "abc123" }),
+    imageDataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+  };
+
+  const ownBranch = await staff
+    .post("/api/admin/focus-products/line-packages")
+    .set("x-csrf-token", csrf)
+    .send(payload);
+  assert.equal(ownBranch.status, 201);
+  assert.equal(ownBranch.body.linePackage.branchCode, "003");
+  assert.equal(storageProvider.uploaded.length, 1);
+
+  const otherBranch = await staff
+    .post("/api/admin/focus-products/line-packages")
+    .set("x-csrf-token", csrf)
+    .send({ ...payload, branchCode: "001" });
+  assert.equal(otherBranch.status, 403);
   assert.equal(storageProvider.uploaded.length, 1);
 });
 

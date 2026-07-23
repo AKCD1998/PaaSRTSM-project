@@ -92,6 +92,15 @@ async function saveFocusLineChatPackage({ db, config, storageProvider, auth, bod
   const focusType = normalizeText(body?.focusType);
   if (!FOCUS_TYPES.has(focusType)) throw createHttpError("focusType is invalid.", 400);
   const branchCode = normalizeBranchCode(body?.branchCode);
+  if (auth?.role !== "admin") {
+    const effectiveBranchCode = normalizeText(auth?.effectiveBranchCode);
+    if (!effectiveBranchCode) {
+      throw createHttpError("No branch associated with this account.", 403);
+    }
+    if (branchCode !== effectiveBranchCode) {
+      throw createHttpError("Cannot save LINE package for another branch.", 403);
+    }
+  }
   const dateFrom = normalizeDate(body?.dateFrom, "dateFrom");
   const dateTo = normalizeDate(body?.dateTo, "dateTo");
   if (dateTo < dateFrom) throw createHttpError("dateTo must not be before dateFrom.", 400);
