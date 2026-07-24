@@ -29,13 +29,13 @@ test("net amount adds sales and subtracts DocType 9 returns", () => {
 });
 
 // Fake pg pool: routes each query by its SQL text and records the actual-sum SQL.
-function fakeDb({ totalActual, dailyRows }) {
+function fakeDb({ totalActual, dailyRows, targetRows = [] }) {
   const captured = { actualSql: null };
   return {
     captured,
     async query(sql) {
       if (/branch_sales_targets/.test(sql)) {
-        return { rows: [] }; // no targets configured
+        return { rows: targetRows };
       }
       if (/GROUP BY (?:sh\.)?doc_date/.test(sql)) {
         return { rows: dailyRows };
@@ -63,4 +63,52 @@ test("getSalesProgress returns the signed net total and issues the corrected SQL
   assert.match(db.captured.actualSql, /FCSdtDisAvg/);
   assert.match(db.captured.actualSql, /IN \('1', '9'\)/);
   assert.doesNotMatch(db.captured.actualSql, /FTShdStaRefund/);
+});
+
+test("remaining daily average follows Excel and includes the as-of date", async () => {
+  const db = fakeDb({
+    totalActual: 1318741,
+    dailyRows: [],
+    targetRows: [{
+      tier: 1,
+      monthly_target: 1627500,
+      updated_at: null,
+      updated_by: null,
+    }],
+  });
+
+  const result = await getSalesProgress({
+    db,
+    branchCode: "003",
+    month: "2026-07",
+    asOfDate: "2026-07-24",
+  });
+
+  assert.equal(result.daysElapsed, 24);
+  assert.equal(result.daysRemaining, 8); // July 24..31, inclusive
+  assert.equal(result.tiers[0].remainingAmount, 308759);
+  assert.equal(result.tiers[0].remainingAvgPerDay, 38594.875);
+});
+
+test("inclusive remaining-day count works for 28, 29, 30, and 31-day months", async () => {
+  const cases = [
+    { month: "2026-02", asOfDate: "2026-02-01", totalDays: 28, daysRemaining: 28 },
+    { month: "2026-02", asOfDate: "2026-02-28", totalDays: 28, daysRemaining: 1 },
+    { month: "2028-02", asOfDate: "2028-02-29", totalDays: 29, daysRemaining: 1 },
+    { month: "2026-04", asOfDate: "2026-04-30", totalDays: 30, daysRemaining: 1 },
+    { month: "2026-07", asOfDate: "2026-07-31", totalDays: 31, daysRemaining: 1 },
+  ];
+
+  for (const testCase of cases) {
+    const db = fakeDb({ totalActual: 0, dailyRows: [] });
+    // eslint-disable-next-line no-await-in-loop
+    const result = await getSalesProgress({
+      db,
+      branchCode: "003",
+      month: testCase.month,
+      asOfDate: testCase.asOfDate,
+    });
+    assert.equal(result.totalDaysInMonth, testCase.totalDays, testCase.asOfDate);
+    assert.equal(result.daysRemaining, testCase.daysRemaining, testCase.asOfDate);
+  }
 });
