@@ -2063,6 +2063,7 @@ function createAdaSyncRouter(deps) {
       return res.status(400).json({ message: "Payload must include headers and lines arrays." });
     }
     const client = await db.connect();
+    let released = false;
     try {
       await client.query("BEGIN");
       for (const record of req.body.headers) {
@@ -2074,13 +2075,20 @@ function createAdaSyncRouter(deps) {
         await upsertSalesLine(client, req.body, record);
       }
       await client.query("COMMIT");
+      client.release();
+      released = true;
 
       // The primary raw-evidence write above is already committed at this point.
       // The CRM mirror is a best-effort secondary side-effect (loyalty-point
       // bookkeeping on a separate, unrelated backend) — it must never turn an
       // already-successful sync into a reported failure, and it must never
-      // trigger a rollback of a transaction that has already committed. Any
-      // mirror failure (including body-size 413s from the CRM backend) is
+      // trigger a rollback of a transaction that has already committed. Released
+      // the pool connection above, before this call: the mirror is an outbound
+      // HTTP request with no DB work of its own, and during a simultaneous
+      // multi-branch sync burst every extra second a connection sits idle here
+      // is a second the pool (max 10) has one less slot for other branches'
+      // requests — see docs/sync-program/INCIDENT_2026-07-24_MORNING_SYNC_HOURGLASS.md.
+      // Any mirror failure (including body-size 413s from the CRM backend) is
       // logged and swallowed here.
       try {
         const { sales, refunds } = buildMirroredSalesPayload(req.body);
@@ -2104,7 +2112,7 @@ function createAdaSyncRouter(deps) {
       await client.query("ROLLBACK");
       return next(e);
     } finally {
-      client.release();
+      if (!released) client.release();
     }
   });
   router.post("/purchases", async (req, res, next) => {

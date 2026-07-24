@@ -10,6 +10,15 @@ const PRODUCT_MOVEMENT_TYPES = new Set([
 ]);
 const PRODUCT_MOVEMENT_TRACE_LIMIT = 200;
 
+// A full branch sync has taken as long as ~23 minutes under real peak-window
+// contention (see docs/sync-program/STATE.md, 2026-07-15 08:20 window) and CP4's
+// async apply phase adds more wall time on top of that. 60 minutes is comfortably
+// above any run this program has ever observed succeeding, so a run still at
+// status='running' past that point is far more likely interrupted (crash, Render
+// restart) than genuinely in progress. Not user input — safe to interpolate
+// directly into the INTERVAL literal below.
+const STALE_RUN_MINUTES = 60;
+
 function parsePositiveNumber(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
@@ -1577,7 +1586,14 @@ function createOrderingRouter(deps) {
   // Admin UI's "ประวัติ Sync" calendar grid: per branch, per night, what happened.
   // - "success"  - ingest.sync_runs has a success row for that branch/date
   // - "failed"   - ingest.sync_runs has a failed/running row, OR heartbeat exists but no run
-  // - "running"  - ingest.sync_runs has only running rows
+  // - "running"  - ingest.sync_runs has a running row started recently (still plausibly in-flight)
+  // - "stale"    - ingest.sync_runs has a running row started too long ago to still be
+  //                genuinely in progress (STALE_RUN_MINUTES), with no success/failure yet
+  //                that day. Added after the 2026-07-24 incident: a Render restart during
+  //                a peak sync burst left several runs stuck at status='running' forever —
+  //                the grid showed a perpetual hourglass indistinguishable from a run that
+  //                was actually still working. See
+  //                docs/sync-program/INCIDENT_2026-07-24_MORNING_SYNC_HOURGLASS.md.
   // - "offline"  - no heartbeat AND no sync_run for that branch/date (laptop was off)
   // - "pending"  - the date is today and nothing has happened yet
   //
@@ -1605,7 +1621,8 @@ function createOrderingRouter(deps) {
             (started_at AT TIME ZONE 'Asia/Bangkok')::date     AS run_date,
             bool_or(status = 'success')                        AS any_success,
             bool_or(status = 'failed')                         AS any_failed,
-            bool_or(status = 'running')                        AS any_running,
+            bool_or(status = 'running' AND started_at >  now() - INTERVAL '${STALE_RUN_MINUTES} minutes') AS any_running,
+            bool_or(status = 'running' AND started_at <= now() - INTERVAL '${STALE_RUN_MINUTES} minutes') AS any_stale,
             COUNT(*)                                           AS total_runs,
             COALESCE(SUM(records_sent), 0)                     AS total_sent
           FROM ingest.sync_runs
@@ -1661,10 +1678,12 @@ function createOrderingRouter(deps) {
           CASE
             WHEN d.d = CURRENT_DATE AND COALESCE(r.any_success, false) = false
                                      AND COALESCE(r.any_failed,  false) = false
-                                     AND COALESCE(r.any_running, false) = false THEN 'pending'
+                                     AND COALESCE(r.any_running, false) = false
+                                     AND COALESCE(r.any_stale,   false) = false THEN 'pending'
             WHEN COALESCE(r.any_success, false) THEN 'success'
             WHEN COALESCE(r.any_failed,  false) THEN 'failed'
             WHEN COALESCE(r.any_running, false) THEN 'running'
+            WHEN COALESCE(r.any_stale,   false) THEN 'stale'
             WHEN COALESCE(h.hb_count, 0) > 0     THEN 'failed'
             ELSE 'offline'
           END AS status,
@@ -1751,7 +1770,8 @@ function createOrderingRouter(deps) {
             date_trunc('hour', started_at AT TIME ZONE 'Asia/Bangkok') AS hour_slot,
             bool_or(status = 'success')                            AS any_success,
             bool_or(status = 'failed')                             AS any_failed,
-            bool_or(status = 'running')                            AS any_running
+            bool_or(status = 'running' AND started_at >  now() - INTERVAL '${STALE_RUN_MINUTES} minutes') AS any_running,
+            bool_or(status = 'running' AND started_at <= now() - INTERVAL '${STALE_RUN_MINUTES} minutes') AS any_stale
           FROM ingest.sync_runs
           WHERE sync_type LIKE 'adapos_branch_%'
             AND started_at >= NOW() - $1::int * INTERVAL '1 hour'
@@ -1764,10 +1784,12 @@ function createOrderingRouter(deps) {
             WHEN h.hour_slot = date_trunc('hour', NOW() AT TIME ZONE 'Asia/Bangkok')
                  AND COALESCE(r.any_success, false) = false
                  AND COALESCE(r.any_failed,  false) = false
-                 AND COALESCE(r.any_running, false) = false THEN 'pending'
+                 AND COALESCE(r.any_running, false) = false
+                 AND COALESCE(r.any_stale,   false) = false THEN 'pending'
             WHEN COALESCE(r.any_success, false) THEN 'success'
             WHEN COALESCE(r.any_failed,  false) THEN 'failed'
             WHEN COALESCE(r.any_running, false) THEN 'running'
+            WHEN COALESCE(r.any_stale,   false) THEN 'stale'
             ELSE 'offline'
           END AS status,
           COALESCE(
