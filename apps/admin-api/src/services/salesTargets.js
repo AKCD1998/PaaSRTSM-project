@@ -179,7 +179,11 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
   const daysElapsed = Math.floor(
     (new Date(clampedAsOf + "T00:00:00Z") - new Date(monthStart + "T00:00:00Z")) / 86400000,
   ) + 1;
-  const daysRemaining = Math.max(totalDays - daysElapsed, 0);
+  // Business planning follows the source Excel workbook: "remaining days"
+  // includes the as-of date itself. This intentionally overlaps with
+  // daysElapsed, which also includes the as-of date. For example, July 24 is
+  // day 24 of 31 and has 8 planning days remaining (24..31), not 7.
+  const daysRemaining = Math.max(totalDays - daysElapsed + 1, 0);
 
   const tiers = targetsResult.tiers.map((t) => {
     if (t.monthlyTarget == null) {
