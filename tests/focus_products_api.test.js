@@ -182,7 +182,16 @@ function createMockDb() {
           row.frozen_sold_by_branch = JSON.parse(params[1]);
           row.frozen_total_sold = params[2];
           row.frozen_at = new Date().toISOString();
-          return { rowCount: 1, rows: [{ frozen_sold_by_branch: row.frozen_sold_by_branch, frozen_total_sold: row.frozen_total_sold, frozen_at: row.frozen_at }] };
+          row.frozen_sold_by_branch_by_product = params[3] ? JSON.parse(params[3]) : null;
+          return {
+            rowCount: 1,
+            rows: [{
+              frozen_sold_by_branch: row.frozen_sold_by_branch,
+              frozen_total_sold: row.frozen_total_sold,
+              frozen_at: row.frozen_at,
+              frozen_sold_by_branch_by_product: row.frozen_sold_by_branch_by_product,
+            }],
+          };
         }
         return { rowCount: 0, rows: [] };
       }
@@ -606,6 +615,10 @@ test("a focus row spanning several product codes counts their sales together", a
   assert.equal(row.achieved, true);
   assert.deepEqual(row.productCodes, ["IC-004754", "IC-004755"]);
   assert.deepEqual(row.products.map((p) => p.productCode), ["IC-004754", "IC-004755"]);
+  // Each product in the group keeps its own per-branch sold qty, so the UI can
+  // show which code contributed how much toward the shared target.
+  assert.deepEqual(row.products[0].soldByBranch, { "001": 10, "003": 5 });
+  assert.deepEqual(row.products[1].soldByBranch, { "001": 10, "003": 5 });
 });
 
 test("a row with no product_codes array falls back to the legacy single code", async () => {

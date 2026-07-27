@@ -305,15 +305,26 @@ function computeStatus(focusType, targetQty, soldByBranch, branchCodes, branchTa
 // and lock it — protects the historical/HR record from being silently
 // rewritten by late-arriving AdaPOS corrections (voids/refunds synced after
 // month-end). Uses a conditional UPDATE so concurrent reads can't double-write.
-async function freezeFocusProduct(db, id, soldByBranch, totalSold) {
+async function freezeFocusProduct(db, id, soldByBranch, totalSold, soldByBranchByProduct) {
   const result = await db.query(
     `UPDATE focus.focus_products
-     SET frozen_sold_by_branch = $2::jsonb, frozen_total_sold = $3, frozen_at = now()
+     SET frozen_sold_by_branch = $2::jsonb, frozen_total_sold = $3, frozen_at = now(),
+         frozen_sold_by_branch_by_product = $4::jsonb
      WHERE id = $1 AND frozen_at IS NULL
-     RETURNING frozen_sold_by_branch, frozen_total_sold, frozen_at`,
-    [id, JSON.stringify(soldByBranch), totalSold],
+     RETURNING frozen_sold_by_branch, frozen_total_sold, frozen_at, frozen_sold_by_branch_by_product`,
+    [id, JSON.stringify(soldByBranch), totalSold, JSON.stringify(soldByBranchByProduct)],
   );
   return result.rows[0] || null;
+}
+
+// Per-product view of a code map for one focus row — {productCode: {branchCode: qty}} —
+// so the UI can show each product's own contribution toward a shared target.
+function soldByBranchByProductForRow(codeMap, productCodes) {
+  const result = {};
+  for (const code of productCodes) {
+    result[code] = (codeMap && codeMap.get(code)) || {};
+  }
+  return result;
 }
 
 async function attachProgress(db, focusRows, allActiveBranchCodes, timings = null) {
@@ -349,21 +360,28 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
   const results = [];
   for (const row of focusRows) {
     const branchCodes = normalizeBranchCodes(row.branch_codes) || allActiveBranchCodes;
+    const productCodesForRow = rowProductCodes(row);
     let soldByBranch;
+    let soldByBranchByProduct;
     let isFrozen = false;
     let frozenAt = row.frozen_at || null;
 
     if (row.frozen_at) {
       soldByBranch = row.frozen_sold_by_branch || {};
+      // Rows frozen before migration 064 never captured per-product detail.
+      soldByBranchByProduct = row.frozen_sold_by_branch_by_product || null;
       isFrozen = true;
     } else {
       const key = `${toIsoDateOnly(row.date_from)}|${toIsoDateOnly(row.date_to)}`;
-      soldByBranch = sumSoldAcrossCodes(batchByRange.get(key), rowProductCodes(row));
+      const codeMap = batchByRange.get(key);
+      soldByBranch = sumSoldAcrossCodes(codeMap, productCodesForRow);
+      soldByBranchByProduct = soldByBranchByProductForRow(codeMap, productCodesForRow);
       if (toIsoDateOnly(row.date_to) < today) {
         const totalSold = Object.values(soldByBranch).reduce((sum, v) => sum + v, 0);
-        const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold);
+        const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold, soldByBranchByProduct);
         if (frozen) {
           soldByBranch = frozen.frozen_sold_by_branch || soldByBranch;
+          soldByBranchByProduct = frozen.frozen_sold_by_branch_by_product || soldByBranchByProduct;
           frozenAt = frozen.frozen_at;
         }
         isFrozen = true;
@@ -375,10 +393,13 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
     results.push({
       ...mapFocusProductRow(row),
       productName: nameMap.get(row.product_code) || null,
-      // Every code in the group, so the UI can list each product sharing the target.
-      products: rowProductCodes(row).map((code) => ({
+      // Every code in the group, so the UI can list each product sharing the
+      // target, plus each product's own per-branch sold qty (soldByBranch is
+      // the pre-summed group total; this is that breakdown, one entry per code).
+      products: productCodesForRow.map((code) => ({
         productCode: code,
         productName: nameMap.get(code) || null,
+        soldByBranch: soldByBranchByProduct?.[code] || null,
       })),
       branchCodes,
       soldByBranch,
