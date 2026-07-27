@@ -468,7 +468,7 @@ function createBranchStaffRouter(deps) {
         }
         const result = await db.query(
           `
-            SELECT staff_id, branch_code, display_name, role, is_active, is_probationary, note
+            SELECT staff_id, branch_code, display_name, role, is_active, is_probationary, note, hire_date
             FROM core.branch_staff
             ${where}
             ORDER BY branch_code ASC, display_name ASC
@@ -484,6 +484,7 @@ function createBranchStaffRouter(deps) {
             isActive: row.is_active,
             isProbationary: row.is_probationary,
             note: row.note,
+            hireDate: row.hire_date ? String(row.hire_date).slice(0, 10) : null,
           })),
         });
       } catch (error) {
@@ -503,6 +504,10 @@ function createBranchStaffRouter(deps) {
       const role = String(req.body?.role || "sales").trim();
       const isProbationary = Boolean(req.body?.isProbationary);
       const note = req.body?.note ? String(req.body.note).trim().slice(0, 255) : null;
+      const hireDateRaw = req.body?.hireDate ? String(req.body.hireDate).trim() : null;
+      if (hireDateRaw && !/^\d{4}-\d{2}-\d{2}$/.test(hireDateRaw)) {
+        return res.status(400).json({ error: "hireDate must be YYYY-MM-DD", request_id: req.requestId });
+      }
 
       if (!/^\d{3}$/.test(branchCode)) {
         return res.status(400).json({ error: "Invalid branchCode", request_id: req.requestId });
@@ -517,11 +522,11 @@ function createBranchStaffRouter(deps) {
       try {
         const result = await db.query(
           `
-            INSERT INTO core.branch_staff (branch_code, display_name, role, is_probationary, note)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING staff_id, branch_code, display_name, role, is_active, is_probationary, note
+            INSERT INTO core.branch_staff (branch_code, display_name, role, is_probationary, note, hire_date)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING staff_id, branch_code, display_name, role, is_active, is_probationary, note, hire_date
           `,
-          [branchCode, displayName, role, isProbationary, note],
+          [branchCode, displayName, role, isProbationary, note, hireDateRaw],
         );
         const row = result.rows[0];
 
@@ -545,6 +550,7 @@ function createBranchStaffRouter(deps) {
             isActive: row.is_active,
             isProbationary: row.is_probationary,
             note: row.note || null,
+            hireDate: row.hire_date ? String(row.hire_date).slice(0, 10) : null,
           },
         });
       } catch (error) {
@@ -598,6 +604,15 @@ function createBranchStaffRouter(deps) {
         params.push(Boolean(req.body.isProbationary));
         idx += 1;
       }
+      if (req.body?.hireDate !== undefined) {
+        const hireDateRaw = req.body.hireDate ? String(req.body.hireDate).trim() : null;
+        if (hireDateRaw && !/^\d{4}-\d{2}-\d{2}$/.test(hireDateRaw)) {
+          return res.status(400).json({ error: "hireDate must be YYYY-MM-DD", request_id: req.requestId });
+        }
+        sets.push(`hire_date = $${idx}`);
+        params.push(hireDateRaw);
+        idx += 1;
+      }
 
       if (sets.length === 0) {
         return res.status(400).json({ error: "No updatable fields provided", request_id: req.requestId });
@@ -610,7 +625,7 @@ function createBranchStaffRouter(deps) {
             UPDATE core.branch_staff
             SET ${sets.join(", ")}, updated_at = now()
             WHERE staff_id = $${idx}
-            RETURNING staff_id, branch_code, display_name, role, is_active, is_probationary
+            RETURNING staff_id, branch_code, display_name, role, is_active, is_probationary, hire_date
           `,
           params,
         );
@@ -637,6 +652,7 @@ function createBranchStaffRouter(deps) {
             role: row.role,
             isActive: row.is_active,
             isProbationary: row.is_probationary,
+            hireDate: row.hire_date ? String(row.hire_date).slice(0, 10) : null,
           },
         });
       } catch (error) {
