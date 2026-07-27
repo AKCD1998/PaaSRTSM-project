@@ -123,11 +123,11 @@ function createFetchMock() {
       }
 
       if (prefer === "count=exact" && rangeHeader === "0-0") {
-        const encounterFilterValues = parsed.searchParams.getAll("encounter_at");
-        if (encounterFilterValues.some((value) => String(value).includes("2026-06-25"))) {
-          return createJsonResponse(200, [], { "content-range": "0-0/5" });
-        }
-        return createJsonResponse(200, [], { "content-range": "0-0/18" });
+        // The KPIs route builds this query off the real wall-clock date
+        // (bangkokNow()), so matching on a hardcoded date string here breaks
+        // the moment real time moves past it — return a fixed count
+        // regardless of which day "today" actually is.
+        return createJsonResponse(200, [], { "content-range": "0-0/5" });
       }
 
       return createJsonResponse(200, [buildEncounterRow()], {

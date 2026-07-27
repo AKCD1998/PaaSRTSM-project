@@ -173,6 +173,7 @@ function mapFocusProductRow(row) {
     branchTargets: row.branch_targets || null, // per-branch target overrides (group_manager only)
     assignedPersonName: row.assigned_person_name || null,
     assignedStaffId: row.assigned_staff_id == null ? null : String(row.assigned_staff_id),
+    assignedStaffHireDate: toIsoDateOnly(row.assigned_staff_hire_date) || null,
     note: row.note,
     isActive: row.is_active,
     createdBy: row.created_by,
@@ -419,12 +420,17 @@ async function listFocusProducts(db, { includeInactive = false, debug = false } 
 
   let t = Date.now();
   const sql = includeInactive
-    ? `SELECT * FROM focus.focus_products ORDER BY created_at DESC`
-    : `SELECT * FROM focus.focus_products
-       WHERE is_active = TRUE
-         AND (publication_status = 'published'
-           OR (publication_status = 'scheduled' AND scheduled_publish_at <= now()))
-       ORDER BY created_at DESC`;
+    ? `SELECT fp.*, bs.hire_date AS assigned_staff_hire_date
+       FROM focus.focus_products fp
+       LEFT JOIN core.branch_staff bs ON bs.staff_id = fp.assigned_staff_id
+       ORDER BY fp.created_at DESC`
+    : `SELECT fp.*, bs.hire_date AS assigned_staff_hire_date
+       FROM focus.focus_products fp
+       LEFT JOIN core.branch_staff bs ON bs.staff_id = fp.assigned_staff_id
+       WHERE fp.is_active = TRUE
+         AND (fp.publication_status = 'published'
+           OR (fp.publication_status = 'scheduled' AND fp.scheduled_publish_at <= now()))
+       ORDER BY fp.created_at DESC`;
   const result = await db.query(sql);
   mark("select focus_products", t);
 

@@ -129,7 +129,11 @@ function createMockDb() {
         };
       }
 
-      if (normalizedSql.includes("with sales as")) {
+      // Two different queries both start "WITH sales AS (" — this one is
+      // queryTopSellers (enrichment.js); queryStockDayBase also opens with a
+      // "sales" CTE now (2026-07-15 rewrite) but never aggregates total_qty,
+      // so match on that instead of the shared CTE name.
+      if (normalizedSql.includes("with sales as") && normalizedSql.includes("as total_qty")) {
         return {
           rowCount: 1,
           rows: [
@@ -212,7 +216,11 @@ function createMockDb() {
         };
       }
 
-      if (normalizedSql.includes("with latest_stock as")) {
+      // queryStockDayBase's CTE was renamed from "latest_stock" to "sales" +
+      // "purchases" (and the stock join moved to analytics.product_current_stock)
+      // by the 2026-07-15 stock-day concurrency fix — match on the join that
+      // survived that rewrite rather than a CTE name that didn't.
+      if (normalizedSql.includes("left join analytics.product_current_stock")) {
         return {
           rowCount: 1,
           rows: [

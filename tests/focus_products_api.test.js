@@ -48,6 +48,7 @@ function createMockDb() {
         branch_codes: null,
         branch_targets: null,
         assigned_person_name: "กนกวรา มันทะเสน",
+        assigned_staff_id: 13,
         note: "โปรโมชั่นเดือนกรกฎาคม",
         is_active: true,
         created_by: "admin@example.com",
@@ -73,17 +74,20 @@ function createMockDb() {
     async query(sql, params = []) {
       const q = normalizeSql(sql);
 
-      if (q.startsWith("select * from focus.focus_products where is_active = true")) {
+      if (q.startsWith("select fp.*, bs.hire_date as assigned_staff_hire_date from focus.focus_products fp left join core.branch_staff bs")
+        && q.includes("where fp.is_active = true")) {
         const now = Date.now();
         const rows = [...state.rows.values()].filter((r) => r.is_active && (
           (r.publication_status || "published") === "published"
           || ((r.publication_status || "published") === "scheduled"
             && new Date(r.scheduled_publish_at).getTime() <= now)
-        ));
+        )).map((row) => ({ ...row, assigned_staff_hire_date: "2020-01-01" }));
         return { rowCount: rows.length, rows };
       }
-      if (q.startsWith("select * from focus.focus_products order by created_at desc")) {
-        return { rowCount: state.rows.size, rows: [...state.rows.values()] };
+      if (q.startsWith("select fp.*, bs.hire_date as assigned_staff_hire_date from focus.focus_products fp left join core.branch_staff bs")
+        && q.includes("order by fp.created_at desc")) {
+        const rows = [...state.rows.values()].map((row) => ({ ...row, assigned_staff_hire_date: "2020-01-01" }));
+        return { rowCount: rows.length, rows };
       }
       if (q.startsWith("select * from focus.focus_products where id = $1")) {
         const row = state.rows.get(Number(params[0]));
@@ -280,6 +284,7 @@ test("GET /api/focus-products requires auth but no specific role", async () => {
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, true);
   assert.equal(res.body.focusProducts.length, 1);
+  assert.equal(res.body.focusProducts[0].assignedStaffHireDate, "2020-01-01");
 });
 
 test("staff sees computed progress for every focus type", async () => {
