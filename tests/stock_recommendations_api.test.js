@@ -349,6 +349,48 @@ test("admin recommendation summary can query all branches", async () => {
   assert.equal(typeof response.body.company.currentInventoryValue, "number");
 });
 
+test("by-product pivot groups the live-computed rows into one row per product with nested branches", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+
+  await loginAs(agent, {
+    username: "admin@example.com",
+    password: "admin-pass-123",
+  });
+
+  const response = await agent.get("/api/admin/stock-recommendations/by-product?branchCode=all&sort=product_code_asc");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.meta.source, "live");
+  assert.deepEqual(response.body.rows.map((row) => row.productCode), ["P1", "P2", "P3"]);
+
+  // P1 has real sales at both branch 001 and 003, so it pivots into a row
+  // carrying both branches' recommendations, not just the flattened
+  // per-branch rows the plain list endpoint returns.
+  const p1 = response.body.rows.find((row) => row.productCode === "P1");
+  const p1BranchCodes = p1.branches.map((branch) => branch.branchCode).sort();
+  assert.deepEqual(p1BranchCodes, ["001", "003"]);
+  const p1Branch001 = p1.branches.find((branch) => branch.branchCode === "001");
+  assert.equal(p1Branch001.action, "TRANSFER_IN");
+  assert.equal(p1.totalCurrentStock, 10 + 100);
+});
+
+test("by-product action filter only returns products where some branch matches, and pagination totals distinct products", async () => {
+  const { app } = createTestApp();
+  const agent = request.agent(app);
+
+  await loginAs(agent, {
+    username: "admin@example.com",
+    password: "admin-pass-123",
+  });
+
+  const response = await agent.get("/api/admin/stock-recommendations/by-product?branchCode=all&action=TRANSFER_IN");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.rows.length, 1);
+  assert.equal(response.body.rows[0].productCode, "P1");
+  assert.equal(response.body.pagination.total, 1);
+});
+
 test("recommendation detail returns the computed row for one branch/product", async () => {
   const { app } = createTestApp();
   const agent = request.agent(app);

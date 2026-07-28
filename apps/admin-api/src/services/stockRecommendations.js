@@ -1205,6 +1205,246 @@ async function listPrecomputedStockRecommendations(db, dataset) {
   };
 }
 
+function buildProductPivotOrderBy(sort) {
+  switch (sort) {
+    case "days_cover_asc":
+      return "agg_days_cover ASC NULLS LAST, product_code ASC";
+    case "inventory_value_desc":
+      return "agg_inventory_value DESC NULLS LAST, product_code ASC";
+    case "product_code_asc":
+      return "product_code ASC";
+    case "priority_desc":
+    default:
+      return "agg_priority_score DESC NULLS LAST, product_code ASC";
+  }
+}
+
+// One row per product with every branch's recommendation nested underneath,
+// instead of one row per (branch, product) — for the branch-stock-style
+// comparison view where a product's per-branch quantities sit side by side.
+// The per-branch detail (donors, reason, etc.) is already fully computed and
+// stored on the snapshot table, so this is a cheap GROUP BY + jsonb_agg over
+// the same small precomputed table the flattened list endpoint already reads.
+async function listPrecomputedStockRecommendationsByProduct(db, dataset) {
+  const { scope, filters, anchorDate, policy } = dataset;
+  const search = normalizeText(filters.search || "");
+  const action = filters.action || null;
+  const orderBy = buildProductPivotOrderBy(filters.sort);
+
+  const countResult = await db.query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM (
+        SELECT product_code
+        FROM ordering.stock_recommendation_snapshots
+        WHERE branch_code = ANY($1::text[])
+          AND target_days = $2
+          AND anchor_date = $3::date
+          AND ($4::text = ''
+            OR product_code ILIKE '%' || $4 || '%'
+            OR COALESCE(product_name_thai, product_name_eng, '') ILIKE '%' || $4 || '%'
+            OR COALESCE(barcode, '') ILIKE '%' || $4 || '%')
+        GROUP BY product_code
+        HAVING ($5::text IS NULL OR bool_or(action = $5))
+      ) sub
+    `,
+    [scope.branchCodes, policy.targetDays, anchorDate, search, action],
+  );
+
+  const rowsResult = await db.query(
+    `
+      SELECT
+        product_code,
+        MAX(product_name_thai) AS product_name_thai,
+        MAX(product_name_eng) AS product_name_eng,
+        MAX(barcode) AS barcode,
+        MAX(unit) AS unit,
+        SUM(current_stock) AS total_current_stock,
+        MAX(priority_score) AS agg_priority_score,
+        MIN(effective_days_cover) AS agg_days_cover,
+        SUM(inventory_value) AS agg_inventory_value,
+        jsonb_agg(
+          jsonb_build_object(
+            'branchCode', branch_code,
+            'branchLabel', branch_label,
+            'currentStock', current_stock,
+            'targetQty', target_qty,
+            'effectiveStock', effective_stock,
+            'currentDaysCover', current_days_cover,
+            'effectiveDaysCover', effective_days_cover,
+            'action', action,
+            'reason', recommendation_reason,
+            'transferPlanQty', transfer_plan_qty,
+            'purchaseQty', purchase_qty,
+            'donors', donors_json,
+            'primarySuggestedDonorBranchCode', primary_suggested_donor_branch_code,
+            'incomingPoQtyTotal', incoming_po_qty_total,
+            'incomingPoAllocationQty', incoming_po_allocation_qty,
+            'soldQty30d', sold_qty_30d,
+            'soldQty90d', sold_qty_90d,
+            'priorityScore', priority_score
+          ) ORDER BY branch_code
+        ) AS branches
+      FROM ordering.stock_recommendation_snapshots
+      WHERE branch_code = ANY($1::text[])
+        AND target_days = $2
+        AND anchor_date = $3::date
+        AND ($4::text = ''
+          OR product_code ILIKE '%' || $4 || '%'
+          OR COALESCE(product_name_thai, product_name_eng, '') ILIKE '%' || $4 || '%'
+          OR COALESCE(barcode, '') ILIKE '%' || $4 || '%')
+      GROUP BY product_code
+      HAVING ($5::text IS NULL OR bool_or(action = $5))
+      ORDER BY ${orderBy}
+      LIMIT $6 OFFSET $7
+    `,
+    [scope.branchCodes, policy.targetDays, anchorDate, search, action, filters.pageSize, filters.offset],
+  );
+
+  return {
+    rows: rowsResult.rows.map(mapProductPivotRow),
+    total: Number(countResult.rows[0]?.total || 0),
+  };
+}
+
+function mapProductPivotRow(row) {
+  return {
+    productCode: row.product_code,
+    productNameThai: row.product_name_thai || row.product_code,
+    productNameEng: row.product_name_eng || row.product_code,
+    barcode: row.barcode || null,
+    unit: row.unit || null,
+    totalCurrentStock: numberOrZero(row.total_current_stock),
+    aggPriorityScore: numberOrZero(row.agg_priority_score),
+    aggDaysCover: numberOrNull(row.agg_days_cover),
+    aggInventoryValue: numberOrZero(row.agg_inventory_value),
+    branches: Array.isArray(row.branches) ? row.branches : [],
+  };
+}
+
+// Same pivot as listPrecomputedStockRecommendationsByProduct, but from the
+// already-flattened live-computed rows (rare path: only hit when no snapshot
+// exists yet for today's anchor date) — groups by productCode in JS instead
+// of SQL since the data's already in memory.
+function pivotRowsByProduct(rows) {
+  const byProduct = new Map();
+  for (const row of rows) {
+    let product = byProduct.get(row.productCode);
+    if (!product) {
+      product = {
+        productCode: row.productCode,
+        productNameThai: row.productNameThai,
+        productNameEng: row.productNameEng,
+        barcode: row.barcode,
+        unit: row.unit,
+        totalCurrentStock: 0,
+        aggPriorityScore: 0,
+        aggDaysCover: null,
+        aggInventoryValue: 0,
+        branches: [],
+      };
+      byProduct.set(row.productCode, product);
+    }
+    product.totalCurrentStock += numberOrZero(row.currentStock);
+    product.aggInventoryValue += numberOrZero(row.inventoryValue);
+    product.aggPriorityScore = Math.max(product.aggPriorityScore, numberOrZero(row.priorityScore));
+    if (row.effectiveDaysCover != null) {
+      product.aggDaysCover = product.aggDaysCover == null
+        ? row.effectiveDaysCover
+        : Math.min(product.aggDaysCover, row.effectiveDaysCover);
+    }
+    product.branches.push({
+      branchCode: row.branchCode,
+      branchLabel: row.branchLabel,
+      currentStock: row.currentStock,
+      targetQty: row.targetQty,
+      effectiveStock: row.effectiveStock,
+      currentDaysCover: row.currentDaysCover,
+      effectiveDaysCover: row.effectiveDaysCover,
+      action: row.action,
+      reason: row.reason,
+      transferPlanQty: row.transferPlanQty,
+      purchaseQty: row.purchaseQty,
+      donors: row.donors,
+      primarySuggestedDonorBranchCode: row.primarySuggestedDonorBranchCode,
+      incomingPoQtyTotal: row.incomingPoQtyTotal,
+      incomingPoAllocationQty: row.incomingPoAllocationQty,
+      soldQty30d: row.soldQty30d,
+      soldQty90d: row.soldQty90d,
+      priorityScore: row.priorityScore,
+    });
+  }
+  return [...byProduct.values()];
+}
+
+function applyProductActionFilter(products, action) {
+  if (!action) return products;
+  return products.filter((product) => product.branches.some((branch) => branch.action === action));
+}
+
+function sortProductRows(products, sort) {
+  const sorted = [...products];
+  switch (sort) {
+    case "days_cover_asc":
+      sorted.sort((a, b) => {
+        const aVal = a.aggDaysCover == null ? Number.POSITIVE_INFINITY : a.aggDaysCover;
+        const bVal = b.aggDaysCover == null ? Number.POSITIVE_INFINITY : b.aggDaysCover;
+        return aVal - bVal || a.productCode.localeCompare(b.productCode);
+      });
+      break;
+    case "inventory_value_desc":
+      sorted.sort((a, b) => b.aggInventoryValue - a.aggInventoryValue || a.productCode.localeCompare(b.productCode));
+      break;
+    case "product_code_asc":
+      sorted.sort((a, b) => a.productCode.localeCompare(b.productCode));
+      break;
+    case "priority_desc":
+    default:
+      sorted.sort((a, b) => b.aggPriorityScore - a.aggPriorityScore || a.productCode.localeCompare(b.productCode));
+      break;
+  }
+  return sorted;
+}
+
+async function listStockRecommendationsByProduct({ db, auth, filters = {} }) {
+  const dataset = await computeRecommendationDataset(db, auth, filters);
+  let pagedRows;
+  let total;
+
+  if (dataset.source === "precomputed") {
+    const precomputed = await listPrecomputedStockRecommendationsByProduct(db, dataset);
+    pagedRows = precomputed.rows;
+    total = precomputed.total;
+  } else {
+    const pivoted = sortProductRows(
+      applyProductActionFilter(pivotRowsByProduct(dataset.rows), dataset.filters.action),
+      dataset.filters.sort,
+    );
+    pagedRows = pivoted.slice(dataset.filters.offset, dataset.filters.offset + dataset.filters.pageSize);
+    total = pivoted.length;
+  }
+
+  return {
+    branchCode: dataset.scope.branchCode,
+    targetDays: dataset.policy.targetDays,
+    generatedAt: dataset.snapshotMeta?.generatedAt || new Date().toISOString(),
+    policy: dataset.policy,
+    pagination: {
+      page: dataset.filters.page,
+      pageSize: dataset.filters.pageSize,
+      total,
+    },
+    rows: pagedRows,
+    meta: {
+      isAllBranches: dataset.scope.isAllBranches,
+      activeBranchCodes: dataset.scope.activeBranchCodes,
+      branchCodesInScope: dataset.scope.branchCodes,
+      anchorDate: dataset.anchorDate,
+      source: dataset.source,
+    },
+  };
+}
+
 async function loadPrecomputedBranchSummaries(db, dataset) {
   const { scope, anchorDate, policy } = dataset;
   const branchResult = await db.query(
@@ -1677,6 +1917,7 @@ async function refreshStockRecommendationSnapshots(db, options = {}) {
 
 module.exports = {
   listStockRecommendations,
+  listStockRecommendationsByProduct,
   getStockRecommendationSummary,
   getStockRecommendationDetail,
   refreshStockRecommendationSnapshots,
