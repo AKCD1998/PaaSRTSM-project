@@ -3,6 +3,7 @@
 const express = require("express");
 const crypto = require("node:crypto");
 const { branchStockValueKeys, firstDefined } = require("../sync-v2-contract");
+const { acquireIngestionDbClient } = require("../utils/db-acquire");
 
 // Legacy-compatible simplified sync endpoints.
 // Keep these working during the transition to /api/sync/ada/*.
@@ -505,7 +506,8 @@ function createSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync:/products");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       // upsertProductBatch() sorts internally (stable order, same rationale
@@ -533,7 +535,8 @@ function createSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync:/sales-summary");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of records) {
@@ -585,7 +588,8 @@ function createSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync:/purchase-summary");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of records) {
@@ -807,7 +811,8 @@ function createSyncRouter(deps) {
   // POST /api/sync/v2/batches. Batches remain staged until an exact manifest
   // is finalized; workers can never observe a partial handoff.
   router.post("/v2/batches", async (req, res, next) => {
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync:/v2/batches");
+    if (!client) return;
     try {
       const syncRunId = normalizeText(req.body?.syncRunId);
       const dataset = normalizeText(req.body?.dataset).toLowerCase();
@@ -881,7 +886,8 @@ function createSyncRouter(deps) {
   });
 
   router.post("/v2/runs/:syncRunId/finalize", async (req, res, next) => {
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync:/v2/runs/:syncRunId/finalize");
+    if (!client) return;
     try {
       const syncRunId = normalizeText(req.params.syncRunId);
       const dataset = normalizeText(req.body?.dataset).toLowerCase();

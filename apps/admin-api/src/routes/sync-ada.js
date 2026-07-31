@@ -1,6 +1,7 @@
 "use strict";
 
 const express = require("express");
+const { acquireIngestionDbClient } = require("../utils/db-acquire");
 
 function normalizeText(value) {
   return String(value == null ? "" : value).trim();
@@ -1940,7 +1941,8 @@ function createAdaSyncRouter(deps) {
       if (error) {
         return res.status(400).json({ message: error });
       }
-      const client = await db.connect();
+      const client = await acquireIngestionDbClient(db, res, "sync-ada:records-handler");
+      if (!client) return;
       try {
         await client.query("BEGIN");
         for (const record of records) {
@@ -1963,7 +1965,8 @@ function createAdaSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/branches");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of records) {
@@ -1993,7 +1996,8 @@ function createAdaSyncRouter(deps) {
       return res.status(400).json({ message: error });
     }
 
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/prices/defaults");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       const result = await ingestProductPriceDefaults(client, req.body || {}, records, { snapshotId, isFinal });
@@ -2030,7 +2034,8 @@ function createAdaSyncRouter(deps) {
       return res.status(400).json({ message: error });
     }
 
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/prices/branch-overrides");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       const result = await ingestProductBranchPriceOverrides(client, req.body || {}, branchCode, records, {
@@ -2062,7 +2067,8 @@ function createAdaSyncRouter(deps) {
     if (!req.body || !Array.isArray(req.body.headers) || !Array.isArray(req.body.lines)) {
       return res.status(400).json({ message: "Payload must include headers and lines arrays." });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/sales");
+    if (!client) return;
     let released = false;
     try {
       await client.query("BEGIN");
@@ -2119,7 +2125,8 @@ function createAdaSyncRouter(deps) {
     if (!req.body || !Array.isArray(req.body.headers) || !Array.isArray(req.body.lines)) {
       return res.status(400).json({ message: "Payload must include headers and lines arrays." });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/purchases");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of req.body.headers) {
@@ -2144,7 +2151,8 @@ function createAdaSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/pending-receipts");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       const result = await replacePendingReceipts(client, req.body, headers, lines);
@@ -2166,7 +2174,8 @@ function createAdaSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/approved-receipts");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of records) {
@@ -2186,7 +2195,8 @@ function createAdaSyncRouter(deps) {
     if (!req.body || !Array.isArray(req.body.headers) || !Array.isArray(req.body.lines)) {
       return res.status(400).json({ message: "Payload must include headers and lines arrays." });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/stock-adjustments");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of req.body.headers) {
@@ -2212,7 +2222,8 @@ function createAdaSyncRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/transfers");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of headers) {

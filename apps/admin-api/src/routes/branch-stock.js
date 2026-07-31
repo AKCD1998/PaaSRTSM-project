@@ -6,6 +6,7 @@ const path = require("node:path");
 const XLSX = require("xlsx");
 const { auditLog } = require("../audit");
 const { auditBase } = require("../utils/audit-payload");
+const { acquireIngestionDbClient } = require("../utils/db-acquire");
 
 const docsDir = path.resolve(__dirname, "../../../../docs");
 const BRANCH_EXPORT_CONFIG = {
@@ -1182,7 +1183,8 @@ function createBranchStockRouter(deps) {
       return res.status(400).json({ message: error });
     }
 
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "branch-stock:/branch-stock/sync");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of records) {
@@ -1220,7 +1222,8 @@ function createBranchStockRouter(deps) {
       return res.status(400).json({ message: error });
     }
 
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "branch-stock:/sync/ada/branch-stock");
+    if (!client) return;
     try {
       await client.query("BEGIN");
       for (const record of records) {
@@ -1258,7 +1261,8 @@ function createBranchStockRouter(deps) {
       return res.status(400).json({ message: parsed.error });
     }
 
-    const client = await db.connect();
+    const client = await acquireIngestionDbClient(db, res, "branch-stock:/branch-stock/upload");
+    if (!client) return;
     try {
       await client.query("BEGIN");
 
@@ -1953,7 +1957,8 @@ function createBranchStockRouter(deps) {
         const safeRows = candidateRows.filter((row) => row.safeToApply);
         const skippedRows = candidateRows.filter((row) => !row.safeToApply);
 
-        const client = await db.connect();
+        const client = await acquireIngestionDbClient(db, res, "branch-stock:/admin/taxonomy-match-apply");
+        if (!client) return;
         try {
           await client.query("BEGIN");
           for (const row of safeRows) {
