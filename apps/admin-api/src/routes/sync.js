@@ -3,6 +3,9 @@
 const express = require("express");
 const crypto = require("node:crypto");
 const { branchStockValueKeys, firstDefined } = require("../sync-v2-contract");
+const {
+  BRANCH_STOCK_RECONCILIATION_VERSION,
+} = require("../services/branchStockReconciliation");
 const { acquireIngestionDbClient } = require("../utils/db-acquire");
 
 // Legacy-compatible simplified sync endpoints.
@@ -34,6 +37,31 @@ function canonicalize(value) {
 
 function hashCanonical(value) {
   return crypto.createHash("sha256").update(canonicalize(value)).digest("hex");
+}
+
+function validateReconciliationManifest(value, recordCount) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "A branch-stock reconciliation manifest is required.";
+  }
+  if (value.version !== BRANCH_STOCK_RECONCILIATION_VERSION ||
+      value.quantityScale !== 4 ||
+      value.digestAlgorithm !== "sha256" ||
+      !/^[a-f0-9]{64}$/.test(String(value.digest || ""))) {
+    return "Unsupported branch-stock reconciliation contract.";
+  }
+  const integerFields = [
+    "recordCount", "uniqueProductCount", "duplicateProductCount", "negativeQuantityCount",
+  ];
+  if (integerFields.some((field) => !Number.isInteger(value[field]) || value[field] < 0) ||
+      value.recordCount !== recordCount ||
+      value.uniqueProductCount + value.duplicateProductCount !== value.recordCount ||
+      !/^-?\d+$/.test(String(value.quantitySumScaled ?? "")) ||
+      Number.isNaN(new Date(value.sourceSnapshotMinAt).getTime()) ||
+      Number.isNaN(new Date(value.sourceSnapshotMaxAt).getTime()) ||
+      new Date(value.sourceSnapshotMinAt) > new Date(value.sourceSnapshotMaxAt)) {
+    return "Invalid branch-stock reconciliation summary.";
+  }
+  return null;
 }
 
 function getSyncV2Config(config) {
@@ -645,36 +673,54 @@ function createSyncRouter(deps) {
       const result = runId
         ? await db.query(
             `
-              UPDATE ingest.sync_runs
-              SET finished_at = CASE
-                    WHEN ingestion_mode = 'v1' THEN $2
-                    WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN $2
-                    ELSE finished_at
-                  END,
-                  status = CASE
-                    WHEN ingestion_mode = 'v1' THEN $3
-                    WHEN $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
-                    ELSE status
-                  END,
-                  handoff_status = CASE
-                    WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
-                    ELSE handoff_status
-                  END,
-                  apply_status = CASE
-                    WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
-                    ELSE apply_status
-                  END,
-                  handoff_finished_at = CASE
-                    WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN $2
-                    ELSE handoff_finished_at
-                  END,
-                  failure_stage = CASE
-                    WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN 'handoff'
-                    ELSE failure_stage
-                  END,
-                  records_read = $4, records_sent = $5, message = $6
-              WHERE sync_run_id = $1::bigint
-              RETURNING sync_run_id, ingestion_mode, status, apply_status
+              WITH updated AS (
+                UPDATE ingest.sync_runs
+                SET finished_at = CASE
+                      WHEN ingestion_mode = 'v1' THEN $2
+                      WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN $2
+                      ELSE finished_at
+                    END,
+                    status = CASE
+                      WHEN ingestion_mode = 'v1' THEN $3
+                      WHEN $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
+                      ELSE status
+                    END,
+                    handoff_status = CASE
+                      WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
+                      ELSE handoff_status
+                    END,
+                    apply_status = CASE
+                      WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN 'failed'
+                      ELSE apply_status
+                    END,
+                    handoff_finished_at = CASE
+                      WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN $2
+                      ELSE handoff_finished_at
+                    END,
+                    failure_stage = CASE
+                      WHEN ingestion_mode = 'hybrid_v2' AND $3 = 'failed' AND finalized_at IS NULL THEN 'handoff'
+                      ELSE failure_stage
+                    END,
+                    records_read = $4, records_sent = $5, message = $6
+                WHERE sync_run_id = $1::bigint
+                RETURNING sync_run_id, branch_code, ingestion_mode, status, apply_status, snapshot_mode
+              ),
+              -- Generation remediation round (_ledger/claude.md CLAIM-X-047,
+              -- fixed by C-051): registered in the SAME statement as the
+              -- status flip above, not as a separate fire-and-forget call
+              -- after commit — this WITH executes atomically as one
+              -- statement, so a v1 run can never end up "recorded successful"
+              -- with its retirement job silently lost. Postgres executes
+              -- every data-modifying CTE in a WITH clause to completion
+              -- regardless of whether the final SELECT reads its output.
+              registered AS (
+                INSERT INTO ingest.branch_stock_retirements (sync_run_id, branch_code, status, next_attempt_at)
+                SELECT sync_run_id, branch_code, 'pending', now()
+                FROM updated
+                WHERE ingestion_mode = 'v1' AND status = 'success' AND snapshot_mode = 'full'
+                ON CONFLICT (sync_run_id) DO NOTHING
+              )
+              SELECT sync_run_id, ingestion_mode, status, apply_status FROM updated
             `,
             [runId, finishedAt, status, recordsRead, recordsSent, message],
           )
@@ -712,6 +758,12 @@ function createSyncRouter(deps) {
       if (shouldMirrorAdaRunLog(req.body) && mayMirror) {
         adaSyncRunId = await insertAdaRunLog(db, req.body);
       }
+
+      // Branch-stock generation round (_ledger/claude.md CLAIM-C-047/C-048,
+      // remediated per X-047/C-051): a v1 branch's retirement job is now
+      // registered atomically inside the WITH clause above, not here.
+      // hybrid_v2's equivalent registration happens inside worker.js's
+      // processOneBatch transaction, where the last batch actually applies.
 
       if (status.toLowerCase() === "failed" && (!isHybrid || isActualHybridFailure)) {
         await db.query(
@@ -893,6 +945,7 @@ function createSyncRouter(deps) {
       const dataset = normalizeText(req.body?.dataset).toLowerCase();
       const batchCount = Number(req.body?.batchCount);
       const recordCount = Number(req.body?.recordCount);
+      const reconciliation = req.body?.reconciliation;
       if (!/^\d+$/.test(syncRunId)) {
         return res.status(400).json({ message: "syncRunId must be numeric." });
       }
@@ -900,7 +953,9 @@ function createSyncRouter(deps) {
           !Number.isInteger(recordCount) || recordCount < 1) {
         return res.status(400).json({ message: "A valid branch_stock manifest is required." });
       }
-      const manifest = { dataset, batchCount, recordCount };
+      const reconciliationError = validateReconciliationManifest(reconciliation, recordCount);
+      if (reconciliationError) return res.status(400).json({ message: reconciliationError });
+      const manifest = { dataset, batchCount, recordCount, reconciliation };
       const manifestHash = hashCanonical(manifest);
       await client.query("BEGIN");
       const run = (await client.query(
@@ -935,6 +990,13 @@ function createSyncRouter(deps) {
          WHERE sync_run_id = $1::bigint AND dataset = $2 AND status = 'staged'`, [syncRunId, dataset],
       );
       await client.query(
+        `INSERT INTO ingest.branch_stock_reconciliations
+           (sync_run_id, branch_code, contract_version, expected_manifest, status, next_attempt_at)
+         VALUES ($1::bigint, $2, $3, $4::jsonb, 'pending', now())
+         ON CONFLICT (sync_run_id) DO NOTHING`,
+        [syncRunId, run.branch_code, reconciliation.version, JSON.stringify(reconciliation)],
+      );
+      await client.query(
         `UPDATE ingest.sync_runs
          SET handoff_status = 'success', apply_status = 'pending', total_batches = $2,
              applied_batches = 0, failed_batches = 0, handoff_finished_at = now(),
@@ -943,6 +1005,56 @@ function createSyncRouter(deps) {
       );
       await client.query("COMMIT");
       return res.json({ syncRunId, status: "finalized", idempotent: false, manifestHash });
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
+      return next(e);
+    } finally { client.release(); }
+  });
+
+  // Legacy v1 applies branch stock synchronously, so its complete source
+  // digest is registered only after every HTTP batch has committed. This is
+  // shadow evidence: registration failure never rolls stock back.
+  router.post("/v1/runs/:syncRunId/reconcile-branch-stock", async (req, res, next) => {
+    const client = await acquireIngestionDbClient(db, res, "sync:/v1/runs/:syncRunId/reconcile-branch-stock");
+    if (!client) return;
+    try {
+      const syncRunId = normalizeText(req.params.syncRunId);
+      const branchCode = normalizeText(req.body?.branchCode).padStart(3, "0");
+      const reconciliation = req.body?.reconciliation;
+      if (!/^\d+$/.test(syncRunId)) return res.status(400).json({ message: "syncRunId must be numeric." });
+      const reconciliationError = validateReconciliationManifest(reconciliation, reconciliation?.recordCount);
+      if (reconciliationError) return res.status(400).json({ message: reconciliationError });
+      await client.query("BEGIN");
+      const run = (await client.query(
+        `SELECT sync_run_id, ingestion_mode, branch_code, status
+         FROM ingest.sync_runs WHERE sync_run_id = $1::bigint FOR UPDATE`,
+        [syncRunId],
+      )).rows[0];
+      if (!run) { await client.query("ROLLBACK"); return res.status(404).json({ message: "Sync run not found." }); }
+      if (run.ingestion_mode !== "v1" || run.status !== "running" || run.branch_code !== branchCode) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: "Run is not an active matching v1 branch sync." });
+      }
+      const existing = (await client.query(
+        `SELECT expected_manifest FROM ingest.branch_stock_reconciliations
+         WHERE sync_run_id = $1::bigint`,
+        [syncRunId],
+      )).rows[0];
+      if (existing) {
+        await client.query("ROLLBACK");
+        if (hashCanonical(existing.expected_manifest) !== hashCanonical(reconciliation)) {
+          return res.status(409).json({ message: "Run already has different reconciliation evidence." });
+        }
+        return res.json({ syncRunId, status: "pending", idempotent: true });
+      }
+      await client.query(
+        `INSERT INTO ingest.branch_stock_reconciliations
+           (sync_run_id, branch_code, contract_version, expected_manifest, status, next_attempt_at)
+         VALUES ($1::bigint, $2, $3, $4::jsonb, 'pending', now())`,
+        [syncRunId, branchCode, reconciliation.version, JSON.stringify(reconciliation)],
+      );
+      await client.query("COMMIT");
+      return res.status(202).json({ syncRunId, status: "pending", idempotent: false });
     } catch (e) {
       try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
       return next(e);
@@ -983,6 +1095,13 @@ function createSyncRouter(deps) {
         `,
         [syncRunId],
       );
+      const reconciliationResult = await db.query(
+        `SELECT status, attempts, max_attempts, last_error, mismatch_summary,
+                created_at, claimed_at, reconciled_at
+         FROM ingest.branch_stock_reconciliations
+         WHERE sync_run_id = $1::bigint`,
+        [syncRunId],
+      );
 
       const run = runResult.rows[0];
       return res.json({
@@ -1006,6 +1125,16 @@ function createSyncRouter(deps) {
           : null,
         message: run.message,
         oldestPendingQueuedAt: staleResult.rows[0].oldest_pending_queued_at,
+        reconciliation: reconciliationResult.rows[0] ? {
+          status: reconciliationResult.rows[0].status,
+          attempts: reconciliationResult.rows[0].attempts,
+          maxAttempts: reconciliationResult.rows[0].max_attempts,
+          lastError: reconciliationResult.rows[0].last_error,
+          mismatchSummary: reconciliationResult.rows[0].mismatch_summary,
+          createdAt: reconciliationResult.rows[0].created_at,
+          claimedAt: reconciliationResult.rows[0].claimed_at,
+          reconciledAt: reconciliationResult.rows[0].reconciled_at,
+        } : null,
       });
     } catch (e) {
       return next(e);

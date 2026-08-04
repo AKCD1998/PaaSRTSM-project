@@ -84,6 +84,13 @@ function buildInventoryBranchStats(row, branchCodes = DISPLAY_BRANCH_CODES) {
 function createBranchStockMockDb() {
   const state = {
     snapshots: new Map(),
+    // WP3 Phase 1 dual-write target (ada.branch_stock_current) — keyed by
+    // "productCode|branchCode" since it's now a row per branch, not a
+    // column per branch. Nothing in this test file asserts on it yet
+    // (assertions live in branch_stock_current_dual_write.test.js); it only
+    // needs to exist here so the mock doesn't throw "Unhandled mock query"
+    // now that every write route also dual-writes to it.
+    branchStockCurrent: new Map(),
     products: new Map(),
     skuCategories: new Map(),
     categoryStates: new Map(),
@@ -169,6 +176,19 @@ function createBranchStockMockDb() {
           cost_avg_branch_005: params[17],
           synced_at: params[18],
           raw_payload: JSON.parse(params[19]),
+        });
+        return { rowCount: 1, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.branch_stock_current")) {
+        const [productCode, branchCode, qty, costAvg, syncedAt, rawPayload] = params;
+        state.branchStockCurrent.set(`${productCode}|${branchCode}`, {
+          product_code: productCode,
+          branch_code: branchCode,
+          qty,
+          cost_avg: costAvg,
+          synced_at: syncedAt,
+          raw_payload: JSON.parse(rawPayload || "{}"),
         });
         return { rowCount: 1, rows: [] };
       }
@@ -464,6 +484,21 @@ function createBranchStockMockDb() {
         return { rowCount: pagedRows.length, rows: pagedRows };
       }
 
+      // Branch-stock generation round (_ledger/claude.md CLAIM-C-046): the
+      // follow-up UPDATE upsertBranchStockSnapshot issues to stamp this
+      // branch's synced_at_branch_XXX / full_sync_run_id_branch_XXX columns.
+      if (normalized.startsWith("update ada.branch_stock_snapshots set synced_at_branch_")) {
+        const [productCode, syncedAt, syncRunId] = params;
+        const branchMatch = /synced_at_branch_(\d{3})/.exec(normalized);
+        const branch = branchMatch[1];
+        const row = state.snapshots.get(productCode);
+        if (row) {
+          row[`synced_at_branch_${branch}`] = syncedAt;
+          if (syncRunId != null) row[`full_sync_run_id_branch_${branch}`] = syncRunId;
+        }
+        return { rowCount: row ? 1 : 0, rows: [] };
+      }
+
       throw new Error(`Unhandled mock query: ${normalized}`);
     },
     async end() {},
@@ -531,6 +566,12 @@ test("branch stock sync and listing routes work on the shared backend", async ()
   assert.equal(db.state.snapshots.size, 1);
   assert.equal(db.state.snapshots.get("630010001").qty_branch_001, 5);
   assert.equal(db.state.snapshots.get("630010001").cost_avg_branch_001, 12.5);
+  // WP3 Phase 1 dual-write: the same POST must also produce a row in the new
+  // normalized table via this v1 route (the current live write path).
+  assert.equal(db.state.branchStockCurrent.size, 1);
+  const dualWrite1 = db.state.branchStockCurrent.get("630010001|001");
+  assert.equal(dualWrite1.qty, 5);
+  assert.equal(dualWrite1.cost_avg, 12.5);
 
   const legacySyncResponse = await request(app)
     .post("/api/sync/ada/branch-stock")
@@ -554,6 +595,8 @@ test("branch stock sync and listing routes work on the shared backend", async ()
   assert.equal(legacySyncResponse.body.accepted, 1);
   assert.equal(legacySyncResponse.body.branchCode, "001");
   assert.equal(db.state.snapshots.size, 2);
+  assert.equal(db.state.branchStockCurrent.size, 2, "the legacy /sync/ada/branch-stock route dual-writes too, not just /branch-stock/sync");
+  assert.equal(db.state.branchStockCurrent.get("630010002|001").qty, 2);
 
   const agent = request.agent(app);
   await loginAsAdmin(agent);

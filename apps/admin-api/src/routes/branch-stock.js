@@ -71,6 +71,18 @@ function parseBooleanFlag(value) {
   return ["1", "true", "yes", "on"].includes(normalized);
 }
 
+// Branch-stock generation round (_ledger/claude.md CLAIM-C-046): the sync
+// agent already obtains a syncRunId from POST /api/sync/run-start before
+// uploading branch stock (see SC-StockDay-Ordering apps/adapos-sync/src/index.js);
+// this just accepts it if present so v1 writes can be tied to a generation.
+// Absent/invalid input is treated as "no generation known", never an error —
+// older agent builds that don't send it must keep working unchanged.
+function parseOptionalSyncRunId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 function normalizeQuery(value = "") {
   return normalizeText(value).toLowerCase();
 }
@@ -332,7 +344,20 @@ function parseBranchStockUploadPayload(body) {
   };
 }
 
-async function upsertBranchStockSnapshot(client, record) {
+// Fixed whitelist mapping branch code -> generation-tracking column names in
+// the wide ada.branch_stock_snapshots table (branch-stock generation round,
+// _ledger/claude.md CLAIM-C-046). Only ever indexed by this literal object,
+// mirroring the existing pattern in services/stockRequests.js.
+const BRANCH_GENERATION_COLUMNS = Object.freeze({
+  "000": { freshnessCol: "synced_at_branch_000", fullSyncCol: "full_sync_run_id_branch_000" },
+  "001": { freshnessCol: "synced_at_branch_001", fullSyncCol: "full_sync_run_id_branch_001" },
+  "002": { freshnessCol: "synced_at_branch_002", fullSyncCol: "full_sync_run_id_branch_002" },
+  "003": { freshnessCol: "synced_at_branch_003", fullSyncCol: "full_sync_run_id_branch_003" },
+  "004": { freshnessCol: "synced_at_branch_004", fullSyncCol: "full_sync_run_id_branch_004" },
+  "005": { freshnessCol: "synced_at_branch_005", fullSyncCol: "full_sync_run_id_branch_005" },
+});
+
+async function upsertBranchStockSnapshot(client, record, branchCode = null, syncRunId = null) {
   await client.query(
     `
       INSERT INTO ada.branch_stock_snapshots
@@ -409,6 +434,70 @@ async function upsertBranchStockSnapshot(client, record) {
       record.syncedAt,
       JSON.stringify(record.rawPayload || {}),
     ],
+  );
+
+  // Branch-stock generation round (_ledger/claude.md CLAIM-C-046/C-048):
+  // stamp this branch's freshness + full-snapshot-generation columns. This is
+  // the direct fix for C-046 (v1 never wrote synced_at_branch_XXX at all, so
+  // reconcileBranchStockJob's wide-table read was permanently empty for every
+  // v1 branch and buildBranchStockReconciliationManifest threw on an empty
+  // snapshot). Deliberately UNCONDITIONAL, not freshness-guarded: the qty
+  // write above (in the ON CONFLICT DO UPDATE SET above) is itself
+  // unconditional/arrival-order (that is QUESTION-004, still open — see
+  // docs/BRANCH_STOCK_GENERATION_CONTRACT.md), so guarding only the
+  // bookkeeping columns would let them silently diverge from what qty
+  // actually reflects (freshness could claim a newer generation than the qty
+  // value in the row actually came from). Only stamped when branchCode is
+  // known; the manual Excel-upload path does not pass one and stays
+  // unstamped, matching its existing exclusion from the reconciliation
+  // contract.
+  if (branchCode) {
+    const { freshnessCol, fullSyncCol } = BRANCH_GENERATION_COLUMNS[branchCode];
+    await client.query(
+      `UPDATE ada.branch_stock_snapshots
+       SET ${freshnessCol} = $2::timestamptz,
+           ${fullSyncCol} = CASE WHEN $3::bigint IS NULL THEN ${fullSyncCol} ELSE $3::bigint END
+       WHERE product_code = $1`,
+      [record.productCode, record.syncedAt, syncRunId],
+    );
+  }
+}
+
+// WP3 Phase 1 dual-write (_ledger/claude.md CLAIM-C-019/X-034; migrations/066):
+// same transaction/client as upsertBranchStockSnapshot above, called
+// alongside it at every call site so ada.branch_stock_current (the new
+// normalized, row-per-branch table) stays in lockstep with the legacy wide
+// table during the migration. Nothing reads from this table yet — see the
+// migration file's own comments for the phased rollout plan. Freshness-guarded
+// the same way worker.js's v2 upsert already is (WHERE synced_at IS NULL OR
+// synced_at <= EXCLUDED.synced_at), so an out-of-order/duplicate write from
+// this v1 path can never regress a fresher value already recorded here —
+// including one written by the v2/worker.js path for the same branch.
+// syncRunId (added branch-stock generation round, CLAIM-C-046/C-048): stamped
+// under the SAME freshness guard as the rest of this row, unlike the wide
+// table's equivalent column above — this table's qty write has always been
+// freshness-guarded (unlike the wide table's unconditional qty write), so
+// keeping last_full_sync_run_id inside that same guarded UPDATE keeps it
+// consistent with what qty actually reflects in this table.
+async function upsertBranchStockCurrent(client, { productCode, branchCode, qty, costAvg, syncedAt, rawPayload, syncRunId }) {
+  await client.query(
+    `
+      INSERT INTO ada.branch_stock_current
+        (product_code, branch_code, qty, cost_avg, synced_at, source_system, source_table, source_synced_at, raw_payload, last_full_sync_run_id, updated_at)
+      VALUES ($1, $2, $3, $4, $5, 'AdaAcc', 'TCNTPdtInWha', $5, $6::jsonb, $7::bigint, now())
+      ON CONFLICT (product_code, branch_code) DO UPDATE SET
+        qty = EXCLUDED.qty,
+        cost_avg = COALESCE(EXCLUDED.cost_avg, ada.branch_stock_current.cost_avg),
+        synced_at = EXCLUDED.synced_at,
+        source_synced_at = EXCLUDED.source_synced_at,
+        raw_payload = EXCLUDED.raw_payload,
+        last_full_sync_run_id = CASE WHEN EXCLUDED.last_full_sync_run_id IS NULL
+          THEN ada.branch_stock_current.last_full_sync_run_id ELSE EXCLUDED.last_full_sync_run_id END,
+        updated_at = now()
+      WHERE ada.branch_stock_current.synced_at IS NULL
+         OR ada.branch_stock_current.synced_at <= EXCLUDED.synced_at
+    `,
+    [productCode, branchCode, qty, costAvg == null ? null : costAvg, syncedAt, JSON.stringify(rawPayload || {}), syncRunId ?? null],
   );
 }
 
@@ -1182,6 +1271,7 @@ function createBranchStockRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
+    const syncRunId = parseOptionalSyncRunId(req.body?.syncRunId);
 
     const client = await acquireIngestionDbClient(db, res, "branch-stock:/branch-stock/sync");
     if (!client) return;
@@ -1196,7 +1286,17 @@ function createBranchStockRouter(deps) {
           record.syncedAt,
         );
         // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, mergedRecord);
+        await upsertBranchStockSnapshot(client, mergedRecord, branchCode, syncRunId);
+        // eslint-disable-next-line no-await-in-loop
+        await upsertBranchStockCurrent(client, {
+          productCode: record.productCode,
+          branchCode,
+          qty: record.qty,
+          costAvg: record.hasCostAvg ? record.costAvg : null,
+          syncedAt: record.syncedAt,
+          rawPayload: record.rawPayload,
+          syncRunId,
+        });
       }
       await client.query("COMMIT");
       if (records.length > 0) {
@@ -1221,6 +1321,7 @@ function createBranchStockRouter(deps) {
     if (error) {
       return res.status(400).json({ message: error });
     }
+    const syncRunId = parseOptionalSyncRunId(req.body?.syncRunId);
 
     const client = await acquireIngestionDbClient(db, res, "branch-stock:/sync/ada/branch-stock");
     if (!client) return;
@@ -1235,7 +1336,17 @@ function createBranchStockRouter(deps) {
           record.syncedAt,
         );
         // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, mergedRecord);
+        await upsertBranchStockSnapshot(client, mergedRecord, branchCode, syncRunId);
+        // eslint-disable-next-line no-await-in-loop
+        await upsertBranchStockCurrent(client, {
+          productCode: record.productCode,
+          branchCode,
+          qty: record.qty,
+          costAvg: record.hasCostAvg ? record.costAvg : null,
+          syncedAt: record.syncedAt,
+          rawPayload: record.rawPayload,
+          syncRunId,
+        });
       }
       await client.query("COMMIT");
       if (records.length > 0) {
@@ -1301,7 +1412,24 @@ function createBranchStockRouter(deps) {
           parsed.generatedAt,
         );
         // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, mergedRecord);
+        // No syncRunId here: this manual-upload flow's own "syncRunId" in the
+        // response below is branch_stock_upload_id, an unrelated identifier
+        // with no ingest.sync_runs row behind it — passing it through would
+        // stamp a full_sync_run_id_branch_XXX value that finalizeFullSnapshotGeneration
+        // could never resolve. Manual uploads stay outside the reconciliation/
+        // generation contract, same as before this round; branchCode is still
+        // threaded so the freshness column at least reflects this write.
+        await upsertBranchStockSnapshot(client, mergedRecord, parsed.branchCode, null);
+        // eslint-disable-next-line no-await-in-loop
+        await upsertBranchStockCurrent(client, {
+          productCode: record.productCode,
+          branchCode: parsed.branchCode,
+          qty: record.qty,
+          costAvg: null, // this manual-upload flow never carries cost data (hasCostAvg: false above)
+          syncedAt: parsed.generatedAt, // no per-record timestamp in this flow; the batch's generatedAt is the closest analog
+          rawPayload: record.rawPayload || {},
+          syncRunId: null,
+        });
         acceptedRows += 1;
       }
 
@@ -2044,4 +2172,9 @@ function createBranchStockRouter(deps) {
 
 module.exports = {
   createBranchStockRouter,
+  // Exported for direct testing of the WP3 Phase 1 dual-write pair (see
+  // _ledger/claude.md CLAIM-X-039) — same pattern worker.js already uses for
+  // its own internals (applyBranchStockBatch, normalizeBranchStock, etc.).
+  upsertBranchStockSnapshot,
+  upsertBranchStockCurrent,
 };
