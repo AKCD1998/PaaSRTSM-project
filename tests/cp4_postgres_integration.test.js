@@ -10,16 +10,23 @@ const { Pool } = require("pg");
 const { createSyncRouter } = require("../apps/admin-api/src/routes/sync");
 const {
   applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches,
-  pruneExpiredBatches, recomputeRunStatus,
+  pruneExpiredBatches, recomputeRunStatus, processOneReconciliation, processOneRetirement,
 } = require("../apps/admin-api/src/worker");
+const {
+  buildBranchStockReconciliationManifest,
+} = require("../apps/admin-api/src/services/branchStockReconciliation");
 
 const databaseUrl = process.env.CP4_TEST_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 8 }) : null;
 const migrationSql = fs.readFileSync(path.join(__dirname, "..", "migrations", "060_add_async_ingestion_queue.sql"), "utf8");
+const reconciliationMigrationSql = fs.readFileSync(path.join(__dirname, "..", "migrations", "067_add_branch_stock_reconciliation.sql"), "utf8");
+const branch066MigrationSql = fs.readFileSync(path.join(__dirname, "..", "migrations", "066_add_ada_branch_stock_current.sql"), "utf8");
+const branch068MigrationSql = fs.readFileSync(path.join(__dirname, "..", "migrations", "068_add_branch_stock_generation_tracking.sql"), "utf8");
+const branch069MigrationSql = fs.readFileSync(path.join(__dirname, "..", "migrations", "069_add_branch_stock_retirements.sql"), "utf8");
 
 async function resetData() {
-  await pool.query("TRUNCATE ingest.sync_batches, ingest.sync_runs, ada.branch_stock_snapshots RESTART IDENTITY CASCADE");
+  await pool.query("TRUNCATE ingest.branch_stock_retirements, ingest.branch_stock_reconciliations, ingest.sync_batches, ingest.sync_runs, ada.branch_stock_snapshots, ada.branch_stock_current RESTART IDENTITY CASCADE");
 }
 
 async function insertRun(overrides = {}) {
@@ -65,10 +72,37 @@ integration("REAL POSTGRES: migration 060 executes, preserves v1 defaults, and r
     INSERT INTO ingest.sync_runs (sync_type,source_name,started_at,status) VALUES ('legacy','v1',now(),'success');
   `);
   await pool.query(migrationSql);
+  await pool.query(reconciliationMigrationSql);
   const legacy = (await pool.query("SELECT ingestion_mode,handoff_status,apply_status FROM ingest.sync_runs")).rows[0];
   assert.deepEqual(legacy, { ingestion_mode: "v1", handoff_status: "not_applicable", apply_status: "not_applicable" });
   await pool.query(migrationSql);
+  await pool.query(reconciliationMigrationSql);
   assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM ingest.sync_runs")).rows[0].count, 1);
+});
+
+// migration 066 (ada.branch_stock_current, WP3 Phase 1), migration 068
+// (branch-stock generation round, _ledger/claude.md CLAIM-C-046/C-047/C-048),
+// and migration 069 (durable retirement queue, remediation round,
+// CLAIM-X-046/X-047 fixed by C-051/C-052/C-053) run for real here —
+// applyBranchStockBatch's dual-write, generation stamping, AND
+// registerRetirementJobIfComplete (called unconditionally inside
+// processOneBatch's own transaction) all reference columns/tables only these
+// migrations create, and this suite's remaining tests share this same schema
+// via resetData() (TRUNCATE, not DROP).
+integration("REAL POSTGRES: migrations 066, 068, and 069 layer cleanly on top of 060/067", async () => {
+  await pool.query(branch066MigrationSql);
+  await pool.query(branch068MigrationSql);
+  await pool.query(branch069MigrationSql);
+  const cols = (await pool.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'ada' AND table_name = 'branch_stock_current'
+       AND column_name IN ('last_full_sync_run_id', 'retired_at', 'retired_by_sync_run_id')`,
+  )).rows.map((r) => r.column_name).sort();
+  assert.deepEqual(cols, ["last_full_sync_run_id", "retired_at", "retired_by_sync_run_id"]);
+  const retirementsTable = (await pool.query(
+    `SELECT 1 FROM information_schema.tables WHERE table_schema='ingest' AND table_name='branch_stock_retirements'`,
+  )).rows;
+  assert.equal(retirementsTable.length, 1);
 });
 
 integration("REAL POSTGRES: staged work is invisible and two claimers get different queued batches", async () => {
@@ -117,6 +151,13 @@ integration("REAL POSTGRES: concurrent branches preserve quantities, exact total
   const record = { productCode: "P1", productNameThai: "สินค้า", productNameEng: "Product", barcode: "885", unit: "EA", syncedAt: "2026-01-02T00:00:00Z", rawPayload: { source: "acceptance" } };
   await applyBranchStockBatch(pool, [{ ...record, productCode: "NEW", branchCode: "003", qty: 6, costAvg: 2 }], "003");
   assert.equal(Number((await pool.query("SELECT qty_total_all_branches FROM ada.branch_stock_snapshots WHERE product_code='NEW'")).rows[0].qty_total_all_branches), 6);
+  // WP3 Phase 1 dual-write: the SAME call must also produce a row in the new
+  // normalized table — one row per (product_code, branch_code), not a column.
+  const newCurrent = (await pool.query("SELECT branch_code, qty, cost_avg FROM ada.branch_stock_current WHERE product_code='NEW'")).rows;
+  assert.equal(newCurrent.length, 1);
+  assert.equal(newCurrent[0].branch_code, "003");
+  assert.equal(Number(newCurrent[0].qty), 6);
+  assert.equal(Number(newCurrent[0].cost_avg), 2);
   const c0 = await pool.connect(); const c1 = await pool.connect();
   try {
     await Promise.all([
@@ -133,6 +174,21 @@ integration("REAL POSTGRES: concurrent branches preserve quantities, exact total
   assert.equal(row.barcode, "885"); assert.equal(row.unit, "EA"); assert.deepEqual(row.raw_payload, { source: "acceptance" });
   assert.equal(row.synced_at.toISOString(), "2026-01-03T00:00:00.000Z");
   assert.equal(row.source_synced_at.toISOString(), "2026-01-03T00:00:00.000Z");
+  // Same sequence of writes (branch 000: qty 10 -> stale 99 rejected by the
+  // freshness guard -> 11 with costAvg:null preserving the prior 5 via
+  // COALESCE; branch 001: qty 20 once) reflected as two separate rows here —
+  // proves the freshness guard and null-cost COALESCE both carry over
+  // correctly to the normalized table, not just the wide one.
+  const p1Current = (await pool.query(
+    "SELECT branch_code, qty, cost_avg, synced_at FROM ada.branch_stock_current WHERE product_code='P1' ORDER BY branch_code",
+  )).rows;
+  assert.equal(p1Current.length, 2);
+  assert.equal(p1Current[0].branch_code, "000");
+  assert.equal(Number(p1Current[0].qty), 11, "the stale qty=99 write (synced_at 2026-01-01, older than the already-applied 2026-01-02) must be rejected here too");
+  assert.equal(Number(p1Current[0].cost_avg), 5, "costAvg:null on the final write must not erase the previously stored cost");
+  assert.equal(p1Current[0].synced_at.toISOString(), "2026-01-03T00:00:00.000Z");
+  assert.equal(p1Current[1].branch_code, "001");
+  assert.equal(Number(p1Current[1].qty), 20);
   await applyBranchStockBatch(pool, [{ ...record, branchCode: "000", productNameThai: null, productNameEng: "", barcode: null, unit: "", qty: 12, syncedAt: "2026-01-04T00:00:00Z" }], "000");
   row = (await pool.query("SELECT * FROM ada.branch_stock_snapshots WHERE product_code='P1'")).rows[0];
   assert.equal(row.product_name_thai, "สินค้า"); assert.equal(row.product_name_eng, "Product");
@@ -151,6 +207,53 @@ integration("REAL POSTGRES: duplicate upload is rejected before staging", async 
   const response = await request(app).post("/api/sync/v2/batches").set("x-api-key", "secret").send({ syncRunId: String(runId), dataset: "branch_stock", batchSeq: 1, records: [record, { ...record, productCode: "DUP" }] });
   assert.equal(response.status, 400);
   assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM ingest.sync_batches")).rows[0].count, 0);
+});
+
+integration("REAL POSTGRES: finalize creates durable evidence and worker reaches reconciliation PASS", async () => {
+  await resetData();
+  const runId = await insertRun({
+    handoff_status: "running", apply_status: "waiting", finalized: false, total_batches: 0,
+  });
+  const records = [{
+    branchCode: "000", productCode: "RECON-P1", qty: 7.25,
+    syncedAt: "2026-07-29T01:00:00.000Z",
+  }];
+  const config = {
+    posApiKeys: new Set(["secret"]),
+    syncV2AllowedDatasets: new Set(["branch_stock"]),
+    syncV2AllowedBranches: new Set(["000"]),
+    syncV2MaxBatchRecords: 100,
+  };
+  const app = express();
+  app.use(express.json());
+  app.use("/api/sync", createSyncRouter({ config, db: pool }));
+  app.use((error, req, res, next) => res.status(500).json({ message: error.message }));
+  assert.equal((await request(app).post("/api/sync/v2/batches").set("x-api-key", "secret").send({
+    syncRunId: String(runId), dataset: "branch_stock", batchSeq: 1, records,
+  })).status, 202);
+  const reconciliation = buildBranchStockReconciliationManifest(records);
+  assert.equal((await request(app).post(`/api/sync/v2/runs/${runId}/finalize`).set("x-api-key", "secret").send({
+    dataset: "branch_stock", batchCount: 1, recordCount: 1, reconciliation,
+  })).status, 200);
+  assert.equal((await pool.query(
+    "SELECT status FROM ingest.branch_stock_reconciliations WHERE sync_run_id=$1", [runId],
+  )).rows[0].status, "pending");
+  assert.equal(await processOneBatch(pool), true);
+  // Generation remediation round (_ledger/claude.md CLAIM-X-047, fixed by
+  // C-052): reconciliation is no longer eligible until retirement for this
+  // same generation reaches 'done' — registerRetirementJobIfComplete ran
+  // inside processOneBatch's own transaction above, so the job is durably
+  // pending here and must be processed before reconciliation can claim.
+  assert.equal(await processOneReconciliation(pool), false, "must not be claimable before retirement completes");
+  assert.equal(await processOneRetirement(pool), true);
+  assert.equal(await processOneReconciliation(pool), true);
+  const evidence = (await pool.query(
+    `SELECT status, mismatch_summary
+     FROM ingest.branch_stock_reconciliations WHERE sync_run_id=$1`,
+    [runId],
+  )).rows[0];
+  assert.equal(evidence.status, "pass");
+  assert.equal(evidence.mismatch_summary.payloadVsNormalized.matches, true);
 });
 
 integration("REAL POSTGRES: apply failure rolls back live data; success commits data and applied state atomically", async () => {
@@ -217,7 +320,12 @@ integration("REAL POSTGRES: finalize mismatch rolls back without queueing staged
                     VALUES ($1,'branch_stock',1,'m','[{}]',1,'staged')`, [runId]);
   const config = { posApiKeys: new Set(["secret"]), syncV2AllowedDatasets: new Set(["branch_stock"]), syncV2AllowedBranches: new Set(["000"]), syncV2MaxBatchRecords: 100 };
   const app = express(); app.use(express.json()); app.use("/api/sync", createSyncRouter({ config, db: pool })); app.use((error, req, res, next) => res.status(500).json({ message: error.message }));
-  const response = await request(app).post(`/api/sync/v2/runs/${runId}/finalize`).set("x-api-key", "secret").send({ dataset: "branch_stock", batchCount: 2, recordCount: 1 });
+  const response = await request(app).post(`/api/sync/v2/runs/${runId}/finalize`).set("x-api-key", "secret").send({
+    dataset: "branch_stock", batchCount: 2, recordCount: 1,
+    reconciliation: buildBranchStockReconciliationManifest([
+      { productCode: "M", qty: 1, syncedAt: "2026-07-29T01:00:00Z" },
+    ]),
+  });
   assert.equal(response.status, 409);
   assert.equal((await pool.query("SELECT status FROM ingest.sync_batches WHERE sync_run_id=$1", [runId])).rows[0].status, "staged");
   assert.equal((await pool.query("SELECT finalized_at FROM ingest.sync_runs WHERE sync_run_id=$1", [runId])).rows[0].finalized_at, null);

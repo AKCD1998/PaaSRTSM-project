@@ -17,6 +17,7 @@ function makeDb(seedRun = {}) {
       const q = sql.replace(/\s+/g, " ").trim();
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(q)) return { rows: [], rowCount: 0 };
       if (/SELECT sync_run_id, ingestion_mode, branch_code, finalized_at, status/i.test(q)) return { rows: state.run ? [state.run] : [], rowCount: state.run ? 1 : 0 };
+      if (/SELECT sync_run_id, ingestion_mode, branch_code, status/i.test(q)) return { rows: state.run ? [state.run] : [], rowCount: state.run ? 1 : 0 };
       if (/INSERT INTO ingest\.sync_batches/i.test(q)) {
         const existing = state.batches.find((b) => b.dataset === params[1] && b.batch_seq === params[2]);
         if (existing) return { rows: [], rowCount: 0 };
@@ -34,6 +35,16 @@ function makeDb(seedRun = {}) {
         return { rows: [{ batch_count: batches.length, record_count: batches.reduce((n, b) => n + b.record_count, 0), min_seq: seqs.length ? Math.min(...seqs) : null, max_seq: seqs.length ? Math.max(...seqs) : null, distinct_seq: new Set(seqs).size }] };
       }
       if (/UPDATE ingest\.sync_batches SET status = 'queued'/i.test(q)) { state.batches.forEach((b) => { b.status = "queued"; }); return { rows: [], rowCount: state.batches.length }; }
+      if (/INSERT INTO ingest\.branch_stock_reconciliations/i.test(q)) {
+        state.reconciliation = {
+          sync_run_id: params[0], branch_code: params[1], contract_version: params[2],
+          expected_manifest: JSON.parse(params[3]), status: "pending",
+        };
+        return { rows: [], rowCount: 1 };
+      }
+      if (/SELECT expected_manifest FROM ingest\.branch_stock_reconciliations/i.test(q)) {
+        return { rows: state.reconciliation ? [state.reconciliation] : [], rowCount: state.reconciliation ? 1 : 0 };
+      }
       if (/UPDATE ingest\.sync_runs SET handoff_status/i.test(q)) {
         Object.assign(state.run, { handoff_status: "success", apply_status: "pending", total_batches: params[1], finalized_at: new Date(), manifest_hash: params[2] });
         return { rows: [], rowCount: 1 };
@@ -59,6 +70,19 @@ function makeApp(config, db) {
 
 const enabledConfig = { posApiKeys: new Set(["secret"]), syncV2AllowedDatasets: new Set(["branch_stock"]), syncV2AllowedBranches: new Set(["000"]), syncV2MaxBatchRecords: 100 };
 const auth = { "x-api-key": "secret" };
+const reconciliation = {
+  version: "branch-stock-v1", quantityScale: 4, recordCount: 1,
+  uniqueProductCount: 1, duplicateProductCount: 0, quantitySumScaled: "10000",
+  negativeQuantityCount: 0, digestAlgorithm: "sha256",
+  digest: "a".repeat(64), sourceSnapshotMinAt: "2026-01-01T00:00:00.000Z",
+  sourceSnapshotMaxAt: "2026-01-01T00:00:00.000Z",
+};
+const manifestFor = (batchCount, recordCount) => ({
+  dataset: "branch_stock", batchCount, recordCount,
+  reconciliation: {
+    ...reconciliation, recordCount, uniqueProductCount: recordCount,
+  },
+});
 
 test("sync v2 feature flags default off and v1 config remains not_applicable", async () => {
   const config = loadConfig({});
@@ -132,7 +156,7 @@ test("duplicate normalized product codes are rejected before staging", async () 
 });
 
 test("finalize rechecks flags and terminal handoff state", async () => {
-  const manifest = { dataset: "branch_stock", batchCount: 1, recordCount: 1 };
+  const manifest = manifestFor(1, 1);
   const failedDb = makeDb({ status: "failed", handoff_status: "failed", apply_status: "failed" });
   failedDb.state.batches = [{ dataset: "branch_stock", batch_seq: 1, record_count: 1, status: "staged" }];
   assert.equal((await request(makeApp(enabledConfig, failedDb)).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifest)).status, 409);
@@ -151,20 +175,37 @@ test("finalize rejects count, record, and sequence mismatches", async () => {
     [{ batch_seq: 1, record_count: 1 }, { batch_seq: 3, record_count: 1 }],
   ]) {
     const db = makeDb(); db.state.batches = batches.map((b, i) => ({ batch_id: i + 1, dataset: "branch_stock", status: "staged", ...b }));
-    const response = await request(makeApp(enabledConfig, db)).post("/api/sync/v2/runs/7/finalize").set(auth).send({ dataset: "branch_stock", batchCount: 2, recordCount: 2 });
+    const response = await request(makeApp(enabledConfig, db)).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifestFor(2, 2));
     assert.equal(response.status, 409);
   }
 });
 
 test("same finalize is idempotent, different manifest conflicts, and overall stays running", async () => {
   const db = makeDb(); db.state.batches = [1, 2].map((seq) => ({ batch_id: seq, dataset: "branch_stock", batch_seq: seq, record_count: 1, status: "staged" }));
-  const app = makeApp(enabledConfig, db); const manifest = { dataset: "branch_stock", batchCount: 2, recordCount: 2 };
+  const app = makeApp(enabledConfig, db); const manifest = manifestFor(2, 2);
   const first = await request(app).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifest);
   const same = await request(app).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifest);
-  const different = await request(app).post("/api/sync/v2/runs/7/finalize").set(auth).send({ ...manifest, recordCount: 3 });
+  const different = await request(app).post("/api/sync/v2/runs/7/finalize").set(auth).send(manifestFor(2, 3));
   assert.equal(first.status, 200); assert.equal(same.status, 200); assert.equal(same.body.idempotent, true);
   assert.equal(different.status, 409); assert.equal(db.state.run.status, "running");
   assert.deepEqual(db.state.batches.map((b) => b.status), ["queued", "queued"]);
+});
+
+test("v1 registers shadow evidence only for its matching active run and is idempotent", async () => {
+  const db = makeDb({ ingestion_mode: "v1", branch_code: "000" });
+  const app = makeApp(enabledConfig, db);
+  const body = { branchCode: "000", reconciliation };
+  const first = await request(app).post("/api/sync/v1/runs/7/reconcile-branch-stock").set(auth).send(body);
+  const same = await request(app).post("/api/sync/v1/runs/7/reconcile-branch-stock").set(auth).send(body);
+  assert.equal(first.status, 202);
+  assert.equal(same.status, 200);
+  assert.equal(same.body.idempotent, true);
+  assert.equal(db.state.reconciliation.status, "pending");
+
+  const wrongBranch = await request(makeApp(enabledConfig, makeDb({
+    ingestion_mode: "v1", branch_code: "001",
+  }))).post("/api/sync/v1/runs/7/reconcile-branch-stock").set(auth).send(body);
+  assert.equal(wrongBranch.status, 409);
 });
 
 test("hybrid run-log cannot report overall success and pre-finalize failure is terminal", async () => {
@@ -226,12 +267,14 @@ test("v2 status polling never writes sync_run_datasets", async () => {
     if (/INSERT INTO ingest\.sync_run_datasets/i.test(sql)) datasetWrites += 1;
     if (/SELECT sync_run_id, sync_type/i.test(sql)) return { rows: [{ sync_run_id: 7, sync_type: "manual", branch_code: "000", status: "running", ingestion_mode: "hybrid_v2", handoff_status: "success", apply_status: "pending", total_batches: 1, applied_batches: 0, failed_batches: 0 }], rowCount: 1 };
     if (/MIN\(queued_at\)/i.test(sql)) return { rows: [{ oldest_pending_queued_at: null, terminal_batch_error: null }], rowCount: 1 };
+    if (/FROM ingest\.branch_stock_reconciliations/i.test(sql)) return { rows: [{ status: "pending", attempts: 0, max_attempts: 5 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   } };
   const app = makeApp(enabledConfig, db);
   for (let i = 0; i < 3; i += 1) {
     const response = await request(app).get("/api/sync/v2/runs/7").set(auth).set("x-sync-run-id", "7");
     assert.equal(response.status, 200);
+    assert.equal(response.body.reconciliation.status, "pending");
   }
   assert.equal(datasetWrites, 0);
 });

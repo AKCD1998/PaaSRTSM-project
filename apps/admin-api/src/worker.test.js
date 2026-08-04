@@ -5,7 +5,11 @@ const assert = require("node:assert/strict");
 const {
   applyBranchStockBatch, claimNextBatch, processOneBatch, reapStuckBatches,
   pruneExpiredBatches, recomputeRunStatus, backoffMs, logWorkerEvent, normalizeBranchStock,
+  claimNextReconciliation, reconcileBranchStockJob, maintainReconciliations,
 } = require("./worker");
+const {
+  buildBranchStockReconciliationManifest,
+} = require("./services/branchStockReconciliation");
 
 test("run recomputation locks the run before taking a fresh aggregate snapshot", async () => {
   const calls = [];
@@ -30,7 +34,94 @@ test("claim query only claims queued/retry_wait and uses SKIP LOCKED, never stag
   assert.match(sql, /FOR UPDATE OF candidate SKIP LOCKED/);
   assert.match(sql, /candidate_run\.status IN \('running', 'failed'\)/);
   assert.match(sql, /candidate_run\.finalized_at IS NOT NULL/);
+  assert.match(sql, /earlier_reconciliation\.status IN \('processing', 'retry_wait'\)/);
+  assert.match(sql, /earlier_run\.ingestion_mode = 'v1' AND earlier_run\.status = 'success'/);
   assert.doesNotMatch(sql, /status IN \([^)]*staged/);
+});
+
+test("reconciliation claim is durable, skip-locked, and waits for APPLIED", async () => {
+  let sql;
+  await claimNextReconciliation({ query: async (query) => { sql = query; return { rows: [] }; } });
+  assert.match(sql, /candidate\.status IN \('pending', 'retry_wait'\)/);
+  assert.match(sql, /candidate_run\.apply_status = 'applied'/);
+  assert.match(sql, /FOR UPDATE OF candidate SKIP LOCKED/);
+  assert.match(sql, /attempts = reconciliation\.attempts \+ 1/);
+});
+
+test("catalog-wide reconciliation uses one repeatable-read snapshot and records PASS evidence", async () => {
+  const at = "2026-07-29T01:00:00.000Z";
+  const records = [{ productCode: "P1", qty: 2, syncedAt: at }];
+  const expected = buildBranchStockReconciliationManifest(records);
+  const clientCalls = [];
+  const client = {
+    async query(sql) {
+      const q = sql.replace(/\s+/g, " ").trim(); clientCalls.push(q);
+      if (/SELECT payload FROM ingest\.sync_batches/.test(q)) return { rows: [{ payload: records }] };
+      if (/FROM ada\.branch_stock_current/.test(q)) return { rows: [{ product_code: "P1", qty: "2.0000", synced_at: at }] };
+      if (/FROM ada\.branch_stock_snapshots/.test(q)) return { rows: [{ product_code: "P1", qty: "2.0000", synced_at: at }] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  let update;
+  const db = {
+    connect: async () => client,
+    query: async (sql, params) => { update = { sql, params }; return { rows: [{ status: params[1] }] }; },
+  };
+  await reconcileBranchStockJob(db, {
+    sync_run_id: 7, branch_code: "000", ingestion_mode: "hybrid_v2", expected_manifest: expected,
+  });
+  assert.equal(clientCalls[0], "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  assert.equal(clientCalls.at(-1), "COMMIT");
+  assert.equal(update.params[1], "pass");
+  assert.equal(JSON.parse(update.params[5]).payloadVsNormalized.matches, true);
+  assert.match(update.sql, /WHERE sync_run_id = \$1::bigint AND status = 'processing'/);
+});
+
+test("reconciliation mismatch is terminal FAIL evidence and never writes stock", async () => {
+  const at = "2026-07-29T01:00:00.000Z";
+  const payload = [{ productCode: "P1", qty: 2, syncedAt: at }];
+  const client = {
+    async query(sql) {
+      if (/SELECT payload FROM ingest\.sync_batches/.test(sql)) return { rows: [{ payload }] };
+      if (/FROM ada\.branch_stock_current/.test(sql)) return { rows: [{ product_code: "P1", qty: 3, synced_at: at }] };
+      if (/FROM ada\.branch_stock_snapshots/.test(sql)) return { rows: [{ product_code: "P1", qty: 3, synced_at: at }] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  let update;
+  await reconcileBranchStockJob({
+    connect: async () => client,
+    query: async (sql, params) => { update = { sql, params }; return { rows: [] }; },
+  }, {
+    sync_run_id: 7, branch_code: "000",
+    ingestion_mode: "hybrid_v2",
+    expected_manifest: buildBranchStockReconciliationManifest(payload),
+  });
+  assert.equal(update.params[1], "fail");
+  assert.equal(JSON.parse(update.params[5]).payloadVsNormalizedRows.mismatchCount, 1);
+  assert.doesNotMatch(update.sql, /INSERT INTO ada|UPDATE ada|DELETE FROM ada/);
+});
+
+test("reconciliation maintenance reaps leases and prunes only aged terminal evidence", async () => {
+  const calls = [];
+  await maintainReconciliations({
+    query: async (sql, params) => { calls.push({ sql: sql.replace(/\s+/g, " ").trim(), params }); return { rows: [], rowCount: 0 }; },
+  }, { reconciliationRetentionDays: 90 });
+  assert.match(calls[0].sql, /reconciliation\.status = 'pending'/);
+  assert.match(calls[0].sql, /run\.status = 'failed'/);
+  assert.match(calls[0].sql, /never became eligible/);
+  // CLAIM-X-048 fix: a new "orphaned" scan terminalizes any reconciliation
+  // whose retirement already ended refused/dead_letter, independent of
+  // whether the retirement-side code already did so in the same breath.
+  assert.match(calls[1].sql, /retirement\.status IN \('refused', 'dead_letter'\)/);
+  assert.match(calls[1].sql, /reconciliation\.status IN \('pending', 'processing', 'retry_wait'\)/);
+  assert.match(calls[2].sql, /status = 'processing'/);
+  assert.match(calls[2].sql, /THEN 'dead_letter' ELSE 'retry_wait'/);
+  assert.match(calls[3].sql, /status IN \('pass', 'fail', 'dead_letter'\)/);
+  assert.doesNotMatch(calls[3].sql, /pending|processing|retry_wait/);
+  assert.deepEqual(calls[3].params, [90]);
 });
 
 test("branch stock applier updates only the whitelisted branch columns and guards freshness", async () => {
@@ -66,14 +157,34 @@ test("worker terminal logs are structured and never contain payloads or secrets"
 
 test("apply, batch status, and recomputed counters share one transaction", async () => {
   const calls = [];
-  const client = { query: async (sql) => { calls.push(sql.replace(/\s+/g, " ").trim()); return { rows: [], rowCount: 1 }; }, release() {} };
-  const db = { query: async () => ({ rows: [{ batch_id: 1, sync_run_id: 7, dataset: "branch_stock", payload: [{ productCode: "P1", qty: 1, syncedAt: "2026-01-01T00:00:00Z" }], attempts: 1, max_attempts: 5, branch_code: "000" }] }), connect: async () => client };
+  const client = {
+    query: async (sql) => {
+      const q = sql.replace(/\s+/g, " ").trim();
+      calls.push(q);
+      // CLAIM-X-058 fix: processOneBatch now fences ownership with a
+      // SELECT ... FOR UPDATE before touching stock — this mock must answer
+      // it with a row matching the claimed batch (status='processing',
+      // attempts=1) or the fence would (correctly) reject every call.
+      if (/SELECT status, attempts FROM ingest\.sync_batches/.test(q)) return { rows: [{ status: "processing", attempts: 1 }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    },
+    release() {},
+  };
+  // registerRetirementJobIfComplete (generation remediation round, fixes
+  // CLAIM-X-047) runs on this SAME client/transaction, not a separate
+  // connection — that is the whole point of the fix (atomic with the batch
+  // commit, no fire-and-forget gap) — so a single mock client is enough now.
+  const db = {
+    query: async () => ({ rows: [{ batch_id: 1, sync_run_id: 7, dataset: "branch_stock", payload: [{ productCode: "P1", qty: 1, syncedAt: "2026-01-01T00:00:00Z" }], attempts: 1, max_attempts: 5, branch_code: "000" }] }),
+    connect: async () => client,
+  };
   await processOneBatch(db);
   assert.equal(calls[0], "BEGIN"); assert.equal(calls.at(-1), "COMMIT");
   assert.ok(calls.find((q) => /INSERT INTO ada\.branch_stock_snapshots/.test(q)));
   assert.ok(calls.find((q) => /UPDATE ingest\.sync_batches SET status = 'applied'/.test(q)));
   const recompute = calls.find((q) => /WITH counts AS/.test(q));
   assert.match(recompute, /COUNT\(\*\) FILTER/); assert.doesNotMatch(recompute, /applied_batches \+ 1/);
+  assert.ok(calls.find((q) => /INSERT INTO ingest\.branch_stock_retirements/.test(q)), "retirement registration must run inside the same transaction");
 });
 
 test("failed apply rolls back live writes before retry status transaction", async () => {
@@ -122,7 +233,13 @@ test("two concurrent claimers receive different batches", async () => {
 test("branch 000 and 001 writes preserve both values and older branch data is ignored (mock storage)", async () => {
   const row = {};
   const client = { async query(sql, params) {
-    const branch = /qty_branch_(\d{3}) = EXCLUDED/.exec(sql)[1];
+    // applyBranchStockBatch now also dual-writes to ada.branch_stock_current
+    // (WP3 Phase 1) — that second query has no per-branch column name to
+    // match, so it's not relevant to this test's wide-table-specific
+    // assertions; skip it rather than let the regex below throw on it.
+    const match = /qty_branch_(\d{3}) = EXCLUDED/.exec(sql);
+    if (!match) return;
+    const branch = match[1];
     const incomingAt = new Date(params[7][0]);
     if (!row[`at_${branch}`] || row[`at_${branch}`] <= incomingAt) {
       row[`qty_${branch}`] = params[5][0]; row[`at_${branch}`] = incomingAt;
@@ -138,10 +255,20 @@ test("branch 000 and 001 writes preserve both values and older branch data is ig
 });
 
 test("null incoming cost uses COALESCE to preserve stored cost", async () => {
-  let call;
-  await applyBranchStockBatch({ query: async (sql, params) => { call = { sql, params }; } }, [{ productCode: "P1", qty: 3, costAvg: null, syncedAt: "2026-01-02" }], "000");
-  assert.equal(call.params[6][0], null);
-  assert.match(call.sql, /cost_avg_branch_000 = COALESCE\(EXCLUDED\.cost_avg_branch_000, ada\.branch_stock_snapshots\.cost_avg_branch_000\)/);
+  const calls = [];
+  await applyBranchStockBatch({ query: async (sql, params) => { calls.push({ sql, params }); } }, [{ productCode: "P1", qty: 3, costAvg: null, syncedAt: "2026-01-02" }], "000");
+  // calls[0] is the wide-table upsert; calls[1] (WP3 Phase 1) is the new
+  // ada.branch_stock_current dual-write — asserted separately below.
+  assert.equal(calls[0].params[6][0], null);
+  assert.match(calls[0].sql, /cost_avg_branch_000 = COALESCE\(EXCLUDED\.cost_avg_branch_000, ada\.branch_stock_snapshots\.cost_avg_branch_000\)/);
+
+  assert.match(calls[1].sql, /INSERT INTO ada\.branch_stock_current/);
+  assert.match(calls[1].sql, /cost_avg = COALESCE\(EXCLUDED\.cost_avg, ada\.branch_stock_current\.cost_avg\)/);
+  assert.equal(calls[1].params[6][0], null);
+  // params: [...unnestParams (11), branchCode, syncRunId] — branch-stock
+  // generation round added syncRunId as the new final scalar param.
+  assert.equal(calls[1].params.at(-2), "000", "branch_code is the second-to-last scalar param, not templated into the SQL");
+  assert.equal(calls[1].params.at(-1), null, "syncRunId defaults to null when applyBranchStockBatch isn't given one");
 });
 
 test("exhausted retry becomes dead_letter and marks the run failed from recomputed counts", async () => {
