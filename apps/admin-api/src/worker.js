@@ -272,30 +272,93 @@ async function readReconciliationInputs(client, job) {
      ORDER BY batch_seq`,
     [job.sync_run_id],
   );
+  // Gate-6 Track R, Option B (Codex/human decision 2026-08-06; corrected
+  // design in _ledger/claude.md, counter-example in _ledger/codex.md
+  // CLAIM-X-134). Supersedes the CLAIM-C-046 `IS NOT NULL` domain filter
+  // this comment used to describe: that filter fixed the original
+  // asymmetric-selector bug (run 1917's unstamped TEST001 row) but left two
+  // real gaps Codex proved from this exact code path --
+  //   (1) a product retired after holding a real, non-NULL stamp from a
+  //       PAST generation stayed in-domain forever (its stamp is never
+  //       cleared by the retirement sweep), permanently mismatching against
+  //       the payload's real absence of that product; and
+  //   (2) a zero-qty row confirmed-current on one table but stale on the
+  //       other could still coincidentally digest-match (the manifest
+  //       digest never reads the stamp -- see branchStockReconciliation.js
+  //       canonicalRows), silently passing a genuine generation divergence.
+  // The domain is now `qty <> 0 OR stamp = THIS run's own sync_run_id` --
+  // current-generation-exact, not merely non-NULL -- on both selectors
+  // symmetrically, which closes both gaps (a stale stamp no longer keeps a
+  // zeroed-out row in-domain; a wide-side lag with the same qty as
+  // normalized now falls out of wide's domain instead of quietly matching).
   const normalized = await client.query(
     `SELECT product_code, qty, synced_at
      FROM ada.branch_stock_current
-     WHERE branch_code = $1`,
-    [job.branch_code],
+     WHERE branch_code = $1 AND (qty <> 0 OR last_full_sync_run_id = $2::bigint)`,
+    [job.branch_code, job.sync_run_id],
   );
-  // Column identifiers are selected exclusively from BRANCH_COLUMNS.
-  // CLAIM-C-046 fix: filter on ${columns.fullSyncRunId}, not ${columns.freshness}.
-  // Legacy v1 branches populate the freshness timestamp inconsistently (it is
-  // written unconditionally, arrival-order, never gated) but ALWAYS stamp the
-  // full-snapshot generation id once a v1 write threads a syncRunId (see
-  // routes/branch-stock.js upsertBranchStockSnapshot). Filtering on freshness
-  // meant a v1 branch's wide-table read was permanently empty (freshness was
-  // never populated by v1 before this round), so buildBranchStockReconciliationManifest
-  // threw on an empty snapshot and every v1 reconciliation dead-lettered.
   const wide = await client.query(
     `SELECT product_code, ${columns.qty} AS qty, ${columns.freshness} AS synced_at
      FROM ada.branch_stock_snapshots
-     WHERE ${columns.fullSyncRunId} IS NOT NULL`,
+     WHERE ${columns.qty} <> 0 OR ${columns.fullSyncRunId} = $1::bigint`,
+    [job.sync_run_id],
+  );
+  // Explicit generation-membership verification (the second half of Option
+  // B, not a byproduct of the domain filter above): independently reads
+  // which product codes each table confirms as belonging to THIS EXACT
+  // generation (stamp = job.sync_run_id, not merely "in the qty/stamp
+  // domain"), so reconcileBranchStockJob can compare the two sets and the
+  // counts directly -- catching a cross-table generation divergence even in
+  // configurations where the qty-domain filter above and the manifest
+  // digest would not, rather than depending solely on the digest comparison
+  // to notice. Reuses the exact same signal (`expected_manifest`'s
+  // registered `uniqueProductCount`) that computeExpectedMembershipCount
+  // already relies on for retirement's own membership proof, applying it to
+  // reconciliation as its own, independent check instead of inferring it
+  // indirectly from the qty-filtered manifests above.
+  const normalizedMembership = await client.query(
+    `SELECT product_code FROM ada.branch_stock_current
+     WHERE branch_code = $1 AND last_full_sync_run_id = $2::bigint`,
+    [job.branch_code, job.sync_run_id],
+  );
+  const wideMembership = await client.query(
+    `SELECT product_code FROM ada.branch_stock_snapshots WHERE ${columns.fullSyncRunId} = $1::bigint`,
+    [job.sync_run_id],
   );
   return {
     payloadRecords: reconciliationRowsFromBatches(batches.rows),
     normalizedRecords: normalized.rows,
     wideRecords: wide.rows,
+    normalizedMembershipCodes: normalizedMembership.rows.map((row) => row.product_code),
+    wideMembershipCodes: wideMembership.rows.map((row) => row.product_code),
+  };
+}
+
+// Option B's explicit generation-membership check: compares which product
+// codes each table confirms for THIS generation as a plain set-difference
+// (not a qty/digest comparison), and additionally checks the confirmed count
+// against the generation's own registered `expected_manifest.uniqueProductCount`
+// where available. Read-only; never writes stock. `expectedCount` may be null
+// (e.g. a payload manifest that could not report a count) -- the count check
+// is then simply skipped, matching computeExpectedMembershipCount's existing
+// "retry, don't refuse, on missing evidence" posture rather than inventing a
+// stricter failure mode here.
+function compareGenerationMembership(normalizedCodes, wideCodes, expectedCount) {
+  const normalizedSet = new Set(normalizedCodes);
+  const wideSet = new Set(wideCodes);
+  const onlyInNormalized = [...normalizedSet].filter((code) => !wideSet.has(code)).sort();
+  const onlyInWide = [...wideSet].filter((code) => !normalizedSet.has(code)).sort();
+  const countMatches = expectedCount == null || normalizedSet.size === expectedCount;
+  const matches = onlyInNormalized.length === 0 && onlyInWide.length === 0 && countMatches;
+  return {
+    matches,
+    normalizedCount: normalizedSet.size,
+    wideCount: wideSet.size,
+    expectedCount: expectedCount ?? null,
+    onlyInNormalizedCount: onlyInNormalized.length,
+    onlyInWideCount: onlyInWide.length,
+    onlyInNormalized: onlyInNormalized.slice(0, 20),
+    onlyInWide: onlyInWide.slice(0, 20),
   };
 }
 
@@ -330,12 +393,19 @@ async function reconcileBranchStockJob(db, job) {
     ? buildMismatchExamples(inputs.payloadRecords, inputs.normalizedRecords)
     : { mismatchCount: null, examples: [], examplesTruncated: false, reason: "v1 source rows are not retained" };
   const wideMismatches = buildMismatchExamples(inputs.normalizedRecords, inputs.wideRecords);
+  const expectedMembershipCount =
+    typeof payloadManifest?.uniqueProductCount === "number" ? payloadManifest.uniqueProductCount : null;
+  const generationMembership = compareGenerationMembership(
+    inputs.normalizedMembershipCodes, inputs.wideMembershipCodes, expectedMembershipCount,
+  );
   const pass = sourceVsPayload.matches !== false && payloadVsNormalized.matches &&
-    normalizedVsWide.matches && payloadManifest.duplicateProductCount === 0;
+    normalizedVsWide.matches && payloadManifest.duplicateProductCount === 0 &&
+    generationMembership.matches;
   const mismatchSummary = {
     sourceVsPayload,
     payloadVsNormalized,
     normalizedVsWide,
+    generationMembership,
     payloadVsNormalizedRows: normalizedMismatches,
     normalizedVsWideRows: wideMismatches,
   };
