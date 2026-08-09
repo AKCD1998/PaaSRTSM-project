@@ -80,6 +80,19 @@ test.before(async function () {
   if (!databaseUrl) return;
   pool = new Pool({ connectionString: databaseUrl, max: 8 });
   countingPool = makeCountingPool(pool);
+  // Standalone schema bootstrap (test-harness remediation, 2026-08-09): this
+  // file previously assumed the target database already had the ada.*
+  // schema applied out-of-band. No FK dependencies here (unlike Slice 2's
+  // table) — ada.sales_headers/ada.sales_lines only need
+  // migrations/015_add_ada_raw_ingestion.sql, same file Slice 1 and Slice 4
+  // already bootstrap from. Confirmed genuinely idempotent by reading the
+  // file (CREATE SCHEMA/TABLE IF NOT EXISTS throughout, wrapped in
+  // BEGIN/COMMIT, no bare ALTER) — safe to apply unconditionally.
+  const migrationSql = fs.readFileSync(
+    path.join(__dirname, "..", "..", "..", "..", "migrations", "015_add_ada_raw_ingestion.sql"),
+    "utf8",
+  );
+  await pool.query(migrationSql);
 });
 
 test.after(async function () {

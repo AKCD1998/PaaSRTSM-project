@@ -84,6 +84,55 @@ test.before(async function () {
   if (!databaseUrl) return;
   pool = new Pool({ connectionString: databaseUrl, max: 8 });
   countingPool = makeCountingPool(pool);
+  // Standalone schema bootstrap (test-harness remediation, 2026-08-09): this
+  // file previously assumed the target database already had the full FK
+  // chain (public.items -> public.skus -> analytics.product_sales_summary_periods,
+  // core.branches) applied out-of-band. This route's table has FK
+  // constraints Slice 1/3/4's ada.* tables do not, so the bootstrap here
+  // needs the official baseline schema plus migrations through 014 (which
+  // adds the skus_company_code_key UNIQUE constraint, core.branches, and
+  // analytics.product_sales_summary_periods itself) — not just one
+  // migration file. Applied in the same numeric order the project's own
+  // scripts/db_migrate.js uses. Every one of these files is genuinely
+  // idempotent (CREATE ... IF NOT EXISTS throughout — confirmed by reading
+  // them, not assumed), so this is safe to run unconditionally whether the
+  // database is brand new or already migrated. Migration 012 is skipped: it
+  // requires the "vector" Postgres extension, which is not installed on
+  // this disposable local cluster and is unrelated to sales-summary — its
+  // own file is wrapped in BEGIN/COMMIT, so a failed statement inside it
+  // rolls back cleanly with no partial effect, confirmed empirically during
+  // Slice 2's original Phase B setup.
+  const rootDir = path.join(__dirname, "..", "..", "..", "..");
+  // stripBom: 001_inventory_schema.sql (and only that file among the ones
+  // this bootstrap reads — confirmed by checking every file's first 3 bytes
+  // directly, not assumed) starts with a UTF-8 byte-order-mark (EF BB BF).
+  // Node's fs.readFileSync does NOT strip a BOM even with "utf8" encoding,
+  // so the raw ﻿ character was being sent to Postgres as literal SQL
+  // text, producing "syntax error at or near BEGIN" the first time this
+  // bootstrap was actually exercised against a fresh database (a real,
+  // previously-undetected bug — Slice 1/3/4's bootstraps never read this
+  // particular file, so they never hit it).
+  const stripBom = (text) => (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  const baselineSql = stripBom(fs.readFileSync(path.join(rootDir, "001_inventory_schema.sql"), "utf8"));
+  await pool.query(baselineSql);
+  const migrationOrder = [
+    "002_add_sku_price_tiers.sql",
+    "003_add_product_fields.sql",
+    "004_add_enrichment_workflow.sql",
+    "005_add_sales_daily.sql",
+    "010_add_audit_logs.sql",
+    "011_add_sku_unit_prices.sql",
+    // 012_add_sku_embeddings.sql intentionally skipped — requires the
+    // "vector" extension, not installed on this disposable cluster, and
+    // unrelated to analytics.product_sales_summary_periods.
+    "013_add_embedding_sync_jobs.sql",
+    "014_add_shared_ordering_and_sync.sql",
+  ];
+  for (const file of migrationOrder) {
+    const sql = stripBom(fs.readFileSync(path.join(rootDir, "migrations", file), "utf8"));
+    // eslint-disable-next-line no-await-in-loop -- one-time test bootstrap, not the code under test
+    await pool.query(sql);
+  }
 });
 
 test.after(async function () {
