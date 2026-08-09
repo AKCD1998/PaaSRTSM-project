@@ -34,6 +34,24 @@ function normalizeSql(sql) {
   return String(sql).replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+// fix(mocks): Track C's set-based UPSERT queries (sync-ada.js /transfers and
+// /sales) send ONE query per batch, with each SQL parameter being a
+// per-column array (`UNNEST($1::text[], $2::text[], ...)`) rather than a
+// single row's scalar values. The mock blocks below used to assume the old
+// per-row scalar shape (`params[0]` = one doc_no string); under the new
+// shape `params[0]` is an array of doc_nos, one entry per row in the batch.
+// This helper iterates the batch by row index and hands each block a `col(i)`
+// accessor so the existing column-index mapping (already verified to match
+// production's UNNEST column order exactly) stays unchanged -- only the
+// scalar-vs-array assumption is fixed.
+function forEachUnnestRow(params, callback) {
+  const rowCount = Array.isArray(params[0]) ? params[0].length : 0;
+  for (let i = 0; i < rowCount; i += 1) {
+    callback((columnIndex) => params[columnIndex][i]);
+  }
+  return rowCount;
+}
+
 function createAdaMockDb() {
   const state = {
     branches: new Map(),
@@ -267,76 +285,84 @@ function createAdaMockDb() {
       }
 
       if (normalized.startsWith("insert into ada.transfer_headers")) {
-        state.transferHeaders.set(`${params[0]}|${params[1]}|${params[4]}`, {
-          doc_no: params[0],
-          doc_type: params[1],
-          branch_code: params[4],
-          branch_code_to: params[5],
-          warehouse_code: params[6],
-          warehouse_code_to: params[7],
-          doc_date: params[8],
-          created_by: params[12],
-          approved_by: params[13],
-          source_synced_at: params[19],
-          raw_payload: JSON.parse(params[20]),
+        const rowCount = forEachUnnestRow(params, (col) => {
+          state.transferHeaders.set(`${col(0)}|${col(1)}|${col(4)}`, {
+            doc_no: col(0),
+            doc_type: col(1),
+            branch_code: col(4),
+            branch_code_to: col(5),
+            warehouse_code: col(6),
+            warehouse_code_to: col(7),
+            doc_date: col(8),
+            created_by: col(12),
+            approved_by: col(13),
+            source_synced_at: col(19),
+            raw_payload: JSON.parse(col(20)),
+          });
         });
-        return { rowCount: 1, rows: [] };
+        return { rowCount, rows: [] };
       }
 
       if (normalized.startsWith("insert into ada.sales_headers")) {
-        state.salesHeaders.set(`${params[0]}|${params[1]}`, {
-          branch_code: params[0],
-          doc_no: params[1],
-          doc_date: params[2],
-          doc_time: params[3],
-          customer_code: params[4],
-          paid_status: params[5],
-          grand_amount: params[6],
-          net_amount: params[7],
-          vat_amount: params[8],
-          cashier_code: params[9],
-          terminal_code: params[10],
-          reference_doc_no: params[11],
-          source_synced_at: params[14],
-          raw_payload: JSON.parse(params[15]),
+        const rowCount = forEachUnnestRow(params, (col) => {
+          state.salesHeaders.set(`${col(0)}|${col(1)}`, {
+            branch_code: col(0),
+            doc_no: col(1),
+            doc_date: col(2),
+            doc_time: col(3),
+            customer_code: col(4),
+            paid_status: col(5),
+            grand_amount: col(6),
+            net_amount: col(7),
+            vat_amount: col(8),
+            cashier_code: col(9),
+            terminal_code: col(10),
+            reference_doc_no: col(11),
+            source_synced_at: col(14),
+            raw_payload: JSON.parse(col(15)),
+          });
         });
-        return { rowCount: 1, rows: [] };
+        return { rowCount, rows: [] };
       }
 
       if (normalized.startsWith("insert into ada.sales_lines")) {
-        state.salesLines.set(`${params[0]}|${params[1]}|${params[2]}|${params[3]}`, {
-          branch_code: params[0],
-          doc_no: params[1],
-          line_no: params[2],
-          product_code: params[3],
-          barcode: params[4],
-          qty: params[5],
-          qty_base: params[10],
-          stock_factor: params[9],
-          net_amount: params[8],
-          source_synced_at: params[15],
-          raw_payload: JSON.parse(params[16]),
+        const rowCount = forEachUnnestRow(params, (col) => {
+          state.salesLines.set(`${col(0)}|${col(1)}|${col(2)}|${col(3)}`, {
+            branch_code: col(0),
+            doc_no: col(1),
+            line_no: col(2),
+            product_code: col(3),
+            barcode: col(4),
+            qty: col(5),
+            qty_base: col(10),
+            stock_factor: col(9),
+            net_amount: col(8),
+            source_synced_at: col(15),
+            raw_payload: JSON.parse(col(16)),
+          });
         });
-        return { rowCount: 1, rows: [] };
+        return { rowCount, rows: [] };
       }
 
       if (normalized.startsWith("insert into ada.transfer_lines")) {
-        state.transferLines.set(`${params[0]}|${params[1]}|${params[2]}|${params[3]}|${params[4]}`, {
-          doc_no: params[0],
-          doc_type: params[1],
-          branch_code: params[2],
-          line_no: params[3],
-          product_code: params[4],
-          unit_code: params[6],
-          unit_name: params[7],
-          qty: params[8],
-          qty_base: params[9],
-          stock_factor: params[10],
-          warehouse_code: params[13],
-          source_synced_at: params[18],
-          raw_payload: JSON.parse(params[19]),
+        const rowCount = forEachUnnestRow(params, (col) => {
+          state.transferLines.set(`${col(0)}|${col(1)}|${col(2)}|${col(3)}|${col(4)}`, {
+            doc_no: col(0),
+            doc_type: col(1),
+            branch_code: col(2),
+            line_no: col(3),
+            product_code: col(4),
+            unit_code: col(6),
+            unit_name: col(7),
+            qty: col(8),
+            qty_base: col(9),
+            stock_factor: col(10),
+            warehouse_code: col(13),
+            source_synced_at: col(18),
+            raw_payload: JSON.parse(col(19)),
+          });
         });
-        return { rowCount: 1, rows: [] };
+        return { rowCount, rows: [] };
       }
 
       if (normalized.startsWith("insert into ada.sync_runs")) {

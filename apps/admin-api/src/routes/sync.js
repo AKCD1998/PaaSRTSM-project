@@ -566,7 +566,15 @@ function createSyncRouter(deps) {
     const client = await acquireIngestionDbClient(db, res, "sync:/sales-summary");
     if (!client) return;
     try {
+      if (records.length === 0) {
+        return res.json({ accepted: 0 });
+      }
+      // BEGIN before normalization (matches the OLD per-record path's
+      // ordering, and Track C Slice 1's own review lesson: a validation
+      // throw hitting ROLLBACK with no open transaction is harmless but a
+      // needless server-side WARNING at fleet scale).
       await client.query("BEGIN");
+      const normalized = [];
       for (const record of records) {
         const productCode = normalizeText(record.productCode);
         if (!productCode) {
@@ -577,31 +585,91 @@ function createSyncRouter(deps) {
         const periodStart =
           normalizeText(record.periodStart) ||
           new Date(Date.now() - (periodDays - 1) * 86400000).toISOString().slice(0, 10);
-
-        // eslint-disable-next-line no-await-in-loop
-        await client.query(
-          `
-            INSERT INTO analytics.product_sales_summary_periods
-              (product_code, branch_code, period_start, period_end, period_days, sold_qty_base, avg_daily_usage, source_name)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'adapos_sync')
-            ON CONFLICT (product_code, branch_code, period_start, period_end, source_name)
-            DO UPDATE SET
-              period_days = EXCLUDED.period_days,
-              sold_qty_base = EXCLUDED.sold_qty_base,
-              avg_daily_usage = EXCLUDED.avg_daily_usage
-          `,
-          [
-            productCode,
-            normalizeText(record.branchCode) || null,
-            periodStart,
-            periodEnd,
-            periodDays,
-            toNumber(record.soldQtyBase, 0),
-            toNumber(record.avgDailyUsage, 0),
-          ],
-        );
+        normalized.push({
+          productCode,
+          branchCode: normalizeText(record.branchCode) || null,
+          periodStart,
+          periodEnd,
+          periodDays,
+          soldQtyBase: toNumber(record.soldQtyBase, 0),
+          avgDailyUsage: toNumber(record.avgDailyUsage, 0),
+        });
       }
+
+      // Track C Slice 2 (2026-08-09): set-based batch UPSERT for
+      // /sales-summary, replacing the per-record loop above this route used
+      // to run. Same request/response contract, same validation, same
+      // transaction atomicity, same 503 acquisition guard — one set-based
+      // INSERT ... SELECT FROM UNNEST(...) ON CONFLICT per payload instead
+      // of one statement per record.
+      //
+      // Ground truth confirmed empirically against the OLD path before
+      // writing this (real disposable Postgres, not assumed):
+      //   - Duplicate conflict key with a NON-NULL branch_code: the OLD path
+      //     applied each record as a separate statement in array order, so
+      //     the LATER record's ON CONFLICT DO UPDATE overwrote the earlier
+      //     one => LAST-wins. Preserved here by de-duplicating only the
+      //     non-null-branch subset before the batch INSERT, keeping the LAST
+      //     occurrence per key.
+      //   - Duplicate conflict key with a NULL branch_code: PostgreSQL's
+      //     plain UNIQUE constraint treats NULL as never equal to NULL, so
+      //     ON CONFLICT never fires — the OLD path silently INSERTed a new
+      //     row for every occurrence, never deduplicating. This is preserved
+      //     exactly: null-branch records are NOT de-duplicated before the
+      //     batch INSERT, and because a null-branch row can never match an
+      //     existing or in-batch conflict target either, including several
+      //     null-branch duplicates in the same single UNNEST statement does
+      //     not raise "ON CONFLICT DO UPDATE command cannot affect row a
+      //     second time" — Postgres just inserts each as a distinct row,
+      //     matching the OLD path's actual (not assumed) behavior.
+      // Codex review fix (2026-08-09): the dedup key was originally built by
+      // string-concatenating fields with a "|" separator
+      // (`${productCode}|${branchCode}|...`), which collides whenever a
+      // field value itself contains "|" — e.g. productCode="A|B",
+      // branchCode="C" collided with productCode="A", branchCode="B|C",
+      // silently dropping one of two distinct rows (reproduced: accepted:2,
+      // 1 row persisted). Neither the schema nor validation forbids "|" in
+      // these text columns, so this was a real data-loss bug, not a
+      // theoretical one. Fixed by keying on a JSON-encoded tuple instead of
+      // string concatenation — JSON.stringify of an array cannot collide
+      // this way, since each element is individually quoted/escaped.
+      const byKey = new Map();
+      const nullBranchRows = [];
+      for (const n of normalized) {
+        if (n.branchCode === null) {
+          nullBranchRows.push(n);
+        } else {
+          byKey.set(JSON.stringify([n.productCode, n.branchCode, n.periodStart, n.periodEnd]), n);
+        }
+      }
+      const toWrite = [...byKey.values(), ...nullBranchRows];
+
+      await client.query(
+        `
+          INSERT INTO analytics.product_sales_summary_periods
+            (product_code, branch_code, period_start, period_end, period_days, sold_qty_base, avg_daily_usage, source_name)
+          SELECT u.product_code, u.branch_code, u.period_start, u.period_end, u.period_days, u.sold_qty_base, u.avg_daily_usage, 'adapos_sync'
+          FROM UNNEST(
+            $1::text[], $2::text[], $3::date[], $4::date[], $5::integer[], $6::numeric[], $7::numeric[]
+          ) AS u(product_code, branch_code, period_start, period_end, period_days, sold_qty_base, avg_daily_usage)
+          ON CONFLICT (product_code, branch_code, period_start, period_end, source_name)
+          DO UPDATE SET
+            period_days = EXCLUDED.period_days,
+            sold_qty_base = EXCLUDED.sold_qty_base,
+            avg_daily_usage = EXCLUDED.avg_daily_usage
+        `,
+        [
+          toWrite.map((r) => r.productCode),
+          toWrite.map((r) => r.branchCode),
+          toWrite.map((r) => r.periodStart),
+          toWrite.map((r) => r.periodEnd),
+          toWrite.map((r) => r.periodDays),
+          toWrite.map((r) => r.soldQtyBase),
+          toWrite.map((r) => r.avgDailyUsage),
+        ],
+      );
       await client.query("COMMIT");
+      // accepted = INPUT record count, not de-duped row count (matches OLD path).
       return res.json({ accepted: records.length });
     } catch (e) {
       await client.query("ROLLBACK");

@@ -758,6 +758,23 @@ function normalizeTransferHeaderRecord(record) {
   };
 }
 
+// fix/transfer-header-index-collision (2026-08-09): the lookup keys below
+// were previously built via string concatenation with "|" as a separator
+// (`${docNo}|${docType}|${branchCode}`), which collides whenever a field
+// value itself contains "|" — reproduced and confirmed before fixing:
+// headers (docNo="A|B", docType="C", branchCode="001") and (docNo="A",
+// docType="B|C", branchCode="001") both concatenated to the identical
+// string "A|B|C|001", so the second header silently overwrote the first in
+// the Map, and a line resolving against the first header's key instead
+// matched the second header's data (observed: warehouse_code came back
+// "WH_WRONG" instead of "WH_EXPECTED"). Same collision class Codex's Slice
+// 2 review found in a different (already-fixed) piece of code. Fixed by
+// keying on JSON.stringify(tuple) instead of string concatenation — cannot
+// collide this way, since each element is individually quoted/escaped.
+// byDocNo's single-field key is left as a plain string: with only one
+// field and no separator involved, there is no concatenation-collision
+// risk to fix there. Fallback precedence (full key -> docNo+docType ->
+// docNo) is unchanged; only the key construction changed.
 function buildTransferHeaderIndexes(headers) {
   const byDocNoTypeBranch = new Map();
   const byDocNoType = new Map();
@@ -768,10 +785,10 @@ function buildTransferHeaderIndexes(headers) {
     const docType = normalizeText(header.docType || "");
     const branchCode = normalizeText(header.branchCode || "");
     if (docNo && docType && branchCode) {
-      byDocNoTypeBranch.set(`${docNo}|${docType}|${branchCode}`, header);
+      byDocNoTypeBranch.set(JSON.stringify([docNo, docType, branchCode]), header);
     }
     if (docNo && docType) {
-      byDocNoType.set(`${docNo}|${docType}`, header);
+      byDocNoType.set(JSON.stringify([docNo, docType]), header);
     }
     if (docNo) {
       byDocNo.set(docNo, header);
@@ -787,8 +804,8 @@ function resolveRelatedTransferHeader(record, indexes) {
   const branchCode = normalizeText(pick(record, ["FTBchCode", "branchCode", "branchFrm"]) || "");
 
   return (
-    indexes.byDocNoTypeBranch.get(`${docNo}|${docType}|${branchCode}`) ||
-    indexes.byDocNoType.get(`${docNo}|${docType}`) ||
+    indexes.byDocNoTypeBranch.get(JSON.stringify([docNo, docType, branchCode])) ||
+    indexes.byDocNoType.get(JSON.stringify([docNo, docType])) ||
     indexes.byDocNo.get(docNo) ||
     null
   );
@@ -1787,6 +1804,175 @@ const upsertStockAdjustmentLine = createHeaderLineUpsert(
   "(branch_code, doc_no, line_no, product_code)",
 );
 
+// Track C Slice 1 (2026-08-09): set-based batch handler for /stock-snapshots,
+// replacing the per-record UPSERT loop inside createRecordsHandler for this one
+// route only. Same request/response contract, same validation, same transaction
+// atomicity, same 503 acquisition guard — but the whole payload's records are
+// applied as ONE set-based INSERT ... SELECT * FROM UNNEST(...) ON CONFLICT,
+// instead of one INSERT per record (a real production window measured ~33,253
+// per-record calls from this route alone, via a pg_stat_statements diff).
+// Investigation history/measurement detail lives in the Gate 6 Track C review
+// process, not in this file — a shipped source comment should not depend on
+// an internal, non-shipped ledger citation for its own context.
+//
+// Ground truth confirmed empirically before writing this (UNVERIFIED items in
+// the delegation packet, both resolved against the OLD per-record path on a real
+// disposable Postgres):
+//   - Duplicate snapshot_key within one payload: the OLD path applied each record
+//     as a separate statement in array order, so the LATER record's ON CONFLICT
+//     DO UPDATE overwrote the earlier one => LAST-wins. A single-statement UNNEST
+//     batch would instead raise "ON CONFLICT DO UPDATE command cannot affect row
+//     a second time" if the same key appears twice, so this handler de-duplicates
+//     by snapshot_key BEFORE the batch INSERT, keeping the LAST occurrence to
+//     preserve the OLD path's observed last-wins semantics.
+//   - Error/rollback shape: a thrown validation error (missing productCode) has
+//     no statusCode/status property, so the production error middleware
+//     (server.js:486-496) returns HTTP 500 { error: "Internal server error" }.
+//     This handler throws the same Error from the same validation, forwarded via
+//     the same next(e), so the response shape is identical.
+//
+// `accepted` in the response is the INPUT record count (records.length), NOT the
+// de-duplicated row count — confirmed against the OLD path, which returns
+// records.length even when duplicates collapse to fewer rows.
+function stockSnapshotsBatchHandler(db) {
+  return async (req, res, next) => {
+    const { error, records } = parseApiRecords(req.body);
+    if (error) {
+      return res.status(400).json({ message: error });
+    }
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:stock-snapshots");
+    if (!client) return;
+    try {
+      if (records.length === 0) {
+        // Empty payload: skip BEGIN/INSERT entirely (no-op), preserve the exact
+        // response shape the OLD path produced.
+        return res.json({ accepted: 0, syncRunId: getSyncRunId(req.body) });
+      }
+      // BEGIN before normalization (matches the OLD path's ordering exactly —
+      // createRecordsHandler always opens the transaction first). Sonnet review
+      // fix 2026-08-09: an earlier draft normalized/validated before BEGIN, so a
+      // thrown validation error hit the catch's ROLLBACK with no transaction
+      // open — harmless (Postgres treats ROLLBACK-outside-a-transaction as a
+      // no-op) but it emits a server-side WARNING on every rejected payload,
+      // which is needless log noise at fleet scale and an avoidable deviation
+      // from the OLD path's behavior. Moved here so ROLLBACK always follows a
+      // real BEGIN, same as before.
+      await client.query("BEGIN");
+      // Normalize + validate every record up front (identical field extraction
+      // to upsertStockSnapshot, in the same order). A single invalid record
+      // throws here, before the INSERT is issued, so the whole payload is
+      // rejected atomically via the transaction opened above.
+      const normalized = [];
+      for (const record of records) {
+        const productCode = normalizeNullableText(pick(record, ["FTPdtCode", "productCode"]));
+        const snapshotAt = parseTimestamp(pick(record, ["snapshotAt", "sourceSnapshotAt"]), getSourceSyncedAt(req.body));
+        if (!productCode || !snapshotAt) {
+          throw new Error("Each stock snapshot requires productCode/FTPdtCode and snapshotAt.");
+        }
+        const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+        const warehouseCode = normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"]));
+        const lotNo = normalizeNullableText(pick(record, ["FTLotNo", "lotNo"]));
+        const expiryDate = parseDate(pick(record, ["FDExpired", "expiryDate"]));
+        normalized.push({
+          snapshotKey: buildStockSnapshotKey(snapshotAt, branchCode, warehouseCode, productCode, lotNo, expiryDate),
+          snapshotAt,
+          branchCode,
+          warehouseCode,
+          productCode,
+          barcode: normalizeNullableText(pick(record, ["FTPdtBarCode", "barcode"])),
+          lotNo,
+          expiryDate,
+          qtyOnHand: toNumber(pick(record, ["FCPdtQty", "qtyOnHand", "stockCurrent"])),
+          qtyReserved: toNumber(pick(record, ["FCPdtQtyRsv", "qtyReserved"])),
+          unitCode: normalizeNullableText(pick(record, ["FTPunCode", "unitCode"])),
+          qtyBase: toNumber(pick(record, ["qtyBase"])),
+          sourceSystem: getSourceSystem(req.body),
+          sourceTable: normalizeText(pick(record, ["sourceTable"], "TCNTPdtStkCard")),
+          sourceSyncedAt: getSourceSyncedAt(req.body),
+          rawPayload: getRawPayload(record),
+        });
+      }
+      // De-duplicate by snapshot_key, LAST occurrence wins (matches OLD path's
+      // observed last-wins semantics). Map preserves insertion order; later
+      // writes to the same key overwrite the earlier value object.
+      const byKey = new Map();
+      for (const n of normalized) byKey.set(n.snapshotKey, n);
+      const unique = [...byKey.values()];
+
+      // Single set-based UPSERT via UNNEST. Parameter count is fixed at 16 (one
+      // array per data column), independent of payload size — avoids Postgres's
+      // ~65535-parameter ceiling that a VALUES ($1..$N*16) list would hit.
+      // Column order and type casts mirror upsertStockSnapshot exactly; updated_at
+      // is set to now() in the statement (not passed as data), as before.
+      await client.query(
+        `
+          INSERT INTO ada.stock_snapshots
+            (
+              snapshot_key, snapshot_at, branch_code, warehouse_code, product_code,
+              barcode, lot_no, expiry_date, qty_on_hand, qty_reserved, unit_code,
+              qty_base, source_system, source_table, source_synced_at, raw_payload,
+              updated_at
+            )
+          SELECT
+            u.key, u.at, u.branch, u.wh, u.product, u.barcode, u.lot, u.expiry,
+            u.qoh, u.qrsv, u.unit, u.qbase, u.srcsys, u.srctbl, u.srcsynced,
+            u.raw::jsonb, now()
+          FROM UNNEST(
+            $1::text[],      $2::timestamptz[], $3::text[],       $4::text[],
+            $5::text[],      $6::text[],        $7::text[],       $8::date[],
+            $9::numeric[],   $10::numeric[],    $11::text[],      $12::numeric[],
+            $13::text[],     $14::text[],       $15::timestamptz[], $16::text[]
+          ) AS u(key, at, branch, wh, product, barcode, lot, expiry, qoh, qrsv,
+                 unit, qbase, srcsys, srctbl, srcsynced, raw)
+          ON CONFLICT (snapshot_key) DO UPDATE SET
+            snapshot_at = EXCLUDED.snapshot_at,
+            branch_code = EXCLUDED.branch_code,
+            warehouse_code = EXCLUDED.warehouse_code,
+            product_code = EXCLUDED.product_code,
+            barcode = EXCLUDED.barcode,
+            lot_no = EXCLUDED.lot_no,
+            expiry_date = EXCLUDED.expiry_date,
+            qty_on_hand = EXCLUDED.qty_on_hand,
+            qty_reserved = EXCLUDED.qty_reserved,
+            unit_code = EXCLUDED.unit_code,
+            qty_base = EXCLUDED.qty_base,
+            source_system = EXCLUDED.source_system,
+            source_table = EXCLUDED.source_table,
+            source_synced_at = EXCLUDED.source_synced_at,
+            raw_payload = EXCLUDED.raw_payload,
+            updated_at = now()
+        `,
+        [
+          unique.map((r) => r.snapshotKey),
+          unique.map((r) => r.snapshotAt),
+          unique.map((r) => r.branchCode),
+          unique.map((r) => r.warehouseCode),
+          unique.map((r) => r.productCode),
+          unique.map((r) => r.barcode),
+          unique.map((r) => r.lotNo),
+          unique.map((r) => r.expiryDate),
+          unique.map((r) => r.qtyOnHand),
+          unique.map((r) => r.qtyReserved),
+          unique.map((r) => r.unitCode),
+          unique.map((r) => r.qtyBase),
+          unique.map((r) => r.sourceSystem),
+          unique.map((r) => r.sourceTable),
+          unique.map((r) => r.sourceSyncedAt),
+          unique.map((r) => r.rawPayload),
+        ],
+      );
+      await client.query("COMMIT");
+      // accepted = INPUT record count, not de-duped row count (matches OLD path).
+      return res.json({ accepted: records.length, syncRunId: getSyncRunId(req.body) });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  };
+}
+
 async function upsertStockSnapshot(client, body, record) {
   const productCode = normalizeNullableText(pick(record, ["FTPdtCode", "productCode"]));
   const snapshotAt = parseTimestamp(pick(record, ["snapshotAt", "sourceSnapshotAt"]), getSourceSyncedAt(body));
@@ -2063,6 +2249,82 @@ function createAdaSyncRouter(deps) {
       client.release();
     }
   });
+  // Track C Slice 3 (2026-08-09): set-based batch UPSERT for /sales,
+  // replacing the two per-record loops (headers, lines) this route used to
+  // run. Same request/response contract ({acceptedHeaders, acceptedLines}),
+  // same validation, same single shared transaction (an invalid record in
+  // EITHER array rolls back BOTH tables), same 503 acquisition guard, same
+  // COMMIT -> release -> CRM-mirror ordering (untouched below) — but each
+  // array is applied as one set-based INSERT ... SELECT FROM UNNEST(...)
+  // ON CONFLICT statement instead of one statement per record.
+  //
+  // Ground truth confirmed empirically against the OLD path before writing
+  // this (real disposable Postgres, not assumed): duplicate conflict keys
+  // in either array -> LAST array occurrence wins (same per-record-loop
+  // last-wins pattern as Slice 1/2). No NULL-conflict-key quirk here (both
+  // tables' conflict-key columns are required/validated non-empty, unlike
+  // Slice 2's nullable branch_code) — confirmed via schema read
+  // (migrations/015_add_ada_raw_ingestion.sql:207-208, 239-242, all NOT
+  // NULL) and empirical duplicate-key tests.
+  //
+  // Dedup keys use JSON.stringify(tuple), never string concatenation —
+  // Codex's Slice 2 review found a real data-loss bug where a "|"-joined
+  // key collided when a field value itself contained "|"; applied that
+  // fix here from the start rather than reproducing the same mistake.
+  function normalizeSalesHeader(body, record) {
+    const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+    const docNo = normalizeNullableText(pick(record, ["FTShdDocNo", "docNo"]));
+    if (!branchCode || !docNo) {
+      throw new Error("Each sales header requires FTBchCode and FTShdDocNo.");
+    }
+    return {
+      branchCode,
+      docNo,
+      docDate: parseDate(pick(record, ["FDShdDocDate", "docDate"])),
+      docTime: normalizeNullableText(pick(record, ["FTShdDocTime", "docTime"])),
+      customerCode: normalizeNullableText(pick(record, ["FTCstCode", "customerCode"])),
+      paidStatus: normalizeNullableText(pick(record, ["FTShdStaPaid", "paidStatus"])),
+      grandAmount: toNumber(pick(record, ["FCShdGndAmt", "grandAmount"])),
+      netAmount: toNumber(pick(record, ["FCShdNet", "netAmount"])),
+      vatAmount: toNumber(pick(record, ["FCShdVatable", "vatAmount"])),
+      cashierCode: normalizeNullableText(pick(record, ["FTUsrCode", "cashierCode"])),
+      terminalCode: normalizeNullableText(pick(record, ["FTPosCode", "terminalCode"])),
+      referenceDocNo: normalizeNullableText(pick(record, ["FTXshRefDocNo", "referenceDocNo"])),
+      sourceSystem: getSourceSystem(body),
+      sourceTable: normalizeText(pick(record, ["sourceTable"], "TPSTSalHD")),
+      sourceSyncedAt: getSourceSyncedAt(body),
+      rawPayload: getRawPayload(record),
+    };
+  }
+  function normalizeSalesLine(body, record) {
+    const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+    const docNo = normalizeNullableText(pick(record, ["FTShdDocNo", "docNo"]));
+    const lineNo = Number(pick(record, ["FNSdtSeqNo", "lineNo"], 0));
+    const productCode = normalizeNullableText(pick(record, ["FTPdtCode", "productCode"]));
+    if (!branchCode || !docNo || !Number.isInteger(lineNo) || lineNo <= 0 || !productCode) {
+      throw new Error("Each sales line requires FTBchCode, FTShdDocNo, positive lineNo, and FTPdtCode.");
+    }
+    return {
+      branchCode,
+      docNo,
+      lineNo,
+      productCode,
+      barcode: normalizeNullableText(pick(record, ["FTSdtBarCode", "barcode"])),
+      qty: toNumber(pick(record, ["FCSdtQty", "qty"])),
+      unitPrice: toNumber(pick(record, ["FCSdtSetPrice", "unitPrice"])),
+      discountAmount: toNumber(pick(record, ["FCSdtDis", "discountAmount"])),
+      lineAmount: toNumber(pick(record, ["FCSdtNetAfHD", "lineAmount"])),
+      stockFactor: toNumber(pick(record, ["FCSdtStkFac", "stockFactor"])),
+      qtyBase: toNumber(pick(record, ["qtyBase"])),
+      lotNo: normalizeNullableText(pick(record, ["FTSdtLotNo", "lotNo"])),
+      expiryDate: parseDate(pick(record, ["FDSdtExpired", "expiryDate"])),
+      sourceSystem: getSourceSystem(body),
+      sourceTable: normalizeText(pick(record, ["sourceTable"], "TPSTSalDT")),
+      sourceSyncedAt: getSourceSyncedAt(body),
+      rawPayload: getRawPayload(record),
+    };
+  }
+
   router.post("/sales", async (req, res, next) => {
     if (!req.body || !Array.isArray(req.body.headers) || !Array.isArray(req.body.lines)) {
       return res.status(400).json({ message: "Payload must include headers and lines arrays." });
@@ -2072,14 +2334,105 @@ function createAdaSyncRouter(deps) {
     let released = false;
     try {
       await client.query("BEGIN");
-      for (const record of req.body.headers) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertSalesHeader(client, req.body, record);
+
+      if (req.body.headers.length > 0) {
+        const normalizedHeaders = req.body.headers.map((record) => normalizeSalesHeader(req.body, record));
+        const headerByKey = new Map();
+        for (const h of normalizedHeaders) {
+          headerByKey.set(JSON.stringify([h.branchCode, h.docNo]), h);
+        }
+        const h = [...headerByKey.values()];
+        await client.query(
+          `
+            INSERT INTO ada.sales_headers
+              (branch_code, doc_no, doc_date, doc_time, customer_code, paid_status,
+               grand_amount, net_amount, vat_amount, cashier_code, terminal_code,
+               reference_doc_no, source_system, source_table, source_synced_at, raw_payload, updated_at)
+            SELECT u.branch_code, u.doc_no, u.doc_date, u.doc_time, u.customer_code, u.paid_status,
+                   u.grand_amount, u.net_amount, u.vat_amount, u.cashier_code, u.terminal_code,
+                   u.reference_doc_no, u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+            FROM UNNEST(
+              $1::text[], $2::text[], $3::date[], $4::text[], $5::text[], $6::text[],
+              $7::numeric[], $8::numeric[], $9::numeric[], $10::text[], $11::text[],
+              $12::text[], $13::text[], $14::text[], $15::timestamptz[], $16::text[]
+            ) AS u(branch_code, doc_no, doc_date, doc_time, customer_code, paid_status,
+                   grand_amount, net_amount, vat_amount, cashier_code, terminal_code,
+                   reference_doc_no, source_system, source_table, source_synced_at, raw_payload)
+            ON CONFLICT (branch_code, doc_no) DO UPDATE SET
+              doc_date = EXCLUDED.doc_date,
+              doc_time = EXCLUDED.doc_time,
+              customer_code = EXCLUDED.customer_code,
+              paid_status = EXCLUDED.paid_status,
+              grand_amount = EXCLUDED.grand_amount,
+              net_amount = EXCLUDED.net_amount,
+              vat_amount = EXCLUDED.vat_amount,
+              cashier_code = EXCLUDED.cashier_code,
+              terminal_code = EXCLUDED.terminal_code,
+              reference_doc_no = EXCLUDED.reference_doc_no,
+              source_system = EXCLUDED.source_system,
+              source_table = EXCLUDED.source_table,
+              source_synced_at = EXCLUDED.source_synced_at,
+              raw_payload = EXCLUDED.raw_payload,
+              updated_at = now()
+          `,
+          [
+            h.map((r) => r.branchCode), h.map((r) => r.docNo), h.map((r) => r.docDate), h.map((r) => r.docTime),
+            h.map((r) => r.customerCode), h.map((r) => r.paidStatus), h.map((r) => r.grandAmount), h.map((r) => r.netAmount),
+            h.map((r) => r.vatAmount), h.map((r) => r.cashierCode), h.map((r) => r.terminalCode), h.map((r) => r.referenceDocNo),
+            h.map((r) => r.sourceSystem), h.map((r) => r.sourceTable), h.map((r) => r.sourceSyncedAt), h.map((r) => r.rawPayload),
+          ],
+        );
       }
-      for (const record of req.body.lines) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertSalesLine(client, req.body, record);
+
+      if (req.body.lines.length > 0) {
+        const normalizedLines = req.body.lines.map((record) => normalizeSalesLine(req.body, record));
+        const lineByKey = new Map();
+        for (const l of normalizedLines) {
+          lineByKey.set(JSON.stringify([l.branchCode, l.docNo, l.lineNo, l.productCode]), l);
+        }
+        const l = [...lineByKey.values()];
+        await client.query(
+          `
+            INSERT INTO ada.sales_lines
+              (branch_code, doc_no, line_no, product_code, barcode, qty, unit_price,
+               discount_amount, line_amount, stock_factor, qty_base, lot_no, expiry_date,
+               source_system, source_table, source_synced_at, raw_payload, updated_at)
+            SELECT u.branch_code, u.doc_no, u.line_no, u.product_code, u.barcode, u.qty, u.unit_price,
+                   u.discount_amount, u.line_amount, u.stock_factor, u.qty_base, u.lot_no, u.expiry_date,
+                   u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+            FROM UNNEST(
+              $1::text[], $2::text[], $3::integer[], $4::text[], $5::text[], $6::numeric[], $7::numeric[],
+              $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::text[], $13::date[],
+              $14::text[], $15::text[], $16::timestamptz[], $17::text[]
+            ) AS u(branch_code, doc_no, line_no, product_code, barcode, qty, unit_price,
+                   discount_amount, line_amount, stock_factor, qty_base, lot_no, expiry_date,
+                   source_system, source_table, source_synced_at, raw_payload)
+            ON CONFLICT (branch_code, doc_no, line_no, product_code) DO UPDATE SET
+              barcode = EXCLUDED.barcode,
+              qty = EXCLUDED.qty,
+              unit_price = EXCLUDED.unit_price,
+              discount_amount = EXCLUDED.discount_amount,
+              line_amount = EXCLUDED.line_amount,
+              stock_factor = EXCLUDED.stock_factor,
+              qty_base = EXCLUDED.qty_base,
+              lot_no = EXCLUDED.lot_no,
+              expiry_date = EXCLUDED.expiry_date,
+              source_system = EXCLUDED.source_system,
+              source_table = EXCLUDED.source_table,
+              source_synced_at = EXCLUDED.source_synced_at,
+              raw_payload = EXCLUDED.raw_payload,
+              updated_at = now()
+          `,
+          [
+            l.map((r) => r.branchCode), l.map((r) => r.docNo), l.map((r) => r.lineNo), l.map((r) => r.productCode),
+            l.map((r) => r.barcode), l.map((r) => r.qty), l.map((r) => r.unitPrice), l.map((r) => r.discountAmount),
+            l.map((r) => r.lineAmount), l.map((r) => r.stockFactor), l.map((r) => r.qtyBase), l.map((r) => r.lotNo),
+            l.map((r) => r.expiryDate), l.map((r) => r.sourceSystem), l.map((r) => r.sourceTable),
+            l.map((r) => r.sourceSyncedAt), l.map((r) => r.rawPayload),
+          ],
+        );
       }
+
       await client.query("COMMIT");
       client.release();
       released = true;
@@ -2216,7 +2569,87 @@ function createAdaSyncRouter(deps) {
       client.release();
     }
   });
-  router.post("/stock-snapshots", createRecordsHandler(upsertStockSnapshot));
+  router.post("/stock-snapshots", stockSnapshotsBatchHandler(db));
+  // Track C Slice 4 (2026-08-09): set-based batch UPSERT for /transfers,
+  // replacing the two per-record loops (headers, lines) this route used to
+  // run. Same request/response contract ({acceptedHeaders, acceptedLines}),
+  // same 400-before-DB-acquisition validation shape ({message: ...}, not
+  // the 500 {error: ...} shape), same single shared transaction, same 503
+  // acquisition guard — but each array is applied as one set-based
+  // INSERT ... SELECT FROM UNNEST(...) ON CONFLICT statement instead of one
+  // statement per record.
+  //
+  // parseTransferPayload(req.body) is reused COMPLETELY UNCHANGED — it
+  // already resolves a line's missing docType/branchCode/warehouseCode/
+  // docDate from a matching header (by docNo+docType+branchCode, then
+  // docNo+docType, then docNo) and validates every record BEFORE any DB
+  // acquisition happens. That front-end behavior is preserved by
+  // construction here, not re-implemented — this handler only replaces
+  // HOW the already-resolved/already-validated headers/lines get written.
+  //
+  // Ground truth confirmed empirically against the OLD path before writing
+  // this (real disposable Postgres, not assumed): duplicate conflict keys
+  // in either array -> LAST array occurrence wins (same pattern as Slice
+  // 1-3). No NULL-conflict-key quirk (both tables' conflict-key columns are
+  // NOT NULL — migrations/015_add_ada_raw_ingestion.sql:126-130, 170-174).
+  //
+  // Dedup keys use JSON.stringify(tuple), never string concatenation —
+  // applied proactively from the start (Codex's Slice 2 finding), same as
+  // Slice 3. Note buildTransferHeaderIndexes/resolveRelatedTransferHeader
+  // (used internally by parseTransferPayload, untouched by this slice) DO
+  // use "|"-joined string keys for their own internal header-lookup maps —
+  // that is pre-existing code outside this slice's scope, not something
+  // this slice's dedup logic reuses or is affected by.
+  function normalizeTransferHeaderForWrite(body, record) {
+    return {
+      docNo: normalizeNullableText(record.docNo),
+      docType: normalizeNullableText(record.docType),
+      branchCode: normalizeNullableText(record.branchCode),
+      docStatus: normalizeNullableText(pick(record, ["FTPthStaDoc", "docStatus"])),
+      processStatus: normalizeNullableText(pick(record, ["FTPthStaPrcDoc", "processStatus"])),
+      branchCodeTo: normalizeNullableText(record.branchCodeTo),
+      warehouseCode: normalizeNullableText(record.warehouseCode),
+      warehouseCodeTo: normalizeNullableText(pick(record, ["FTWahCodeTo", "warehouseCodeTo", "whTo"])),
+      docDate: parseDate(record.docDate),
+      docTime: normalizeNullableText(pick(record, ["FTPthDocTime", "docTime"])),
+      approvedAt: parseTimestamp(pick(record, ["FDPthApprove", "approvedAt"])),
+      processedAt: parseTimestamp(pick(record, ["FDPthPrcDate", "processedAt"])),
+      createdBy: normalizeNullableText(record.createdBy),
+      approvedBy: normalizeNullableText(record.approvedBy),
+      remark: normalizeNullableText(pick(record, ["FTPthRmk", "remark"])),
+      referenceDocNo: normalizeNullableText(pick(record, ["FTPthRefDoc", "referenceDocNo"])),
+      referenceDocType: normalizeNullableText(pick(record, ["FTPthRefType", "referenceDocType"])),
+      sourceSystem: getSourceSystem(body),
+      sourceTable: normalizeText(pick(record, ["sourceTable"], "TCNTPdtTnfHD")),
+      sourceSyncedAt: getSourceSyncedAt(body),
+      rawPayload: getRawPayload(record),
+    };
+  }
+  function normalizeTransferLineForWrite(body, record) {
+    return {
+      docNo: normalizeNullableText(record.docNo),
+      docType: normalizeNullableText(record.docType),
+      branchCode: normalizeNullableText(record.branchCode),
+      lineNo: Number(record.lineNo),
+      productCode: normalizeNullableText(record.productCode),
+      barcode: normalizeNullableText(pick(record, ["FTPtdBarCode", "barcode"])),
+      unitCode: normalizeNullableText(record.unitCode),
+      unitName: normalizeNullableText(record.unitName),
+      qty: toNumber(record.qty),
+      qtyBase: toNumber(record.qtyBase),
+      stockFactor: toNumber(record.stockFactor),
+      lotNo: normalizeNullableText(pick(record, ["FTPtdLotNo", "lotNo"])),
+      expiryDate: parseDate(pick(record, ["FDPtdExpired", "expiryDate"])),
+      warehouseCode: normalizeNullableText(record.warehouseCode),
+      referenceDocNo: normalizeNullableText(pick(record, ["FTPthRefDoc", "referenceDocNo"])),
+      referenceLineNo: normalizeNullableText(pick(record, ["FNPtdRefSeqNo", "referenceLineNo"])),
+      sourceSystem: getSourceSystem(body),
+      sourceTable: normalizeText(pick(record, ["sourceTable"], "TCNTPdtTnfDT")),
+      sourceSyncedAt: getSourceSyncedAt(body),
+      rawPayload: getRawPayload(record),
+    };
+  }
+
   router.post("/transfers", async (req, res, next) => {
     const { error, headers, lines } = parseTransferPayload(req.body);
     if (error) {
@@ -2226,14 +2659,118 @@ function createAdaSyncRouter(deps) {
     if (!client) return;
     try {
       await client.query("BEGIN");
-      for (const record of headers) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertTransferHeader(client, req.body, record);
+
+      if (headers.length > 0) {
+        const normalizedHeaders = headers.map((record) => normalizeTransferHeaderForWrite(req.body, record));
+        const byKey = new Map();
+        for (const h of normalizedHeaders) {
+          byKey.set(JSON.stringify([h.docNo, h.docType, h.branchCode]), h);
+        }
+        const h = [...byKey.values()];
+        await client.query(
+          `
+            INSERT INTO ada.transfer_headers
+              (doc_no, doc_type, doc_status, process_status, branch_code, branch_code_to,
+               warehouse_code, warehouse_code_to, doc_date, doc_time, approved_at, processed_at,
+               created_by, approved_by, remark, reference_doc_no, reference_doc_type,
+               source_system, source_table, source_synced_at, raw_payload, updated_at)
+            SELECT u.doc_no, u.doc_type, u.doc_status, u.process_status, u.branch_code, u.branch_code_to,
+                   u.warehouse_code, u.warehouse_code_to, u.doc_date, u.doc_time, u.approved_at, u.processed_at,
+                   u.created_by, u.approved_by, u.remark, u.reference_doc_no, u.reference_doc_type,
+                   u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+            FROM UNNEST(
+              $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+              $7::text[], $8::text[], $9::date[], $10::text[], $11::timestamptz[], $12::timestamptz[],
+              $13::text[], $14::text[], $15::text[], $16::text[], $17::text[],
+              $18::text[], $19::text[], $20::timestamptz[], $21::text[]
+            ) AS u(doc_no, doc_type, doc_status, process_status, branch_code, branch_code_to,
+                   warehouse_code, warehouse_code_to, doc_date, doc_time, approved_at, processed_at,
+                   created_by, approved_by, remark, reference_doc_no, reference_doc_type,
+                   source_system, source_table, source_synced_at, raw_payload)
+            ON CONFLICT (doc_no, doc_type, branch_code) DO UPDATE SET
+              doc_status = EXCLUDED.doc_status,
+              process_status = EXCLUDED.process_status,
+              branch_code_to = EXCLUDED.branch_code_to,
+              warehouse_code = EXCLUDED.warehouse_code,
+              warehouse_code_to = EXCLUDED.warehouse_code_to,
+              doc_date = EXCLUDED.doc_date,
+              doc_time = EXCLUDED.doc_time,
+              approved_at = EXCLUDED.approved_at,
+              processed_at = EXCLUDED.processed_at,
+              created_by = EXCLUDED.created_by,
+              approved_by = EXCLUDED.approved_by,
+              remark = EXCLUDED.remark,
+              reference_doc_no = EXCLUDED.reference_doc_no,
+              reference_doc_type = EXCLUDED.reference_doc_type,
+              source_system = EXCLUDED.source_system,
+              source_table = EXCLUDED.source_table,
+              source_synced_at = EXCLUDED.source_synced_at,
+              raw_payload = EXCLUDED.raw_payload,
+              updated_at = now()
+          `,
+          [
+            h.map((r) => r.docNo), h.map((r) => r.docType), h.map((r) => r.docStatus), h.map((r) => r.processStatus),
+            h.map((r) => r.branchCode), h.map((r) => r.branchCodeTo), h.map((r) => r.warehouseCode), h.map((r) => r.warehouseCodeTo),
+            h.map((r) => r.docDate), h.map((r) => r.docTime), h.map((r) => r.approvedAt), h.map((r) => r.processedAt),
+            h.map((r) => r.createdBy), h.map((r) => r.approvedBy), h.map((r) => r.remark), h.map((r) => r.referenceDocNo),
+            h.map((r) => r.referenceDocType), h.map((r) => r.sourceSystem), h.map((r) => r.sourceTable),
+            h.map((r) => r.sourceSyncedAt), h.map((r) => r.rawPayload),
+          ],
+        );
       }
-      for (const record of lines) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertTransferLine(client, req.body, record);
+
+      if (lines.length > 0) {
+        const normalizedLines = lines.map((record) => normalizeTransferLineForWrite(req.body, record));
+        const byKey = new Map();
+        for (const l of normalizedLines) {
+          byKey.set(JSON.stringify([l.docNo, l.docType, l.branchCode, l.lineNo, l.productCode]), l);
+        }
+        const l = [...byKey.values()];
+        await client.query(
+          `
+            INSERT INTO ada.transfer_lines
+              (doc_no, doc_type, branch_code, line_no, product_code, barcode, unit_code, unit_name,
+               qty, qty_base, stock_factor, lot_no, expiry_date, warehouse_code,
+               reference_doc_no, reference_line_no, source_system, source_table, source_synced_at, raw_payload, updated_at)
+            SELECT u.doc_no, u.doc_type, u.branch_code, u.line_no, u.product_code, u.barcode, u.unit_code, u.unit_name,
+                   u.qty, u.qty_base, u.stock_factor, u.lot_no, u.expiry_date, u.warehouse_code,
+                   u.reference_doc_no, u.reference_line_no, u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+            FROM UNNEST(
+              $1::text[], $2::text[], $3::text[], $4::integer[], $5::text[], $6::text[], $7::text[], $8::text[],
+              $9::numeric[], $10::numeric[], $11::numeric[], $12::text[], $13::date[], $14::text[],
+              $15::text[], $16::text[], $17::text[], $18::text[], $19::timestamptz[], $20::text[]
+            ) AS u(doc_no, doc_type, branch_code, line_no, product_code, barcode, unit_code, unit_name,
+                   qty, qty_base, stock_factor, lot_no, expiry_date, warehouse_code,
+                   reference_doc_no, reference_line_no, source_system, source_table, source_synced_at, raw_payload)
+            ON CONFLICT (doc_no, doc_type, branch_code, line_no, product_code) DO UPDATE SET
+              barcode = EXCLUDED.barcode,
+              unit_code = EXCLUDED.unit_code,
+              unit_name = EXCLUDED.unit_name,
+              qty = EXCLUDED.qty,
+              qty_base = EXCLUDED.qty_base,
+              stock_factor = EXCLUDED.stock_factor,
+              lot_no = EXCLUDED.lot_no,
+              expiry_date = EXCLUDED.expiry_date,
+              warehouse_code = EXCLUDED.warehouse_code,
+              reference_doc_no = EXCLUDED.reference_doc_no,
+              reference_line_no = EXCLUDED.reference_line_no,
+              source_system = EXCLUDED.source_system,
+              source_table = EXCLUDED.source_table,
+              source_synced_at = EXCLUDED.source_synced_at,
+              raw_payload = EXCLUDED.raw_payload,
+              updated_at = now()
+          `,
+          [
+            l.map((r) => r.docNo), l.map((r) => r.docType), l.map((r) => r.branchCode), l.map((r) => r.lineNo),
+            l.map((r) => r.productCode), l.map((r) => r.barcode), l.map((r) => r.unitCode), l.map((r) => r.unitName),
+            l.map((r) => r.qty), l.map((r) => r.qtyBase), l.map((r) => r.stockFactor), l.map((r) => r.lotNo),
+            l.map((r) => r.expiryDate), l.map((r) => r.warehouseCode), l.map((r) => r.referenceDocNo),
+            l.map((r) => r.referenceLineNo), l.map((r) => r.sourceSystem), l.map((r) => r.sourceTable),
+            l.map((r) => r.sourceSyncedAt), l.map((r) => r.rawPayload),
+          ],
+        );
       }
+
       await client.query("COMMIT");
       return res.json({ acceptedHeaders: headers.length, acceptedLines: lines.length });
     } catch (e) {
