@@ -261,6 +261,39 @@ integration("test 3d: line without its own docType/branchCode inherits from the 
   assert.equal(line.warehouse_code, "WH1", "inherited from header");
 });
 
+// ---- Test 3e: header-lookup key collision fix (fix/transfer-header-index-collision) --
+// Real bug, independently reproduced before fixing (see
+// _ledger/claude.md CLAIM-X-179/180): buildTransferHeaderIndexes'/
+// resolveRelatedTransferHeader's lookup keys were built via string
+// concatenation with "|" as a separator, which collided whenever a field
+// value itself contained "|". headers (docNo="A|B", docType="C",
+// branchCode="001") and (docNo="A", docType="B|C", branchCode="001") both
+// concatenated to the identical string "A|B|C|001", so a line matching the
+// first header's real identity instead resolved against the second
+// header's data. Confirmed via direct reproduction: OLD code returned
+// warehouse_code="WH_WRONG" for this exact payload; this test locks in the
+// fixed (JSON.stringify-keyed) behavior and must fail if the fix regresses.
+integration("test 3e: separator-colliding header lookup keys must resolve to the CORRECT matching header, not a collided one", async () => {
+  await reset();
+  const res = await request(makeApp(pool)).post("/api/sync/ada/transfers").send({
+    sourceSyncedAt: SS,
+    headers: [
+      { docNo: "A|B", docType: "C", branchCode: "001", warehouseCode: "WH_EXPECTED" },
+      { docNo: "A", docType: "B|C", branchCode: "001", warehouseCode: "WH_WRONG" },
+    ],
+    lines: [
+      { docNo: "A|B", docType: "C", branchCode: "001", lineNo: 1, productCode: "P1", qty: 1 }, // no warehouseCode of its own
+    ],
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.acceptedHeaders, 2);
+  assert.equal(res.body.acceptedLines, 1);
+  const line = (await pool.query(
+    "SELECT warehouse_code FROM ada.transfer_lines WHERE doc_no='A|B' AND doc_type='C' AND branch_code='001'",
+  )).rows[0];
+  assert.equal(line.warehouse_code, "WH_EXPECTED", "must resolve against the header sharing this line's own (docNo,docType,branchCode) identity, not a key-collided one");
+});
+
 // ---- Test 4: invalid record → HTTP 400, {message}, zero DB interaction ----
 integration("test 4: invalid line (missing lineNo/productCode) → HTTP 400, {message}, never touches DB", async () => {
   await reset();

@@ -758,6 +758,23 @@ function normalizeTransferHeaderRecord(record) {
   };
 }
 
+// fix/transfer-header-index-collision (2026-08-09): the lookup keys below
+// were previously built via string concatenation with "|" as a separator
+// (`${docNo}|${docType}|${branchCode}`), which collides whenever a field
+// value itself contains "|" — reproduced and confirmed before fixing:
+// headers (docNo="A|B", docType="C", branchCode="001") and (docNo="A",
+// docType="B|C", branchCode="001") both concatenated to the identical
+// string "A|B|C|001", so the second header silently overwrote the first in
+// the Map, and a line resolving against the first header's key instead
+// matched the second header's data (observed: warehouse_code came back
+// "WH_WRONG" instead of "WH_EXPECTED"). Same collision class Codex's Slice
+// 2 review found in a different (already-fixed) piece of code. Fixed by
+// keying on JSON.stringify(tuple) instead of string concatenation — cannot
+// collide this way, since each element is individually quoted/escaped.
+// byDocNo's single-field key is left as a plain string: with only one
+// field and no separator involved, there is no concatenation-collision
+// risk to fix there. Fallback precedence (full key -> docNo+docType ->
+// docNo) is unchanged; only the key construction changed.
 function buildTransferHeaderIndexes(headers) {
   const byDocNoTypeBranch = new Map();
   const byDocNoType = new Map();
@@ -768,10 +785,10 @@ function buildTransferHeaderIndexes(headers) {
     const docType = normalizeText(header.docType || "");
     const branchCode = normalizeText(header.branchCode || "");
     if (docNo && docType && branchCode) {
-      byDocNoTypeBranch.set(`${docNo}|${docType}|${branchCode}`, header);
+      byDocNoTypeBranch.set(JSON.stringify([docNo, docType, branchCode]), header);
     }
     if (docNo && docType) {
-      byDocNoType.set(`${docNo}|${docType}`, header);
+      byDocNoType.set(JSON.stringify([docNo, docType]), header);
     }
     if (docNo) {
       byDocNo.set(docNo, header);
@@ -787,8 +804,8 @@ function resolveRelatedTransferHeader(record, indexes) {
   const branchCode = normalizeText(pick(record, ["FTBchCode", "branchCode", "branchFrm"]) || "");
 
   return (
-    indexes.byDocNoTypeBranch.get(`${docNo}|${docType}|${branchCode}`) ||
-    indexes.byDocNoType.get(`${docNo}|${docType}`) ||
+    indexes.byDocNoTypeBranch.get(JSON.stringify([docNo, docType, branchCode])) ||
+    indexes.byDocNoType.get(JSON.stringify([docNo, docType])) ||
     indexes.byDocNo.get(docNo) ||
     null
   );
