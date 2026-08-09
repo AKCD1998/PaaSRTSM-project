@@ -2553,6 +2553,86 @@ function createAdaSyncRouter(deps) {
     }
   });
   router.post("/stock-snapshots", stockSnapshotsBatchHandler(db));
+  // Track C Slice 4 (2026-08-09): set-based batch UPSERT for /transfers,
+  // replacing the two per-record loops (headers, lines) this route used to
+  // run. Same request/response contract ({acceptedHeaders, acceptedLines}),
+  // same 400-before-DB-acquisition validation shape ({message: ...}, not
+  // the 500 {error: ...} shape), same single shared transaction, same 503
+  // acquisition guard — but each array is applied as one set-based
+  // INSERT ... SELECT FROM UNNEST(...) ON CONFLICT statement instead of one
+  // statement per record.
+  //
+  // parseTransferPayload(req.body) is reused COMPLETELY UNCHANGED — it
+  // already resolves a line's missing docType/branchCode/warehouseCode/
+  // docDate from a matching header (by docNo+docType+branchCode, then
+  // docNo+docType, then docNo) and validates every record BEFORE any DB
+  // acquisition happens. That front-end behavior is preserved by
+  // construction here, not re-implemented — this handler only replaces
+  // HOW the already-resolved/already-validated headers/lines get written.
+  //
+  // Ground truth confirmed empirically against the OLD path before writing
+  // this (real disposable Postgres, not assumed): duplicate conflict keys
+  // in either array -> LAST array occurrence wins (same pattern as Slice
+  // 1-3). No NULL-conflict-key quirk (both tables' conflict-key columns are
+  // NOT NULL — migrations/015_add_ada_raw_ingestion.sql:126-130, 170-174).
+  //
+  // Dedup keys use JSON.stringify(tuple), never string concatenation —
+  // applied proactively from the start (Codex's Slice 2 finding), same as
+  // Slice 3. Note buildTransferHeaderIndexes/resolveRelatedTransferHeader
+  // (used internally by parseTransferPayload, untouched by this slice) DO
+  // use "|"-joined string keys for their own internal header-lookup maps —
+  // that is pre-existing code outside this slice's scope, not something
+  // this slice's dedup logic reuses or is affected by.
+  function normalizeTransferHeaderForWrite(body, record) {
+    return {
+      docNo: normalizeNullableText(record.docNo),
+      docType: normalizeNullableText(record.docType),
+      branchCode: normalizeNullableText(record.branchCode),
+      docStatus: normalizeNullableText(pick(record, ["FTPthStaDoc", "docStatus"])),
+      processStatus: normalizeNullableText(pick(record, ["FTPthStaPrcDoc", "processStatus"])),
+      branchCodeTo: normalizeNullableText(record.branchCodeTo),
+      warehouseCode: normalizeNullableText(record.warehouseCode),
+      warehouseCodeTo: normalizeNullableText(pick(record, ["FTWahCodeTo", "warehouseCodeTo", "whTo"])),
+      docDate: parseDate(record.docDate),
+      docTime: normalizeNullableText(pick(record, ["FTPthDocTime", "docTime"])),
+      approvedAt: parseTimestamp(pick(record, ["FDPthApprove", "approvedAt"])),
+      processedAt: parseTimestamp(pick(record, ["FDPthPrcDate", "processedAt"])),
+      createdBy: normalizeNullableText(record.createdBy),
+      approvedBy: normalizeNullableText(record.approvedBy),
+      remark: normalizeNullableText(pick(record, ["FTPthRmk", "remark"])),
+      referenceDocNo: normalizeNullableText(pick(record, ["FTPthRefDoc", "referenceDocNo"])),
+      referenceDocType: normalizeNullableText(pick(record, ["FTPthRefType", "referenceDocType"])),
+      sourceSystem: getSourceSystem(body),
+      sourceTable: normalizeText(pick(record, ["sourceTable"], "TCNTPdtTnfHD")),
+      sourceSyncedAt: getSourceSyncedAt(body),
+      rawPayload: getRawPayload(record),
+    };
+  }
+  function normalizeTransferLineForWrite(body, record) {
+    return {
+      docNo: normalizeNullableText(record.docNo),
+      docType: normalizeNullableText(record.docType),
+      branchCode: normalizeNullableText(record.branchCode),
+      lineNo: Number(record.lineNo),
+      productCode: normalizeNullableText(record.productCode),
+      barcode: normalizeNullableText(pick(record, ["FTPtdBarCode", "barcode"])),
+      unitCode: normalizeNullableText(record.unitCode),
+      unitName: normalizeNullableText(record.unitName),
+      qty: toNumber(record.qty),
+      qtyBase: toNumber(record.qtyBase),
+      stockFactor: toNumber(record.stockFactor),
+      lotNo: normalizeNullableText(pick(record, ["FTPtdLotNo", "lotNo"])),
+      expiryDate: parseDate(pick(record, ["FDPtdExpired", "expiryDate"])),
+      warehouseCode: normalizeNullableText(record.warehouseCode),
+      referenceDocNo: normalizeNullableText(pick(record, ["FTPthRefDoc", "referenceDocNo"])),
+      referenceLineNo: normalizeNullableText(pick(record, ["FNPtdRefSeqNo", "referenceLineNo"])),
+      sourceSystem: getSourceSystem(body),
+      sourceTable: normalizeText(pick(record, ["sourceTable"], "TCNTPdtTnfDT")),
+      sourceSyncedAt: getSourceSyncedAt(body),
+      rawPayload: getRawPayload(record),
+    };
+  }
+
   router.post("/transfers", async (req, res, next) => {
     const { error, headers, lines } = parseTransferPayload(req.body);
     if (error) {
@@ -2562,14 +2642,118 @@ function createAdaSyncRouter(deps) {
     if (!client) return;
     try {
       await client.query("BEGIN");
-      for (const record of headers) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertTransferHeader(client, req.body, record);
+
+      if (headers.length > 0) {
+        const normalizedHeaders = headers.map((record) => normalizeTransferHeaderForWrite(req.body, record));
+        const byKey = new Map();
+        for (const h of normalizedHeaders) {
+          byKey.set(JSON.stringify([h.docNo, h.docType, h.branchCode]), h);
+        }
+        const h = [...byKey.values()];
+        await client.query(
+          `
+            INSERT INTO ada.transfer_headers
+              (doc_no, doc_type, doc_status, process_status, branch_code, branch_code_to,
+               warehouse_code, warehouse_code_to, doc_date, doc_time, approved_at, processed_at,
+               created_by, approved_by, remark, reference_doc_no, reference_doc_type,
+               source_system, source_table, source_synced_at, raw_payload, updated_at)
+            SELECT u.doc_no, u.doc_type, u.doc_status, u.process_status, u.branch_code, u.branch_code_to,
+                   u.warehouse_code, u.warehouse_code_to, u.doc_date, u.doc_time, u.approved_at, u.processed_at,
+                   u.created_by, u.approved_by, u.remark, u.reference_doc_no, u.reference_doc_type,
+                   u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+            FROM UNNEST(
+              $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+              $7::text[], $8::text[], $9::date[], $10::text[], $11::timestamptz[], $12::timestamptz[],
+              $13::text[], $14::text[], $15::text[], $16::text[], $17::text[],
+              $18::text[], $19::text[], $20::timestamptz[], $21::text[]
+            ) AS u(doc_no, doc_type, doc_status, process_status, branch_code, branch_code_to,
+                   warehouse_code, warehouse_code_to, doc_date, doc_time, approved_at, processed_at,
+                   created_by, approved_by, remark, reference_doc_no, reference_doc_type,
+                   source_system, source_table, source_synced_at, raw_payload)
+            ON CONFLICT (doc_no, doc_type, branch_code) DO UPDATE SET
+              doc_status = EXCLUDED.doc_status,
+              process_status = EXCLUDED.process_status,
+              branch_code_to = EXCLUDED.branch_code_to,
+              warehouse_code = EXCLUDED.warehouse_code,
+              warehouse_code_to = EXCLUDED.warehouse_code_to,
+              doc_date = EXCLUDED.doc_date,
+              doc_time = EXCLUDED.doc_time,
+              approved_at = EXCLUDED.approved_at,
+              processed_at = EXCLUDED.processed_at,
+              created_by = EXCLUDED.created_by,
+              approved_by = EXCLUDED.approved_by,
+              remark = EXCLUDED.remark,
+              reference_doc_no = EXCLUDED.reference_doc_no,
+              reference_doc_type = EXCLUDED.reference_doc_type,
+              source_system = EXCLUDED.source_system,
+              source_table = EXCLUDED.source_table,
+              source_synced_at = EXCLUDED.source_synced_at,
+              raw_payload = EXCLUDED.raw_payload,
+              updated_at = now()
+          `,
+          [
+            h.map((r) => r.docNo), h.map((r) => r.docType), h.map((r) => r.docStatus), h.map((r) => r.processStatus),
+            h.map((r) => r.branchCode), h.map((r) => r.branchCodeTo), h.map((r) => r.warehouseCode), h.map((r) => r.warehouseCodeTo),
+            h.map((r) => r.docDate), h.map((r) => r.docTime), h.map((r) => r.approvedAt), h.map((r) => r.processedAt),
+            h.map((r) => r.createdBy), h.map((r) => r.approvedBy), h.map((r) => r.remark), h.map((r) => r.referenceDocNo),
+            h.map((r) => r.referenceDocType), h.map((r) => r.sourceSystem), h.map((r) => r.sourceTable),
+            h.map((r) => r.sourceSyncedAt), h.map((r) => r.rawPayload),
+          ],
+        );
       }
-      for (const record of lines) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertTransferLine(client, req.body, record);
+
+      if (lines.length > 0) {
+        const normalizedLines = lines.map((record) => normalizeTransferLineForWrite(req.body, record));
+        const byKey = new Map();
+        for (const l of normalizedLines) {
+          byKey.set(JSON.stringify([l.docNo, l.docType, l.branchCode, l.lineNo, l.productCode]), l);
+        }
+        const l = [...byKey.values()];
+        await client.query(
+          `
+            INSERT INTO ada.transfer_lines
+              (doc_no, doc_type, branch_code, line_no, product_code, barcode, unit_code, unit_name,
+               qty, qty_base, stock_factor, lot_no, expiry_date, warehouse_code,
+               reference_doc_no, reference_line_no, source_system, source_table, source_synced_at, raw_payload, updated_at)
+            SELECT u.doc_no, u.doc_type, u.branch_code, u.line_no, u.product_code, u.barcode, u.unit_code, u.unit_name,
+                   u.qty, u.qty_base, u.stock_factor, u.lot_no, u.expiry_date, u.warehouse_code,
+                   u.reference_doc_no, u.reference_line_no, u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+            FROM UNNEST(
+              $1::text[], $2::text[], $3::text[], $4::integer[], $5::text[], $6::text[], $7::text[], $8::text[],
+              $9::numeric[], $10::numeric[], $11::numeric[], $12::text[], $13::date[], $14::text[],
+              $15::text[], $16::text[], $17::text[], $18::text[], $19::timestamptz[], $20::text[]
+            ) AS u(doc_no, doc_type, branch_code, line_no, product_code, barcode, unit_code, unit_name,
+                   qty, qty_base, stock_factor, lot_no, expiry_date, warehouse_code,
+                   reference_doc_no, reference_line_no, source_system, source_table, source_synced_at, raw_payload)
+            ON CONFLICT (doc_no, doc_type, branch_code, line_no, product_code) DO UPDATE SET
+              barcode = EXCLUDED.barcode,
+              unit_code = EXCLUDED.unit_code,
+              unit_name = EXCLUDED.unit_name,
+              qty = EXCLUDED.qty,
+              qty_base = EXCLUDED.qty_base,
+              stock_factor = EXCLUDED.stock_factor,
+              lot_no = EXCLUDED.lot_no,
+              expiry_date = EXCLUDED.expiry_date,
+              warehouse_code = EXCLUDED.warehouse_code,
+              reference_doc_no = EXCLUDED.reference_doc_no,
+              reference_line_no = EXCLUDED.reference_line_no,
+              source_system = EXCLUDED.source_system,
+              source_table = EXCLUDED.source_table,
+              source_synced_at = EXCLUDED.source_synced_at,
+              raw_payload = EXCLUDED.raw_payload,
+              updated_at = now()
+          `,
+          [
+            l.map((r) => r.docNo), l.map((r) => r.docType), l.map((r) => r.branchCode), l.map((r) => r.lineNo),
+            l.map((r) => r.productCode), l.map((r) => r.barcode), l.map((r) => r.unitCode), l.map((r) => r.unitName),
+            l.map((r) => r.qty), l.map((r) => r.qtyBase), l.map((r) => r.stockFactor), l.map((r) => r.lotNo),
+            l.map((r) => r.expiryDate), l.map((r) => r.warehouseCode), l.map((r) => r.referenceDocNo),
+            l.map((r) => r.referenceLineNo), l.map((r) => r.sourceSystem), l.map((r) => r.sourceTable),
+            l.map((r) => r.sourceSyncedAt), l.map((r) => r.rawPayload),
+          ],
+        );
       }
+
       await client.query("COMMIT");
       return res.json({ acceptedHeaders: headers.length, acceptedLines: lines.length });
     } catch (e) {
