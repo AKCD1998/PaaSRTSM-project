@@ -1787,6 +1787,175 @@ const upsertStockAdjustmentLine = createHeaderLineUpsert(
   "(branch_code, doc_no, line_no, product_code)",
 );
 
+// Track C Slice 1 (2026-08-09): set-based batch handler for /stock-snapshots,
+// replacing the per-record UPSERT loop inside createRecordsHandler for this one
+// route only. Same request/response contract, same validation, same transaction
+// atomicity, same 503 acquisition guard — but the whole payload's records are
+// applied as ONE set-based INSERT ... SELECT * FROM UNNEST(...) ON CONFLICT,
+// instead of one INSERT per record (a real production window measured ~33,253
+// per-record calls from this route alone, via a pg_stat_statements diff).
+// Investigation history/measurement detail lives in the Gate 6 Track C review
+// process, not in this file — a shipped source comment should not depend on
+// an internal, non-shipped ledger citation for its own context.
+//
+// Ground truth confirmed empirically before writing this (UNVERIFIED items in
+// the delegation packet, both resolved against the OLD per-record path on a real
+// disposable Postgres):
+//   - Duplicate snapshot_key within one payload: the OLD path applied each record
+//     as a separate statement in array order, so the LATER record's ON CONFLICT
+//     DO UPDATE overwrote the earlier one => LAST-wins. A single-statement UNNEST
+//     batch would instead raise "ON CONFLICT DO UPDATE command cannot affect row
+//     a second time" if the same key appears twice, so this handler de-duplicates
+//     by snapshot_key BEFORE the batch INSERT, keeping the LAST occurrence to
+//     preserve the OLD path's observed last-wins semantics.
+//   - Error/rollback shape: a thrown validation error (missing productCode) has
+//     no statusCode/status property, so the production error middleware
+//     (server.js:486-496) returns HTTP 500 { error: "Internal server error" }.
+//     This handler throws the same Error from the same validation, forwarded via
+//     the same next(e), so the response shape is identical.
+//
+// `accepted` in the response is the INPUT record count (records.length), NOT the
+// de-duplicated row count — confirmed against the OLD path, which returns
+// records.length even when duplicates collapse to fewer rows.
+function stockSnapshotsBatchHandler(db) {
+  return async (req, res, next) => {
+    const { error, records } = parseApiRecords(req.body);
+    if (error) {
+      return res.status(400).json({ message: error });
+    }
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:stock-snapshots");
+    if (!client) return;
+    try {
+      if (records.length === 0) {
+        // Empty payload: skip BEGIN/INSERT entirely (no-op), preserve the exact
+        // response shape the OLD path produced.
+        return res.json({ accepted: 0, syncRunId: getSyncRunId(req.body) });
+      }
+      // BEGIN before normalization (matches the OLD path's ordering exactly —
+      // createRecordsHandler always opens the transaction first). Sonnet review
+      // fix 2026-08-09: an earlier draft normalized/validated before BEGIN, so a
+      // thrown validation error hit the catch's ROLLBACK with no transaction
+      // open — harmless (Postgres treats ROLLBACK-outside-a-transaction as a
+      // no-op) but it emits a server-side WARNING on every rejected payload,
+      // which is needless log noise at fleet scale and an avoidable deviation
+      // from the OLD path's behavior. Moved here so ROLLBACK always follows a
+      // real BEGIN, same as before.
+      await client.query("BEGIN");
+      // Normalize + validate every record up front (identical field extraction
+      // to upsertStockSnapshot, in the same order). A single invalid record
+      // throws here, before the INSERT is issued, so the whole payload is
+      // rejected atomically via the transaction opened above.
+      const normalized = [];
+      for (const record of records) {
+        const productCode = normalizeNullableText(pick(record, ["FTPdtCode", "productCode"]));
+        const snapshotAt = parseTimestamp(pick(record, ["snapshotAt", "sourceSnapshotAt"]), getSourceSyncedAt(req.body));
+        if (!productCode || !snapshotAt) {
+          throw new Error("Each stock snapshot requires productCode/FTPdtCode and snapshotAt.");
+        }
+        const branchCode = normalizeNullableText(pick(record, ["FTBchCode", "branchCode"]));
+        const warehouseCode = normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"]));
+        const lotNo = normalizeNullableText(pick(record, ["FTLotNo", "lotNo"]));
+        const expiryDate = parseDate(pick(record, ["FDExpired", "expiryDate"]));
+        normalized.push({
+          snapshotKey: buildStockSnapshotKey(snapshotAt, branchCode, warehouseCode, productCode, lotNo, expiryDate),
+          snapshotAt,
+          branchCode,
+          warehouseCode,
+          productCode,
+          barcode: normalizeNullableText(pick(record, ["FTPdtBarCode", "barcode"])),
+          lotNo,
+          expiryDate,
+          qtyOnHand: toNumber(pick(record, ["FCPdtQty", "qtyOnHand", "stockCurrent"])),
+          qtyReserved: toNumber(pick(record, ["FCPdtQtyRsv", "qtyReserved"])),
+          unitCode: normalizeNullableText(pick(record, ["FTPunCode", "unitCode"])),
+          qtyBase: toNumber(pick(record, ["qtyBase"])),
+          sourceSystem: getSourceSystem(req.body),
+          sourceTable: normalizeText(pick(record, ["sourceTable"], "TCNTPdtStkCard")),
+          sourceSyncedAt: getSourceSyncedAt(req.body),
+          rawPayload: getRawPayload(record),
+        });
+      }
+      // De-duplicate by snapshot_key, LAST occurrence wins (matches OLD path's
+      // observed last-wins semantics). Map preserves insertion order; later
+      // writes to the same key overwrite the earlier value object.
+      const byKey = new Map();
+      for (const n of normalized) byKey.set(n.snapshotKey, n);
+      const unique = [...byKey.values()];
+
+      // Single set-based UPSERT via UNNEST. Parameter count is fixed at 16 (one
+      // array per data column), independent of payload size — avoids Postgres's
+      // ~65535-parameter ceiling that a VALUES ($1..$N*16) list would hit.
+      // Column order and type casts mirror upsertStockSnapshot exactly; updated_at
+      // is set to now() in the statement (not passed as data), as before.
+      await client.query(
+        `
+          INSERT INTO ada.stock_snapshots
+            (
+              snapshot_key, snapshot_at, branch_code, warehouse_code, product_code,
+              barcode, lot_no, expiry_date, qty_on_hand, qty_reserved, unit_code,
+              qty_base, source_system, source_table, source_synced_at, raw_payload,
+              updated_at
+            )
+          SELECT
+            u.key, u.at, u.branch, u.wh, u.product, u.barcode, u.lot, u.expiry,
+            u.qoh, u.qrsv, u.unit, u.qbase, u.srcsys, u.srctbl, u.srcsynced,
+            u.raw::jsonb, now()
+          FROM UNNEST(
+            $1::text[],      $2::timestamptz[], $3::text[],       $4::text[],
+            $5::text[],      $6::text[],        $7::text[],       $8::date[],
+            $9::numeric[],   $10::numeric[],    $11::text[],      $12::numeric[],
+            $13::text[],     $14::text[],       $15::timestamptz[], $16::text[]
+          ) AS u(key, at, branch, wh, product, barcode, lot, expiry, qoh, qrsv,
+                 unit, qbase, srcsys, srctbl, srcsynced, raw)
+          ON CONFLICT (snapshot_key) DO UPDATE SET
+            snapshot_at = EXCLUDED.snapshot_at,
+            branch_code = EXCLUDED.branch_code,
+            warehouse_code = EXCLUDED.warehouse_code,
+            product_code = EXCLUDED.product_code,
+            barcode = EXCLUDED.barcode,
+            lot_no = EXCLUDED.lot_no,
+            expiry_date = EXCLUDED.expiry_date,
+            qty_on_hand = EXCLUDED.qty_on_hand,
+            qty_reserved = EXCLUDED.qty_reserved,
+            unit_code = EXCLUDED.unit_code,
+            qty_base = EXCLUDED.qty_base,
+            source_system = EXCLUDED.source_system,
+            source_table = EXCLUDED.source_table,
+            source_synced_at = EXCLUDED.source_synced_at,
+            raw_payload = EXCLUDED.raw_payload,
+            updated_at = now()
+        `,
+        [
+          unique.map((r) => r.snapshotKey),
+          unique.map((r) => r.snapshotAt),
+          unique.map((r) => r.branchCode),
+          unique.map((r) => r.warehouseCode),
+          unique.map((r) => r.productCode),
+          unique.map((r) => r.barcode),
+          unique.map((r) => r.lotNo),
+          unique.map((r) => r.expiryDate),
+          unique.map((r) => r.qtyOnHand),
+          unique.map((r) => r.qtyReserved),
+          unique.map((r) => r.unitCode),
+          unique.map((r) => r.qtyBase),
+          unique.map((r) => r.sourceSystem),
+          unique.map((r) => r.sourceTable),
+          unique.map((r) => r.sourceSyncedAt),
+          unique.map((r) => r.rawPayload),
+        ],
+      );
+      await client.query("COMMIT");
+      // accepted = INPUT record count, not de-duped row count (matches OLD path).
+      return res.json({ accepted: records.length, syncRunId: getSyncRunId(req.body) });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  };
+}
+
 async function upsertStockSnapshot(client, body, record) {
   const productCode = normalizeNullableText(pick(record, ["FTPdtCode", "productCode"]));
   const snapshotAt = parseTimestamp(pick(record, ["snapshotAt", "sourceSnapshotAt"]), getSourceSyncedAt(body));
@@ -2216,7 +2385,7 @@ function createAdaSyncRouter(deps) {
       client.release();
     }
   });
-  router.post("/stock-snapshots", createRecordsHandler(upsertStockSnapshot));
+  router.post("/stock-snapshots", stockSnapshotsBatchHandler(db));
   router.post("/transfers", async (req, res, next) => {
     const { error, headers, lines } = parseTransferPayload(req.body);
     if (error) {
