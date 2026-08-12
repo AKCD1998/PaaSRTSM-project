@@ -852,6 +852,321 @@ async function readExistingBranchStockSnapshot(client, productCode) {
   return result.rows[0] || null;
 }
 
+// ===========================================================================
+// Track C: Legacy Branch-Stock v1 Set-Based Optimization (Phase 3).
+// Batch replacements for the per-record read/merge/upsert loop used by
+// POST /branch-stock/sync and its byte-identical alias POST
+// /sync/ada/branch-stock. Behavior is proven identical to the OLD per-record
+// path by tests/branch_stock_set_based_upgrade.test.js (matrix A-K, written
+// and passing against the OLD path BEFORE this implementation existed;
+// matrix K specifically covers duplicate-productCode sequential-merge
+// behavior, added after Codex's Tech Lead review found the first batch
+// implementation's naive last-record dedup diverged from the OLD path's
+// real sequential fold -- see foldWideGroup/foldNormalizedGroup below).
+//
+// Two asymmetries proven by that test file are deliberately preserved, not
+// "fixed":
+//   - the wide table's qty write is UNCONDITIONAL (arrival-order-wins, no
+//     freshness guard) -- QUESTION-004, still open, see
+//     docs/BRANCH_STOCK_GENERATION_CONTRACT.md. The normalized table's qty
+//     write IS freshness-guarded.
+//   - the wide table's cost_avg distinguishes an EXPLICIT null (overwrites
+//     an existing cost to null) from an OMITTED cost (preserves the
+//     existing cost) -- mirrors mergeBranchStockRecord's hasCostAvg check
+//     exactly. The normalized table's cost_avg PRESERVES on BOTH explicit
+//     null and omitted (its own COALESCE can't tell them apart, because the
+//     route always collapses hasCostAvg=false and hasCostAvg-true-with-null
+//     to the same null parameter before this function is even called --
+//     confirmed empirically against real Postgres before writing this code,
+//     branch_stock_set_based_upgrade.test.js's F2b test).
+//
+// v2/CP4's applyBranchStockBatch (worker.js) is the proven set-based model
+// for the general shape (SQL-side merge via a JOIN to the existing row
+// through ON CONFLICT DO UPDATE, dynamic branch-column names from a fixed
+// whitelist, never from request input) -- but it cannot be reused unmodified
+// here: it guards the wide table's qty with a freshness WHERE clause v1 does
+// not have, and its cost_avg handling is a plain COALESCE that does not
+// replicate v1's explicit-null-overwrites distinction. Both differences are
+// deliberate for CP4/v2 and must NOT leak into this v1 candidate.
+//
+// The OLD per-record helpers immediately above this comment
+// (upsertBranchStockSnapshot, upsertBranchStockCurrent, mergeBranchStockRecord,
+// readExistingBranchStockSnapshot, mapExistingSnapshotRowToRecord,
+// createEmptySnapshotRecord) are completely UNCHANGED and remain the
+// implementation for POST /branch-stock/upload, which shares all six of
+// them and is explicitly out of scope for this candidate.
+
+// Groups a record array by productCode, preserving payload order within
+// each group. A naive "keep only the last occurrence" reduction (the
+// original Phase 3 approach) discards state the OLD per-record loop's
+// SEQUENTIAL merge depends on -- Codex's Tech Lead review independently
+// reproduced this against real Postgres (BLOCKED verdict before seal) with
+// a duplicate whose second record omitted name/cost and had an OLDER
+// timestamp: the candidate lost the first record's name/cost entirely and
+// let the normalized table's freshness guard be bypassed, because "keep the
+// last record" is not the same as "replay every record in order." See
+// MATRIX K in branch_stock_set_based_upgrade.test.js for the full
+// regression coverage this fix is verified against, and foldWideGroup /
+// foldNormalizedGroup below for the two tables' genuinely different fold
+// rules.
+function groupByProductCodeInOrder(records) {
+  const groups = new Map();
+  for (const record of records) {
+    if (!groups.has(record.productCode)) groups.set(record.productCode, []);
+    groups.get(record.productCode).push(record);
+  }
+  return groups;
+}
+
+// Replays a group of same-productCode records against the wide table's
+// exact per-record semantics: qty/synced_at/raw_payload are UNCONDITIONAL
+// (each record's own value always wins, so only the LAST record in the
+// group matters for those); product_name_thai/eng/barcode/unit carry
+// forward via JS `||` (a later record's own null/omitted value falls back
+// to whatever the fold has accumulated so far, seeded from the real
+// pre-existing DB row -- not always starting empty, see K6); cost_avg only
+// changes on a record whose hasCostAvg is true (explicit value OR explicit
+// null), otherwise carries forward exactly like the name fields.
+function foldWideGroup(groupRecords, existingRow) {
+  // Codex Tech Lead review (second BLOCKED verdict, real-Postgres
+  // reproduction): these four seed lines used `??` (only replaces
+  // null/undefined), but mapExistingSnapshotRowToRecord -- the OLD path's
+  // own normalization of a freshly-read row (branch-stock.js:779-782) --
+  // uses `||` (also replaces "", the DB's actual empty-string value for an
+  // unset name/barcode/unit column). An existing row whose name was stored
+  // as "" would seed the fold with "" instead of null, diverging from what
+  // the OLD path would have merged. Must match `||` exactly, not just avoid
+  // a crash on null/undefined.
+  let productNameThai = existingRow?.product_name_thai || null;
+  let productNameEng = existingRow?.product_name_eng || null;
+  let barcode = existingRow?.barcode || null;
+  let unit = existingRow?.unit || null;
+  let cost = existingRow?.cost ?? null;
+  for (const record of groupRecords) {
+    productNameThai = record.productNameThai || productNameThai;
+    productNameEng = record.productNameEng || productNameEng;
+    barcode = record.barcode || barcode;
+    unit = record.unit || unit;
+    if (record.hasCostAvg) cost = record.costAvg;
+  }
+  const last = groupRecords[groupRecords.length - 1];
+  return {
+    productCode: last.productCode,
+    productNameThai,
+    productNameEng,
+    barcode,
+    unit,
+    qty: last.qty,
+    cost,
+    syncedAt: last.syncedAt,
+    rawPayload: last.rawPayload,
+  };
+}
+
+// Replays a group of same-productCode records against the normalized
+// table's exact per-record semantics: EVERY record independently attempts a
+// freshness-guarded write against whatever state the fold has accumulated
+// so far (seeded from the real pre-existing row, or null if none) -- a
+// record whose own syncedAt is older than the accumulated state's is fully
+// REJECTED (matching the real SQL's WHERE clause exactly, <=  not  <, so
+// equal timestamps still let the later record apply).
+//
+// Two bugs found and fixed here after Codex's Tech Lead review (BLOCKED
+// verdict, real-Postgres reproduction), each caught by its own regression
+// test in MATRIX K / D2 -- not caught by reasoning alone:
+//
+// (1) cost_avg on an accepted record must NOT branch on record.hasCostAvg
+// directly. The OLD route ALWAYS collapses `hasCostAvg ? costAvg : null`
+// into the single parameter it hands to upsertBranchStockCurrent, so an
+// EXPLICIT null (hasCostAvg=true, value=null) and an OMITTED cost
+// (hasCostAvg=false) are INDISTINGUISHABLE by the time they reach this
+// table's own COALESCE-based preserve logic -- both must preserve the
+// accumulated cost. Branching on hasCostAvg directly here would let an
+// explicit-null record overwrite the accumulated cost to null, which is the
+// WIDE table's behavior, not this table's (K2 caught this exact mistake:
+// "0 !== 9.99").
+//
+// (2) A group where NO record ever passes the guard (every record is
+// staler than the accumulated/pre-existing state) must produce NO write at
+// all for that product -- not "write back the unchanged state with this
+// batch's own syncRunId/generation marker anyway". The real per-record SQL
+// achieves this for free: its own WHERE clause rejects the whole UPDATE,
+// including the generation-marker column, when nothing should change. Once
+// the fold pre-resolves state in JS, sending an unmodified (but otherwise
+// well-formed) row back into the UPSERT trivially satisfies the SQL guard
+// via equality (existing.synced_at <= EXCLUDED.synced_at when they're the
+// same value) and would incorrectly let the generation marker move forward
+// even though the actual data never changed (D2 caught this exact mistake:
+// a stale second request's syncRunId ended up stamped, "602 !== 601").
+// Tracked via the `accepted` flag and filtered out by the caller before
+// this product is included in the batch UPSERT's arrays at all.
+function foldNormalizedGroup(groupRecords, existingRow) {
+  let current = existingRow
+    ? { qty: existingRow.qty, cost: existingRow.cost_avg, syncedAt: existingRow.synced_at, rawPayload: null }
+    : null;
+  let accepted = false;
+  for (const record of groupRecords) {
+    const guardPasses = !current || current.syncedAt == null || new Date(current.syncedAt) <= new Date(record.syncedAt);
+    if (!guardPasses) continue;
+    accepted = true;
+    const collapsedCost = record.hasCostAvg ? record.costAvg : null; // matches the route's own pre-collapse before calling upsertBranchStockCurrent
+    current = {
+      qty: record.qty,
+      cost: collapsedCost ?? (current?.cost ?? null), // matches this table's own COALESCE(collapsedCost, existing.cost)
+      syncedAt: record.syncedAt,
+      rawPayload: record.rawPayload,
+    };
+  }
+  return accepted ? current : null;
+}
+
+async function upsertBranchStockSnapshotBatch(client, records, branchCode, syncRunId = null) {
+  if (records.length === 0) return;
+  const groups = groupByProductCodeInOrder(records);
+  const productCodes = [...groups.keys()];
+
+  // Set-based read, only as needed: seeds foldWideGroup with each product's
+  // REAL pre-existing wide-table state (name/barcode/unit/cost -- qty and
+  // synced_at need no seed, they are always the group's last record's own
+  // value regardless of any pre-existing row). One batched SELECT for the
+  // whole payload, not one per record and not one per duplicate.
+  const existingRows = await client.query(
+    `SELECT product_code, product_name_thai, product_name_eng, barcode, unit, ${getBranchSnapshotColumnNames(branchCode).costColumn} AS cost
+     FROM ada.branch_stock_snapshots WHERE product_code = ANY($1::text[])`,
+    [productCodes],
+  );
+  const existingByProduct = new Map(existingRows.rows.map((row) => [row.product_code, row]));
+  const folded = productCodes.map((code) => foldWideGroup(groups.get(code), existingByProduct.get(code) || null));
+
+  const { qtyColumn, costColumn } = getBranchSnapshotColumnNames(branchCode);
+  const { freshnessCol, fullSyncCol } = BRANCH_GENERATION_COLUMNS[branchCode];
+
+  // Param order: $1-$5 identity/name text[], $6 qty numeric[], $7 folded
+  // cost numeric[], $8 syncedAt timestamptz[], $9 rawPayload jsonb[], $10
+  // syncRunId (single scalar for the whole batch, not per-record --
+  // branchCode/syncRunId are request-level fields, matching the route's
+  // existing contract).
+  await client.query(
+    `
+      INSERT INTO ada.branch_stock_snapshots
+        (product_code, product_name_thai, product_name_eng, barcode, unit,
+         ${qtyColumn}, ${costColumn}, ${freshnessCol}, ${fullSyncCol}, qty_total_all_branches,
+         synced_at, source_system, source_table, source_synced_at, raw_payload, updated_at)
+      SELECT x.product_code, x.product_name_thai, x.product_name_eng, x.barcode, x.unit,
+             x.qty, x.cost, x.synced_at, $10::bigint, x.qty,
+             x.synced_at, 'AdaAcc', 'TCNTPdtInWha', x.synced_at, x.raw_payload, now()
+      FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                  $6::numeric[], $7::numeric[], $8::timestamptz[], $9::jsonb[])
+        AS x(product_code, product_name_thai, product_name_eng, barcode, unit,
+             qty, cost, synced_at, raw_payload)
+      ON CONFLICT (product_code) DO UPDATE SET
+        product_name_thai = EXCLUDED.product_name_thai,
+        product_name_eng = EXCLUDED.product_name_eng,
+        barcode = EXCLUDED.barcode,
+        unit = EXCLUDED.unit,
+        ${qtyColumn} = EXCLUDED.${qtyColumn},
+        ${costColumn} = EXCLUDED.${costColumn},
+        ${freshnessCol} = EXCLUDED.${freshnessCol},
+        ${fullSyncCol} = CASE WHEN $10::bigint IS NULL THEN ada.branch_stock_snapshots.${fullSyncCol} ELSE $10::bigint END,
+        qty_total_all_branches =
+          ${qtyColumn === "qty_branch_000" ? `EXCLUDED.${qtyColumn}` : "ada.branch_stock_snapshots.qty_branch_000"} +
+          ${qtyColumn === "qty_branch_001" ? `EXCLUDED.${qtyColumn}` : "ada.branch_stock_snapshots.qty_branch_001"} +
+          ${qtyColumn === "qty_branch_002" ? `EXCLUDED.${qtyColumn}` : "ada.branch_stock_snapshots.qty_branch_002"} +
+          ${qtyColumn === "qty_branch_003" ? `EXCLUDED.${qtyColumn}` : "ada.branch_stock_snapshots.qty_branch_003"} +
+          ${qtyColumn === "qty_branch_004" ? `EXCLUDED.${qtyColumn}` : "ada.branch_stock_snapshots.qty_branch_004"} +
+          ${qtyColumn === "qty_branch_005" ? `EXCLUDED.${qtyColumn}` : "ada.branch_stock_snapshots.qty_branch_005"},
+        synced_at = EXCLUDED.synced_at,
+        source_system = EXCLUDED.source_system,
+        source_table = EXCLUDED.source_table,
+        source_synced_at = EXCLUDED.source_synced_at,
+        raw_payload = EXCLUDED.raw_payload,
+        updated_at = now()
+    `,
+    [
+      folded.map((r) => r.productCode),
+      folded.map((r) => r.productNameThai),
+      folded.map((r) => r.productNameEng),
+      folded.map((r) => r.barcode),
+      folded.map((r) => r.unit),
+      folded.map((r) => r.qty),
+      folded.map((r) => r.cost),
+      folded.map((r) => r.syncedAt),
+      folded.map((r) => JSON.stringify(r.rawPayload || {})),
+      syncRunId,
+    ],
+  );
+}
+
+async function upsertBranchStockCurrentBatch(client, records, branchCode, syncRunId = null) {
+  if (records.length === 0) return;
+  const groups = groupByProductCodeInOrder(records);
+  const productCodes = [...groups.keys()];
+
+  // Set-based read, only as needed: seeds foldNormalizedGroup with each
+  // product's REAL pre-existing (productCode, branchCode) row on THIS
+  // table, independently of the wide table's own existing state (the two
+  // tables are not assumed to be in lockstep, matching this candidate's
+  // Phase 3 design principle throughout). One batched SELECT for the whole
+  // payload, not one per record and not one per duplicate.
+  const existingRows = await client.query(
+    `SELECT product_code, qty, cost_avg, synced_at FROM ada.branch_stock_current
+     WHERE branch_code = $1 AND product_code = ANY($2::text[])`,
+    [branchCode, productCodes],
+  );
+  const existingByProduct = new Map(existingRows.rows.map((row) => [row.product_code, row]));
+  // A group where EVERY record is rejected by the freshness guard (e.g. a
+  // single stale record arriving in its own request against a fresher
+  // pre-existing row -- D2) must produce NO write at all, not a no-op write
+  // of the unchanged state -- writing it back would still let the
+  // generation-marker CASE fire, since the fold's own (unchanged) state
+  // trivially satisfies the SQL guard via equality. foldNormalizedGroup
+  // returns null for exactly this case (its own `accepted` tracking, not
+  // "state happens to be null"); filtered out here before this product is
+  // included in the batch UPSERT's arrays at all. Found and fixed after
+  // Codex's Tech Lead review (BLOCKED verdict, D2's real-Postgres
+  // reproduction: "602 !== 601").
+  const folded = productCodes
+    .map((code) => ({ productCode: code, state: foldNormalizedGroup(groups.get(code), existingByProduct.get(code) || null) }))
+    .filter((entry) => entry.state != null);
+  if (folded.length === 0) return; // every group in this batch was rejected by the freshness guard -- nothing to write
+
+  // Param order: $1-$5 identity/value arrays, $6 branchCode (single scalar,
+  // not per-record), $7 syncRunId (single scalar). cost_avg is pre-collapsed
+  // to null for both "omitted" and "explicit null" inside foldNormalizedGroup,
+  // matching the OLD upsertBranchStockCurrent call site's own contract
+  // exactly -- the COALESCE below then preserves the existing cost in both
+  // cases, the correct, empirically-verified v1 behavior for THIS table
+  // (asymmetric with the wide table above, not a bug).
+  await client.query(
+    `
+      INSERT INTO ada.branch_stock_current
+        (product_code, branch_code, qty, cost_avg, synced_at, source_system, source_table, source_synced_at, raw_payload, last_full_sync_run_id, updated_at)
+      SELECT x.product_code, $6, x.qty, x.cost, x.synced_at, 'AdaAcc', 'TCNTPdtInWha', x.synced_at, x.raw_payload, $7::bigint, now()
+      FROM UNNEST($1::text[], $2::numeric[], $3::numeric[], $4::timestamptz[], $5::jsonb[])
+        AS x(product_code, qty, cost, synced_at, raw_payload)
+      ON CONFLICT (product_code, branch_code) DO UPDATE SET
+        qty = EXCLUDED.qty,
+        cost_avg = COALESCE(EXCLUDED.cost_avg, ada.branch_stock_current.cost_avg),
+        synced_at = EXCLUDED.synced_at,
+        source_synced_at = EXCLUDED.source_synced_at,
+        raw_payload = EXCLUDED.raw_payload,
+        last_full_sync_run_id = CASE WHEN $7::bigint IS NULL THEN ada.branch_stock_current.last_full_sync_run_id ELSE $7::bigint END,
+        updated_at = now()
+      WHERE ada.branch_stock_current.synced_at IS NULL
+         OR ada.branch_stock_current.synced_at <= EXCLUDED.synced_at
+    `,
+    [
+      folded.map((r) => r.productCode),
+      folded.map((r) => r.state.qty),
+      folded.map((r) => r.state.cost),
+      folded.map((r) => r.state.syncedAt),
+      folded.map((r) => JSON.stringify(r.state.rawPayload || {})),
+      branchCode,
+      syncRunId,
+    ],
+  );
+}
+
 async function findExistingBranchStockUpload(client, idempotencyKey) {
   const result = await client.query(
     `
@@ -1277,27 +1592,23 @@ function createBranchStockRouter(deps) {
     if (!client) return;
     try {
       await client.query("BEGIN");
-      for (const record of records) {
-        const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
-        const mergedRecord = mergeBranchStockRecord(
-          branchCode,
-          existingSnapshot ? mapExistingSnapshotRowToRecord(existingSnapshot) : createEmptySnapshotRecord(record.productCode, record.syncedAt),
-          record,
-          record.syncedAt,
-        );
-        // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, mergedRecord, branchCode, syncRunId);
-        // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockCurrent(client, {
-          productCode: record.productCode,
-          branchCode,
-          qty: record.qty,
-          costAvg: record.hasCostAvg ? record.costAvg : null,
-          syncedAt: record.syncedAt,
-          rawPayload: record.rawPayload,
-          syncRunId,
-        });
-      }
+      // Track C: Legacy Branch-Stock v1 Set-Based Optimization (Phase 3).
+      // Set-based replacement for the per-record read/merge/upsert loop --
+      // see the extensive comment above upsertBranchStockSnapshotBatch for
+      // the exact behavior-preservation guarantees (unconditional wide-table
+      // qty, freshness-guarded normalized-table qty, the explicit-null-vs-
+      // omitted cost asymmetry between the two tables). Both functions
+      // replay a duplicate productCode group as a SEQUENTIAL fold seeded
+      // from that table's own real pre-existing state (groupByProductCodeInOrder
+      // + foldWideGroup/foldNormalizedGroup) -- NOT a naive "keep only the
+      // last occurrence" reduction, which Codex's Tech Lead review found
+      // diverges from the OLD path's real per-record merge whenever a later
+      // duplicate omits a field an earlier one set. The response below
+      // still reports the INPUT record count, matching the OLD route's
+      // contract exactly, regardless of how many duplicates collapse into
+      // one written row per table.
+      await upsertBranchStockSnapshotBatch(client, records, branchCode, syncRunId);
+      await upsertBranchStockCurrentBatch(client, records, branchCode, syncRunId);
       await client.query("COMMIT");
       if (records.length > 0) {
         fireCategorizationBatch(db, records.map((r) => r.productCode));
@@ -1327,27 +1638,23 @@ function createBranchStockRouter(deps) {
     if (!client) return;
     try {
       await client.query("BEGIN");
-      for (const record of records) {
-        const existingSnapshot = await readExistingBranchStockSnapshot(client, record.productCode);
-        const mergedRecord = mergeBranchStockRecord(
-          branchCode,
-          existingSnapshot ? mapExistingSnapshotRowToRecord(existingSnapshot) : createEmptySnapshotRecord(record.productCode, record.syncedAt),
-          record,
-          record.syncedAt,
-        );
-        // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockSnapshot(client, mergedRecord, branchCode, syncRunId);
-        // eslint-disable-next-line no-await-in-loop
-        await upsertBranchStockCurrent(client, {
-          productCode: record.productCode,
-          branchCode,
-          qty: record.qty,
-          costAvg: record.hasCostAvg ? record.costAvg : null,
-          syncedAt: record.syncedAt,
-          rawPayload: record.rawPayload,
-          syncRunId,
-        });
-      }
+      // Track C: Legacy Branch-Stock v1 Set-Based Optimization (Phase 3).
+      // Set-based replacement for the per-record read/merge/upsert loop --
+      // see the extensive comment above upsertBranchStockSnapshotBatch for
+      // the exact behavior-preservation guarantees (unconditional wide-table
+      // qty, freshness-guarded normalized-table qty, the explicit-null-vs-
+      // omitted cost asymmetry between the two tables). Both functions
+      // replay a duplicate productCode group as a SEQUENTIAL fold seeded
+      // from that table's own real pre-existing state (groupByProductCodeInOrder
+      // + foldWideGroup/foldNormalizedGroup) -- NOT a naive "keep only the
+      // last occurrence" reduction, which Codex's Tech Lead review found
+      // diverges from the OLD path's real per-record merge whenever a later
+      // duplicate omits a field an earlier one set. The response below
+      // still reports the INPUT record count, matching the OLD route's
+      // contract exactly, regardless of how many duplicates collapse into
+      // one written row per table.
+      await upsertBranchStockSnapshotBatch(client, records, branchCode, syncRunId);
+      await upsertBranchStockCurrentBatch(client, records, branchCode, syncRunId);
       await client.query("COMMIT");
       if (records.length > 0) {
         fireCategorizationBatch(db, records.map((r) => r.productCode));
