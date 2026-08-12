@@ -154,7 +154,26 @@ function createBranchStockMockDb() {
         };
       }
 
-      if (normalized.startsWith("insert into ada.branch_stock_snapshots")) {
+      // Track C: Legacy Branch-Stock v1 Set-Based Optimization (Phase 3).
+      // The sync routes now issue a set-based UNNEST batch UPSERT (one
+      // statement for the whole payload) instead of one INSERT per record,
+      // with the target branch baked into the COLUMN NAME (qty_branch_XXX /
+      // cost_avg_branch_XXX / synced_at_branch_XXX / full_sync_run_id_branch_XXX)
+      // rather than passed as a data parameter -- this mock previously
+      // assumed the OLD per-record scalar-param shape (all 6 branch columns
+      // present, one row per query) and would silently misread the new
+      // array/UNNEST params (the exact bug class already found and fixed in
+      // apps/admin-api/src/routes/sync-ada.js's own test mocks earlier in
+      // this engagement, CLAIM-X-180 in _ledger/claude.md). Extracts the
+      // written branch's column names from the SQL text itself (present
+      // literally in the query, e.g. "qty_branch_003"), since the new SQL
+      // only ever touches ONE branch's columns per statement.
+      // The OLD single-record shape is still used by /branch-stock/upload
+      // (untouched in this candidate, shares the helper functions with the
+      // two sync routes but is explicitly out of scope for the batch
+      // conversion) -- kept side by side with the new batch handlers below,
+      // distinguished by the absence of "from unnest(" in the query text.
+      if (normalized.startsWith("insert into ada.branch_stock_snapshots") && !normalized.includes("from unnest(")) {
         state.snapshots.set(params[0], {
           product_code: params[0],
           product_name_thai: params[1],
@@ -180,7 +199,7 @@ function createBranchStockMockDb() {
         return { rowCount: 1, rows: [] };
       }
 
-      if (normalized.startsWith("insert into ada.branch_stock_current")) {
+      if (normalized.startsWith("insert into ada.branch_stock_current") && !normalized.includes("from unnest(")) {
         const [productCode, branchCode, qty, costAvg, syncedAt, rawPayload] = params;
         state.branchStockCurrent.set(`${productCode}|${branchCode}`, {
           product_code: productCode,
@@ -191,6 +210,100 @@ function createBranchStockMockDb() {
           raw_payload: JSON.parse(rawPayload || "{}"),
         });
         return { rowCount: 1, rows: [] };
+      }
+
+      // Codex Tech Lead remediation (real-Postgres reproduction, BLOCKED
+      // verdict before seal): the naive last-record dedup discarded state a
+      // correct sequential fold needs. The fix reads each product's REAL
+      // pre-existing row (name/barcode/unit/cost on the wide table below;
+      // qty/cost/synced_at on the normalized table further down) to seed
+      // the fold, matching what mergeBranchStockRecord's OLD per-record
+      // read/merge loop would have seen.
+      if (normalized.startsWith("select product_code, product_name_thai, product_name_eng, barcode, unit,") && normalized.includes("as cost from ada.branch_stock_snapshots where product_code = any(")) {
+        const costCol = /,\s*(cost_avg_branch_\d{3})\s+as cost\b/.exec(normalized)?.[1];
+        const productCodes = params[0] || [];
+        const rows = productCodes.map((code) => {
+          const existing = state.snapshots.get(code);
+          return {
+            product_code: code,
+            product_name_thai: existing?.product_name_thai ?? null,
+            product_name_eng: existing?.product_name_eng ?? null,
+            barcode: existing?.barcode ?? null,
+            unit: existing?.unit ?? null,
+            cost: existing?.[costCol] ?? null,
+          };
+        });
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.startsWith("select product_code, qty, cost_avg, synced_at from ada.branch_stock_current where branch_code")) {
+        const [branchCode, productCodes] = params;
+        const rows = (productCodes || [])
+          .map((code) => state.branchStockCurrent.get(`${code}|${branchCode}`))
+          .filter(Boolean)
+          .map((row) => ({ product_code: row.product_code, qty: row.qty, cost_avg: row.cost_avg, synced_at: row.synced_at }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (normalized.startsWith("insert into ada.branch_stock_snapshots") && normalized.includes("from unnest(")) {
+        const qtyCol = /,\s*(qty_branch_\d{3}),/.exec(normalized)?.[1];
+        const costCol = /,\s*(cost_avg_branch_\d{3}),/.exec(normalized)?.[1];
+        const freshnessCol = /,\s*(synced_at_branch_\d{3}),/.exec(normalized)?.[1];
+        const fullSyncCol = /,\s*(full_sync_run_id_branch_\d{3}),/.exec(normalized)?.[1];
+        const [productCodes, namesThai, namesEng, barcodes, units, qtys, costs, syncedAts, rawPayloads, syncRunId] = params;
+        const ALL_QTY_COLS = ["qty_branch_000", "qty_branch_001", "qty_branch_002", "qty_branch_003", "qty_branch_004", "qty_branch_005"];
+        productCodes.forEach((code, i) => {
+          const existing = state.snapshots.get(code) || {};
+          const row = {
+            product_code: code,
+            product_name_thai: namesThai[i] ?? existing.product_name_thai ?? null,
+            product_name_eng: namesEng[i] ?? existing.product_name_eng ?? null,
+            barcode: barcodes[i] ?? existing.barcode ?? null,
+            unit: units[i] ?? existing.unit ?? null,
+            qty_branch_000: existing.qty_branch_000 ?? 0,
+            qty_branch_001: existing.qty_branch_001 ?? 0,
+            qty_branch_002: existing.qty_branch_002 ?? 0,
+            qty_branch_003: existing.qty_branch_003 ?? 0,
+            qty_branch_004: existing.qty_branch_004 ?? 0,
+            qty_branch_005: existing.qty_branch_005 ?? 0,
+            cost_avg_branch_000: existing.cost_avg_branch_000 ?? null,
+            cost_avg_branch_001: existing.cost_avg_branch_001 ?? null,
+            cost_avg_branch_002: existing.cost_avg_branch_002 ?? null,
+            cost_avg_branch_003: existing.cost_avg_branch_003 ?? null,
+            cost_avg_branch_004: existing.cost_avg_branch_004 ?? null,
+            cost_avg_branch_005: existing.cost_avg_branch_005 ?? null,
+            [freshnessCol]: syncedAts[i],
+            [fullSyncCol]: syncRunId ?? existing[fullSyncCol] ?? null,
+            synced_at: syncedAts[i],
+            raw_payload: JSON.parse(rawPayloads[i]),
+          };
+          row[qtyCol] = qtys[i];
+          row[costCol] = costs[i];
+          row.qty_total_all_branches = ALL_QTY_COLS.reduce((sum, col) => sum + Number(row[col] || 0), 0);
+          state.snapshots.set(code, row);
+        });
+        return { rowCount: productCodes.length, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.branch_stock_current") && normalized.includes("from unnest(")) {
+        const [productCodes, qtys, costs, syncedAts, rawPayloads, branchCode, syncRunId] = params;
+        productCodes.forEach((code, i) => {
+          const key = `${code}|${branchCode}`;
+          const existing = state.branchStockCurrent.get(key);
+          if (existing && existing.synced_at != null && new Date(existing.synced_at) > new Date(syncedAts[i])) {
+            return; // freshness guard: a genuinely stale write is rejected, matching the real SQL's WHERE clause
+          }
+          state.branchStockCurrent.set(key, {
+            product_code: code,
+            branch_code: branchCode,
+            qty: qtys[i],
+            cost_avg: costs[i] ?? existing?.cost_avg ?? null,
+            synced_at: syncedAts[i],
+            last_full_sync_run_id: syncRunId ?? existing?.last_full_sync_run_id ?? null,
+            raw_payload: JSON.parse(rawPayloads[i] || "{}"),
+          });
+        });
+        return { rowCount: productCodes.length, rows: [] };
       }
 
       if (normalized.startsWith("select product_code, product_name_thai, product_name_eng, barcode, unit, qty_branch_000")) {
