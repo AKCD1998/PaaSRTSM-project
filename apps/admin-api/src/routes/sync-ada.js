@@ -1696,6 +1696,290 @@ async function upsertApprovedReceiptRecord(client, body, branchCode, record) {
   }
 }
 
+// Track C — set-based conversion of the approved-receipts write path.
+// upsertApprovedReceiptRecord (above) is kept UNCHANGED and unused by this
+// route as of this candidate -- not deleted, per this candidate's explicit
+// no-dead-code-removal scope boundary.
+//
+// Behavior contract, established empirically against the OLD per-record
+// path on real Postgres before this was written (FINAL APPROVED-RECEIPTS
+// SEALED CANDIDATE REPORT, Phase B):
+//   - duplicate doc_no in one payload -> the LAST record wins ENTIRELY
+//     (full-row replace for both header and lines; OLD's
+//     ON CONFLICT DO UPDATE SET col=EXCLUDED.col for every column means no
+//     earlier duplicate's field ever survives, so a simple last-write-wins
+//     grouping is exactly equivalent -- no partial-field fold needed,
+//     unlike the legacy branch-stock candidate).
+//   - a duplicate record's own docNo/seqNo validity must still be checked
+//     even though its data is ultimately discarded, because OLD's
+//     sequential per-record loop would have thrown while processing it
+//     (before ever reaching a later record), rolling back the WHOLE
+//     transaction -- this function validates every record's docNo and
+//     every record's lines' seqNo, not just the winning subset.
+//   - duplicate seq_no WITHIN one record's own lines IS pre-validated here
+//     in JS (a per-record `seenSeqNos` check, below), for EVERY original
+//     record -- not only the eventual last-record-wins winner (CLAIM-X-203
+//     fix; see the fold loop's own comment for why the winner-only check
+//     an earlier draft had was a real regression). This preserves the
+//     EXTERNALLY OBSERVABLE outcome OLD produced -- HTTP 500, the whole
+//     payload's transaction rolled back -- but the error is no longer a
+//     real PostgreSQL `23505` unique-violation the way OLD's was: OLD let
+//     the `(doc_no, seq_no)` PRIMARY KEY reject the second INSERT and
+//     propagate that DB error; this candidate now throws a plain JS
+//     `Error` before any batch SQL for the duplicate-seq_no case ever
+//     runs. The response body is identical either way (the outer error
+//     middleware collapses every 5xx to the same generic
+//     `{"error":"Internal server error"}` regardless of the underlying
+//     error's origin or message), so no client-visible contract changed --
+//     only the internal error's provenance did.
+//   - header raw_payload = the entire submitted record object (lines array
+//     included verbatim), unless the record supplies its own
+//     `__rawPayload` -- identical to getRawPayload's existing contract,
+//     unchanged.
+//   - sourceSyncedAt: `getSourceSyncedAt(body)` is called separately for
+//     every PERSISTED header row and every PERSISTED line row (not hoisted
+//     to one shared value computed once for the whole batch) -- this is
+//     NOT a claim that NEW matches OLD's exact call order or timing. OLD
+//     interleaves header-then-lines PER DOCUMENT, sequentially; this
+//     batched version computes all header rows' values in one loop, then
+//     all line rows' values in a separate later loop, so the relative
+//     ORDER in which individual `Date.now()` fallback calls happen (when
+//     `sourceSyncedAt` is omitted from the request) differs from OLD's,
+//     even though each persisted row still gets its own freshly-computed
+//     value rather than a value shared across the batch. No downstream
+//     correctness dependency on millisecond-level ordering or timing
+//     between rows has been found or is asserted here -- `ordering.js`'s
+//     approved-receipts admin list reads and displays `source_synced_at`
+//     per row, but nothing in that reader (or elsewhere) compares rows'
+//     timestamps against each other or depends on their relative sequence.
+async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
+  if (records.length === 0) {
+    return;
+  }
+
+  // Group by doc_no, last occurrence wins (full replace) -- but validate
+  // EVERY record along the way, in payload order, matching OLD's
+  // sequential per-record/per-line throw points.
+  //
+  // CLAIM-X-203 remediation (Codex-caught regression): OLD processes each
+  // record SEQUENTIALLY and DELETE-then-reinserts that record's own lines
+  // as it goes, so if an EARLIER record sharing a doc_no with a LATER,
+  // ultimately-winning record has a duplicate seq_no WITHIN ITS OWN lines,
+  // OLD still reaches that earlier record's insert loop, still hits the
+  // real (doc_no, seq_no) PK violation, and still rolls back the whole
+  // payload -- even though that earlier record's lines are not what ends
+  // up "winning" the doc_no. The first draft of this candidate only let
+  // the database's real unique constraint catch a duplicate seq_no in the
+  // FINAL/winning record's lines (relying on the real INSERT, deliberately
+  // not pre-validated in JS, per the function-level comment above) --  but
+  // a non-winning, discarded record's lines never reach that INSERT at
+  // all under last-record-wins compaction, so its own internal duplicate
+  // silently vanished instead of failing the batch. Fixed by explicitly
+  // checking every record's OWN lines array for an internal seq_no
+  // collision here, in JS, before compaction -- this is pure in-memory
+  // validation (no extra DB round trip), so it does not affect the O(1)
+  // statement-count property for the normal (no-duplicate) case.
+  const byDocNo = new Map();
+  const order = [];
+  for (const record of records) {
+    const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
+    if (!docNo) {
+      throw new Error("Each approved receipt record requires FTXihDocNo/docNo.");
+    }
+    const seenSeqNos = new Set();
+    for (const line of record.lines || []) {
+      const seqNo = Number(pick(line, ["FNXidSeqNo", "seqNo"], 0));
+      if (!Number.isInteger(seqNo) || seqNo <= 0) {
+        throw new Error("Each approved receipt line requires positive FNXidSeqNo/seqNo.");
+      }
+      if (seenSeqNos.has(seqNo)) {
+        throw new Error("Each approved receipt line requires a unique seqNo within its own record.");
+      }
+      seenSeqNos.add(seqNo);
+    }
+    if (!byDocNo.has(docNo)) order.push(docNo);
+    byDocNo.set(docNo, record);
+  }
+
+  const sourceSystem = getSourceSystem(body);
+  // Codex CLAIM-X-203/CLAIM-X-205 remediation, item 5: `getSourceSyncedAt(body)`
+  // is called separately below for each PERSISTED header row and each
+  // PERSISTED line row (not hoisted to one shared value computed once for
+  // the whole batch). `source_synced_at` is a real downstream-read field
+  // (ordering.js's approved-receipts admin list selects and returns
+  // `h.source_synced_at AS synced_at`), so an earlier draft's "compute
+  // once per batch" simplification -- justified at the time as
+  // non-observable wall-clock noise -- was withdrawn rather than risk an
+  // admin-visible timestamp discrepancy. When the request supplies
+  // `sourceSyncedAt` explicitly, every call returns that same fixed value
+  // regardless (see `getSourceSyncedAt`/`parseTimestamp`), so this only
+  // matters in the omitted-fallback case. This is NOT a claim that NEW
+  // reproduces OLD's exact call order/timing: OLD calls
+  // header-then-lines-per-document, sequentially; this function computes
+  // all header values in one loop then all line values in a separate
+  // later loop, so the relative sequence of individual `Date.now()`
+  // fallback calls differs from OLD's even though each row still gets its
+  // own freshly-computed value. No downstream reader has been found that
+  // depends on millisecond-level ordering between rows.
+
+  const h = {
+    docNo: [], branchCode: [], docType: [], docDate: [], docTime: [], supplierCode: [],
+    supplierName: [], refExt: [], refExtDate: [], warehouseCode: [], total: [], vat: [],
+    grand: [], usrCode: [], createdBy: [], createdAtAda: [], staDoc: [], staPrcDoc: [],
+    sourceSystem: [], sourceTable: [], sourceSyncedAt: [], rawPayload: [],
+  };
+  for (const docNo of order) {
+    const record = byDocNo.get(docNo);
+    h.docNo.push(docNo);
+    h.branchCode.push(branchCode);
+    h.docType.push(normalizeNullableText(pick(record, ["FTXihDocType", "docType"])));
+    h.docDate.push(parseDate(pick(record, ["FDXihDocDate", "docDate"])));
+    h.docTime.push(normalizeNullableText(pick(record, ["FTXihDocTime", "docTime"])));
+    h.supplierCode.push(normalizeNullableText(pick(record, ["FTSplCode", "supplierCode"])));
+    h.supplierName.push(normalizeNullableText(pick(record, ["FTXihCstName", "supplierName"])));
+    h.refExt.push(normalizeNullableText(pick(record, ["FTXihRefExt", "refExt"])));
+    h.refExtDate.push(parseDate(pick(record, ["FDXihRefExtDate", "refExtDate"])));
+    h.warehouseCode.push(normalizeNullableText(pick(record, ["FTWahCode", "warehouseCode"])));
+    h.total.push(toNumber(pick(record, ["FCXihTotal", "total"]), 0));
+    h.vat.push(toNumber(pick(record, ["FCXihVat", "vat"]), 0));
+    h.grand.push(toNumber(pick(record, ["FCXihGrand", "grand"]), 0));
+    h.usrCode.push(normalizeNullableText(pick(record, ["FTUsrCode", "usrCode"])));
+    h.createdBy.push(normalizeNullableText(pick(record, ["FTWhoIns", "createdBy"])));
+    h.createdAtAda.push(parseTimestamp(pick(record, ["FDDateIns", "createdAtAda"])));
+    h.staDoc.push(normalizeNullableText(pick(record, ["FTXihStaDoc", "staDoc"])));
+    h.staPrcDoc.push(normalizeNullableText(pick(record, ["FTXihStaPrcDoc", "staPrcDoc"])));
+    h.sourceSystem.push(sourceSystem);
+    h.sourceTable.push(normalizeText(pick(record, ["sourceTable"], "TACTPiHD")));
+    h.sourceSyncedAt.push(getSourceSyncedAt(body));
+    h.rawPayload.push(getRawPayload(record));
+  }
+
+  await client.query(
+    `
+      INSERT INTO ada.approved_receipt_headers
+        (doc_no, branch_code, doc_type, doc_date, doc_time, supplier_code, supplier_name,
+         ref_ext, ref_ext_date, warehouse_code, total, vat, grand, usr_code, created_by,
+         created_at_ada, sta_doc, sta_prc_doc, source_system, source_table, source_synced_at,
+         raw_payload, updated_at)
+      SELECT u.doc_no, u.branch_code, u.doc_type, u.doc_date, u.doc_time, u.supplier_code,
+             u.supplier_name, u.ref_ext, u.ref_ext_date, u.warehouse_code, u.total, u.vat,
+             u.grand, u.usr_code, u.created_by, u.created_at_ada, u.sta_doc, u.sta_prc_doc,
+             u.source_system, u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+      FROM UNNEST(
+        $1::text[], $2::text[], $3::text[], $4::date[], $5::text[], $6::text[], $7::text[],
+        $8::text[], $9::date[], $10::text[], $11::numeric[], $12::numeric[], $13::numeric[],
+        $14::text[], $15::text[], $16::timestamptz[], $17::text[], $18::text[], $19::text[],
+        $20::text[], $21::timestamptz[], $22::text[]
+      ) AS u(doc_no, branch_code, doc_type, doc_date, doc_time, supplier_code, supplier_name,
+             ref_ext, ref_ext_date, warehouse_code, total, vat, grand, usr_code, created_by,
+             created_at_ada, sta_doc, sta_prc_doc, source_system, source_table, source_synced_at,
+             raw_payload)
+      ON CONFLICT (doc_no) DO UPDATE SET
+        branch_code = EXCLUDED.branch_code,
+        doc_type = EXCLUDED.doc_type,
+        doc_date = EXCLUDED.doc_date,
+        doc_time = EXCLUDED.doc_time,
+        supplier_code = EXCLUDED.supplier_code,
+        supplier_name = EXCLUDED.supplier_name,
+        ref_ext = EXCLUDED.ref_ext,
+        ref_ext_date = EXCLUDED.ref_ext_date,
+        warehouse_code = EXCLUDED.warehouse_code,
+        total = EXCLUDED.total,
+        vat = EXCLUDED.vat,
+        grand = EXCLUDED.grand,
+        usr_code = EXCLUDED.usr_code,
+        created_by = EXCLUDED.created_by,
+        created_at_ada = EXCLUDED.created_at_ada,
+        sta_doc = EXCLUDED.sta_doc,
+        sta_prc_doc = EXCLUDED.sta_prc_doc,
+        source_system = EXCLUDED.source_system,
+        source_table = EXCLUDED.source_table,
+        source_synced_at = EXCLUDED.source_synced_at,
+        raw_payload = EXCLUDED.raw_payload,
+        updated_at = now()
+    `,
+    [
+      h.docNo, h.branchCode, h.docType, h.docDate, h.docTime, h.supplierCode, h.supplierName,
+      h.refExt, h.refExtDate, h.warehouseCode, h.total, h.vat, h.grand, h.usrCode, h.createdBy,
+      h.createdAtAda, h.staDoc, h.staPrcDoc, h.sourceSystem, h.sourceTable, h.sourceSyncedAt,
+      h.rawPayload,
+    ],
+  );
+
+  // DELETE only the final distinct doc_nos actually present this request --
+  // matches OLD's per-record DELETE, batched to one statement.
+  await client.query("DELETE FROM ada.approved_receipt_lines WHERE doc_no = ANY($1::text[])", [order]);
+
+  const l = {
+    docNo: [], seqNo: [], productCode: [], productName: [], barcode: [], unitCode: [],
+    unitName: [], factor: [], qty: [], qtyBase: [], stockFactor: [], setPrice: [], net: [],
+    vat: [], costIn: [], lotNo: [], expiredDate: [], warehouseCode: [], sourceSystem: [],
+    sourceTable: [], sourceSyncedAt: [], rawPayload: [],
+  };
+  for (const docNo of order) {
+    const record = byDocNo.get(docNo);
+    for (const line of record.lines || []) {
+      const seqNo = Number(pick(line, ["FNXidSeqNo", "seqNo"], 0));
+      l.docNo.push(docNo);
+      l.seqNo.push(seqNo);
+      l.productCode.push(normalizeNullableText(pick(line, ["FTPdtCode", "productCode"])));
+      l.productName.push(normalizeNullableText(pick(line, ["FTPdtName", "productName"])));
+      l.barcode.push(normalizeNullableText(pick(line, ["FTXidBarCode", "barcode"])));
+      l.unitCode.push(normalizeNullableText(pick(line, ["FTPunCode", "unitCode"])));
+      l.unitName.push(normalizeNullableText(pick(line, ["FTXidUnitName", "unitName"])));
+      l.factor.push(toNumber(pick(line, ["FCXidFactor", "factor"]), 1));
+      l.qty.push(toNumber(pick(line, ["FCXidQty", "qty"]), 0));
+      l.qtyBase.push(toNumber(pick(line, ["FCXidQtyAll", "qtyBase"]), 0));
+      l.stockFactor.push(toNumber(pick(line, ["FCXidStkFac", "stockFactor"]), 1));
+      l.setPrice.push(toNumber(pick(line, ["FCXidSetPrice", "setPrice"]), 0));
+      l.net.push(toNumber(pick(line, ["FCXidNet", "net"]), 0));
+      l.vat.push(toNumber(pick(line, ["FCXidVat", "vat"]), 0));
+      l.costIn.push(toNumber(pick(line, ["FCXidCostIn", "costIn"]), 0));
+      l.lotNo.push(normalizeNullableText(pick(line, ["FTXidLotNo", "lotNo"])));
+      l.expiredDate.push(parseDate(pick(line, ["FDXidExpired", "expiredDate"])));
+      l.warehouseCode.push(normalizeNullableText(pick(line, ["FTWahCode", "warehouseCode"])));
+      l.sourceSystem.push(sourceSystem);
+      l.sourceTable.push(normalizeText(pick(line, ["sourceTable"], "TACTPiDT")));
+      l.sourceSyncedAt.push(getSourceSyncedAt(body));
+      l.rawPayload.push(getRawPayload(line));
+    }
+  }
+
+  if (l.docNo.length === 0) {
+    return;
+  }
+
+  // No ON CONFLICT here, intentionally -- see the function-level comment.
+  // A genuine duplicate (doc_no, seq_no) within the winning record's own
+  // lines throws the real Postgres unique-violation error, same as OLD.
+  await client.query(
+    `
+      INSERT INTO ada.approved_receipt_lines
+        (doc_no, seq_no, product_code, product_name, barcode, unit_code, unit_name, factor,
+         qty, qty_base, stock_factor, set_price, net, vat, cost_in, lot_no, expired_date,
+         warehouse_code, source_system, source_table, source_synced_at, raw_payload, updated_at)
+      SELECT u.doc_no, u.seq_no, u.product_code, u.product_name, u.barcode, u.unit_code,
+             u.unit_name, u.factor, u.qty, u.qty_base, u.stock_factor, u.set_price, u.net,
+             u.vat, u.cost_in, u.lot_no, u.expired_date, u.warehouse_code, u.source_system,
+             u.source_table, u.source_synced_at, u.raw_payload::jsonb, now()
+      FROM UNNEST(
+        $1::text[], $2::integer[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+        $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::numeric[],
+        $13::numeric[], $14::numeric[], $15::numeric[], $16::text[], $17::date[], $18::text[],
+        $19::text[], $20::text[], $21::timestamptz[], $22::text[]
+      ) AS u(doc_no, seq_no, product_code, product_name, barcode, unit_code, unit_name, factor,
+             qty, qty_base, stock_factor, set_price, net, vat, cost_in, lot_no, expired_date,
+             warehouse_code, source_system, source_table, source_synced_at, raw_payload)
+    `,
+    [
+      l.docNo, l.seqNo, l.productCode, l.productName, l.barcode, l.unitCode, l.unitName,
+      l.factor, l.qty, l.qtyBase, l.stockFactor, l.setPrice, l.net, l.vat, l.costIn, l.lotNo,
+      l.expiredDate, l.warehouseCode, l.sourceSystem, l.sourceTable, l.sourceSyncedAt,
+      l.rawPayload,
+    ],
+  );
+}
+
 const upsertStockAdjustmentHeader = createHeaderLineUpsert(
   "ada.stock_adjustment_headers",
   "Each stock adjustment header requires branch_code and doc_no.",
@@ -2531,10 +2815,9 @@ function createAdaSyncRouter(deps) {
     if (!client) return;
     try {
       await client.query("BEGIN");
-      for (const record of records) {
-        // eslint-disable-next-line no-await-in-loop
-        await upsertApprovedReceiptRecord(client, req.body, branchCode, record);
-      }
+      // Track C: set-based batch replaces the OLD per-record loop
+      // (upsertApprovedReceiptRecord, kept above, unused, not deleted).
+      await upsertApprovedReceiptsBatch(client, req.body, branchCode, records);
       await client.query("COMMIT");
       return res.json({ ok: true, upserted: records.length });
     } catch (e) {

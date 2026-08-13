@@ -126,6 +126,80 @@ function createReceiptMockDb() {
         return { rowCount: 1, rows: [] };
       }
 
+      // Track C set-based batch shape (UNNEST-based) -- checked BEFORE the
+      // OLD single-record prefix checks below, because both start with the
+      // same "insert into ada.approved_receipt_headers"/"...lines" prefix;
+      // without this ordering the OLD branch would match first and treat
+      // array params as scalars, producing silently wrong mock state
+      // rather than an error. The OLD single-record handlers are kept
+      // unchanged beneath this for `upsertApprovedReceiptRecord`, which
+      // still exists in source (unused by the route, not deleted).
+      if (normalized.startsWith("insert into ada.approved_receipt_headers") && normalized.includes("from unnest")) {
+        const [docNos, branchCodes, docTypes, docDates, docTimes, supplierCodes, supplierNames,
+          refExts, refExtDates, warehouseCodes, totals, vats, grands, usrCodes, createdBys,
+          createdAtAdas, staDocs, staPrcDocs] = params;
+        for (let i = 0; i < docNos.length; i++) {
+          state.approvedHeaders.set(docNos[i], {
+            doc_no: docNos[i],
+            branch_code: branchCodes[i],
+            doc_type: docTypes[i],
+            doc_date: docDates[i],
+            doc_time: docTimes[i],
+            supplier_code: supplierCodes[i],
+            supplier_name: supplierNames[i],
+            ref_ext: refExts[i],
+            ref_ext_date: refExtDates[i],
+            warehouse_code: warehouseCodes[i],
+            total: totals[i],
+            vat: vats[i],
+            grand: grands[i],
+            usr_code: usrCodes[i],
+            created_by: createdBys[i],
+            created_at_ada: createdAtAdas[i],
+            sta_doc: staDocs[i],
+            sta_prc_doc: staPrcDocs[i],
+            synced_at: params[20][i],
+          });
+        }
+        return { rowCount: docNos.length, rows: [] };
+      }
+
+      if (normalized.startsWith("delete from ada.approved_receipt_lines where doc_no = any($1")) {
+        for (const docNo of params[0]) state.approvedLines.delete(docNo);
+        return { rowCount: 0, rows: [] };
+      }
+
+      if (normalized.startsWith("insert into ada.approved_receipt_lines") && normalized.includes("from unnest")) {
+        const [docNos, seqNos, productCodes, productNames, barcodes, unitCodes, unitNames,
+          factors, qtys, qtyBases, stockFactors, setPrices, nets, vats, costIns, lotNos,
+          expiredDates, lineWarehouseCodes] = params;
+        for (let i = 0; i < docNos.length; i++) {
+          const list = state.approvedLines.get(docNos[i]) || [];
+          list.push({
+            doc_no: docNos[i],
+            seq_no: seqNos[i],
+            product_code: productCodes[i],
+            product_name: productNames[i],
+            barcode: barcodes[i],
+            unit_code: unitCodes[i],
+            unit_name: unitNames[i],
+            factor: factors[i],
+            qty: qtys[i],
+            qty_base: qtyBases[i],
+            stock_factor: stockFactors[i],
+            set_price: setPrices[i],
+            net: nets[i],
+            line_vat: vats[i],
+            cost_in: costIns[i],
+            lot_no: lotNos[i],
+            expired_date: expiredDates[i],
+            line_warehouse_code: lineWarehouseCodes[i],
+          });
+          state.approvedLines.set(docNos[i], list);
+        }
+        return { rowCount: docNos.length, rows: [] };
+      }
+
       if (normalized.startsWith("insert into ada.approved_receipt_headers")) {
         state.approvedHeaders.set(params[0], {
           doc_no: params[0],
