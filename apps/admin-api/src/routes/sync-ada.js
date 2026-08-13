@@ -1727,13 +1727,16 @@ async function upsertApprovedReceiptRecord(client, body, branchCode, record) {
 //     included verbatim), unless the record supplies its own
 //     `__rawPayload` -- identical to getRawPayload's existing contract,
 //     unchanged.
-//   - sourceSyncedAt, when omitted from the request body, is computed ONCE
-//     for the whole batch (not once per row as OLD's per-statement
-//     `getSourceSyncedAt(body)` calls effectively did). This is a
-//     disclosed, intentional deviation: OLD's per-row "fresh Date.now()"
-//     fallback is non-deterministic wall-clock noise with no downstream
-//     business meaning at sub-second granularity: nothing reads or
-//     compares these fallback timestamps across rows within one batch.
+//   - sourceSyncedAt matches OLD exactly: `getSourceSyncedAt(body)` is
+//     called fresh for every row (header and line), not hoisted to one
+//     shared value. An earlier draft of this candidate hoisted it to save
+//     a function call, reasoning the omitted-fallback case was
+//     non-observable wall-clock noise -- withdrawn (CLAIM-X-203 item 5)
+//     once it was confirmed `ordering.js`'s approved-receipts admin list
+//     actually selects and returns `source_synced_at` downstream, so any
+//     discrepancy from OLD is a real, admin-visible behavior change, not
+//     provably inert. Restoring the exact per-row call costs nothing (it
+//     is a JS computation, not a DB round trip) and removes the question.
 async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
   if (records.length === 0) {
     return;
@@ -1742,6 +1745,25 @@ async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
   // Group by doc_no, last occurrence wins (full replace) -- but validate
   // EVERY record along the way, in payload order, matching OLD's
   // sequential per-record/per-line throw points.
+  //
+  // CLAIM-X-203 remediation (Codex-caught regression): OLD processes each
+  // record SEQUENTIALLY and DELETE-then-reinserts that record's own lines
+  // as it goes, so if an EARLIER record sharing a doc_no with a LATER,
+  // ultimately-winning record has a duplicate seq_no WITHIN ITS OWN lines,
+  // OLD still reaches that earlier record's insert loop, still hits the
+  // real (doc_no, seq_no) PK violation, and still rolls back the whole
+  // payload -- even though that earlier record's lines are not what ends
+  // up "winning" the doc_no. The first draft of this candidate only let
+  // the database's real unique constraint catch a duplicate seq_no in the
+  // FINAL/winning record's lines (relying on the real INSERT, deliberately
+  // not pre-validated in JS, per the function-level comment above) --  but
+  // a non-winning, discarded record's lines never reach that INSERT at
+  // all under last-record-wins compaction, so its own internal duplicate
+  // silently vanished instead of failing the batch. Fixed by explicitly
+  // checking every record's OWN lines array for an internal seq_no
+  // collision here, in JS, before compaction -- this is pure in-memory
+  // validation (no extra DB round trip), so it does not affect the O(1)
+  // statement-count property for the normal (no-duplicate) case.
   const byDocNo = new Map();
   const order = [];
   for (const record of records) {
@@ -1749,18 +1771,34 @@ async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
     if (!docNo) {
       throw new Error("Each approved receipt record requires FTXihDocNo/docNo.");
     }
+    const seenSeqNos = new Set();
     for (const line of record.lines || []) {
       const seqNo = Number(pick(line, ["FNXidSeqNo", "seqNo"], 0));
       if (!Number.isInteger(seqNo) || seqNo <= 0) {
         throw new Error("Each approved receipt line requires positive FNXidSeqNo/seqNo.");
       }
+      if (seenSeqNos.has(seqNo)) {
+        throw new Error("Each approved receipt line requires a unique seqNo within its own record.");
+      }
+      seenSeqNos.add(seqNo);
     }
     if (!byDocNo.has(docNo)) order.push(docNo);
     byDocNo.set(docNo, record);
   }
 
   const sourceSystem = getSourceSystem(body);
-  const sourceSyncedAt = getSourceSyncedAt(body);
+  // Codex CLAIM-X-203 remediation, item 5: `getSourceSyncedAt(body)` is
+  // called FRESH per row below (not hoisted to one shared value), matching
+  // OLD's per-statement behavior exactly. This matters: `source_synced_at`
+  // is a real downstream-read field (ordering.js's approved-receipts admin
+  // list selects and returns `h.source_synced_at AS synced_at`), so an
+  // earlier draft's "compute once per batch" simplification -- justified
+  // at the time as non-observable wall-clock noise -- was withdrawn rather
+  // than risk an admin-visible timestamp discrepancy. When the request
+  // supplies `sourceSyncedAt` explicitly, every call returns that same
+  // fixed value regardless (see `getSourceSyncedAt`/`parseTimestamp`), so
+  // this only changes behavior in the omitted-fallback case, restoring
+  // OLD's fresh-`Date.now()`-per-row default exactly.
 
   const h = {
     docNo: [], branchCode: [], docType: [], docDate: [], docTime: [], supplierCode: [],
@@ -1790,7 +1828,7 @@ async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
     h.staPrcDoc.push(normalizeNullableText(pick(record, ["FTXihStaPrcDoc", "staPrcDoc"])));
     h.sourceSystem.push(sourceSystem);
     h.sourceTable.push(normalizeText(pick(record, ["sourceTable"], "TACTPiHD")));
-    h.sourceSyncedAt.push(sourceSyncedAt);
+    h.sourceSyncedAt.push(getSourceSyncedAt(body));
     h.rawPayload.push(getRawPayload(record));
   }
 
@@ -1880,7 +1918,7 @@ async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
       l.warehouseCode.push(normalizeNullableText(pick(line, ["FTWahCode", "warehouseCode"])));
       l.sourceSystem.push(sourceSystem);
       l.sourceTable.push(normalizeText(pick(line, ["sourceTable"], "TACTPiDT")));
-      l.sourceSyncedAt.push(sourceSyncedAt);
+      l.sourceSyncedAt.push(getSourceSyncedAt(body));
       l.rawPayload.push(getRawPayload(line));
     }
   }

@@ -40,6 +40,8 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const express = require("express");
 const request = require("supertest");
 const { Pool } = require("pg");
@@ -80,6 +82,25 @@ let pool;
 test.before(async function () {
   if (!databaseUrl) return;
   pool = new Pool({ connectionString: databaseUrl, max: 8 });
+  // Codex CLAIM-X-203 remediation, item 4: this file previously assumed
+  // the target database already had the ada.* schema applied out-of-band
+  // -- it opened a pool but never bootstrapped anything, so pointing it at
+  // a genuinely blank database failed with `3F000 schema "ada" does not
+  // exist` before the route was ever exercised. Standalone bootstrap from
+  // the real migration file, matching the established pattern already
+  // used by sync-ada-sales-lines-headers.test.js. `CREATE SCHEMA IF NOT
+  // EXISTS` first because migration 020 itself assumes the schema already
+  // exists (it was originally meant to run after migration 015); applying
+  // the migration body is idempotent either way (CREATE TABLE/INDEX IF NOT
+  // EXISTS throughout, confirmed by reading the file), so this is safe to
+  // run unconditionally against either a blank database or one that
+  // already has the schema applied.
+  await pool.query("CREATE SCHEMA IF NOT EXISTS ada");
+  const migrationSql = fs.readFileSync(
+    path.join(__dirname, "..", "migrations", "020_add_admin_receipt_staging.sql"),
+    "utf8",
+  );
+  await pool.query(migrationSql);
 });
 test.after(async function () {
   if (pool) await pool.end();
@@ -195,6 +216,30 @@ integration("2: duplicate doc_no across payload -- last record replaces header+l
   const lines = await dumpLines();
   assert.equal(lines.length, 2);
   assert.deepEqual(lines.map((l) => l.product_code), ["PB", "PC"]); // PA is GONE
+});
+
+// ---- 2b: duplicate doc_no where the DISCARDED earlier record has an
+// internal duplicate seq_no -- Codex CLAIM-X-203 regression. The first
+// draft of this candidate validated seqNo positivity for every record but
+// only let the DB's real unique constraint catch a duplicate seq_no in the
+// WINNING record's own lines -- an earlier, non-winning record's internal
+// duplicate was silently discarded by last-record-wins compaction instead
+// of failing the batch, because its lines never reached the INSERT at all.
+// OLD reaches the earlier record's insert loop regardless of whether it
+// ultimately "wins" its doc_no, so it still rolls back the whole payload.
+integration("2b: duplicate doc_no, EARLIER (discarded) record has internal duplicate seq_no -- must still 500/rollback like OLD, not silently succeed", async () => {
+  await reset();
+  const r = await request(makeApp(pool)).post("/api/sync/ada/approved-receipts").send({
+    branchCode: "001",
+    records: [
+      { FTXihDocNo: "SAME-DOC", lines: [{ FNXidSeqNo: 1, FTPdtCode: "EARLY-A" }, { FNXidSeqNo: 1, FTPdtCode: "EARLY-B" }] },
+      { FTXihDocNo: "SAME-DOC", lines: [{ FNXidSeqNo: 1, FTPdtCode: "FINAL-VALID" }] },
+    ],
+  });
+  assert.equal(r.status, 500);
+  assert.deepEqual(r.body, { error: "Internal server error", request_id: null });
+  assert.equal((await dumpHeaders()).length, 0);
+  assert.equal((await dumpLines()).length, 0);
 });
 
 // ---- 3: duplicate doc_no, final record has zero lines --------------------
