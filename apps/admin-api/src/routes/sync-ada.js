@@ -1716,27 +1716,42 @@ async function upsertApprovedReceiptRecord(client, body, branchCode, record) {
 //     (before ever reaching a later record), rolling back the WHOLE
 //     transaction -- this function validates every record's docNo and
 //     every record's lines' seqNo, not just the winning subset.
-//   - duplicate seq_no WITHIN one record's own lines is NOT pre-validated
-//     here in JS, on purpose: OLD never validated it either -- it let the
-//     real `(doc_no, seq_no)` PRIMARY KEY reject the second occurrence.
-//     This batched version preserves that by never adding ON CONFLICT to
-//     the line INSERT, so a genuine intra-record duplicate still throws
-//     the same class of real Postgres unique-violation error, still rolls
-//     back the whole transaction the same way.
+//   - duplicate seq_no WITHIN one record's own lines IS pre-validated here
+//     in JS (a per-record `seenSeqNos` check, below), for EVERY original
+//     record -- not only the eventual last-record-wins winner (CLAIM-X-203
+//     fix; see the fold loop's own comment for why the winner-only check
+//     an earlier draft had was a real regression). This preserves the
+//     EXTERNALLY OBSERVABLE outcome OLD produced -- HTTP 500, the whole
+//     payload's transaction rolled back -- but the error is no longer a
+//     real PostgreSQL `23505` unique-violation the way OLD's was: OLD let
+//     the `(doc_no, seq_no)` PRIMARY KEY reject the second INSERT and
+//     propagate that DB error; this candidate now throws a plain JS
+//     `Error` before any batch SQL for the duplicate-seq_no case ever
+//     runs. The response body is identical either way (the outer error
+//     middleware collapses every 5xx to the same generic
+//     `{"error":"Internal server error"}` regardless of the underlying
+//     error's origin or message), so no client-visible contract changed --
+//     only the internal error's provenance did.
 //   - header raw_payload = the entire submitted record object (lines array
 //     included verbatim), unless the record supplies its own
 //     `__rawPayload` -- identical to getRawPayload's existing contract,
 //     unchanged.
-//   - sourceSyncedAt matches OLD exactly: `getSourceSyncedAt(body)` is
-//     called fresh for every row (header and line), not hoisted to one
-//     shared value. An earlier draft of this candidate hoisted it to save
-//     a function call, reasoning the omitted-fallback case was
-//     non-observable wall-clock noise -- withdrawn (CLAIM-X-203 item 5)
-//     once it was confirmed `ordering.js`'s approved-receipts admin list
-//     actually selects and returns `source_synced_at` downstream, so any
-//     discrepancy from OLD is a real, admin-visible behavior change, not
-//     provably inert. Restoring the exact per-row call costs nothing (it
-//     is a JS computation, not a DB round trip) and removes the question.
+//   - sourceSyncedAt: `getSourceSyncedAt(body)` is called separately for
+//     every PERSISTED header row and every PERSISTED line row (not hoisted
+//     to one shared value computed once for the whole batch) -- this is
+//     NOT a claim that NEW matches OLD's exact call order or timing. OLD
+//     interleaves header-then-lines PER DOCUMENT, sequentially; this
+//     batched version computes all header rows' values in one loop, then
+//     all line rows' values in a separate later loop, so the relative
+//     ORDER in which individual `Date.now()` fallback calls happen (when
+//     `sourceSyncedAt` is omitted from the request) differs from OLD's,
+//     even though each persisted row still gets its own freshly-computed
+//     value rather than a value shared across the batch. No downstream
+//     correctness dependency on millisecond-level ordering or timing
+//     between rows has been found or is asserted here -- `ordering.js`'s
+//     approved-receipts admin list reads and displays `source_synced_at`
+//     per row, but nothing in that reader (or elsewhere) compares rows'
+//     timestamps against each other or depends on their relative sequence.
 async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
   if (records.length === 0) {
     return;
@@ -1787,18 +1802,25 @@ async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
   }
 
   const sourceSystem = getSourceSystem(body);
-  // Codex CLAIM-X-203 remediation, item 5: `getSourceSyncedAt(body)` is
-  // called FRESH per row below (not hoisted to one shared value), matching
-  // OLD's per-statement behavior exactly. This matters: `source_synced_at`
-  // is a real downstream-read field (ordering.js's approved-receipts admin
-  // list selects and returns `h.source_synced_at AS synced_at`), so an
-  // earlier draft's "compute once per batch" simplification -- justified
-  // at the time as non-observable wall-clock noise -- was withdrawn rather
-  // than risk an admin-visible timestamp discrepancy. When the request
-  // supplies `sourceSyncedAt` explicitly, every call returns that same
-  // fixed value regardless (see `getSourceSyncedAt`/`parseTimestamp`), so
-  // this only changes behavior in the omitted-fallback case, restoring
-  // OLD's fresh-`Date.now()`-per-row default exactly.
+  // Codex CLAIM-X-203/CLAIM-X-205 remediation, item 5: `getSourceSyncedAt(body)`
+  // is called separately below for each PERSISTED header row and each
+  // PERSISTED line row (not hoisted to one shared value computed once for
+  // the whole batch). `source_synced_at` is a real downstream-read field
+  // (ordering.js's approved-receipts admin list selects and returns
+  // `h.source_synced_at AS synced_at`), so an earlier draft's "compute
+  // once per batch" simplification -- justified at the time as
+  // non-observable wall-clock noise -- was withdrawn rather than risk an
+  // admin-visible timestamp discrepancy. When the request supplies
+  // `sourceSyncedAt` explicitly, every call returns that same fixed value
+  // regardless (see `getSourceSyncedAt`/`parseTimestamp`), so this only
+  // matters in the omitted-fallback case. This is NOT a claim that NEW
+  // reproduces OLD's exact call order/timing: OLD calls
+  // header-then-lines-per-document, sequentially; this function computes
+  // all header values in one loop then all line values in a separate
+  // later loop, so the relative sequence of individual `Date.now()`
+  // fallback calls differs from OLD's even though each row still gets its
+  // own freshly-computed value. No downstream reader has been found that
+  // depends on millisecond-level ordering between rows.
 
   const h = {
     docNo: [], branchCode: [], docType: [], docDate: [], docTime: [], supplierCode: [],
