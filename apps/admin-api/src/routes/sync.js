@@ -652,11 +652,20 @@ function createSyncRouter(deps) {
           FROM UNNEST(
             $1::text[], $2::text[], $3::date[], $4::date[], $5::integer[], $6::numeric[], $7::numeric[]
           ) AS u(product_code, branch_code, period_start, period_end, period_days, sold_qty_base, avg_daily_usage)
+          -- Track B Slice B1 (2026-08-14, _ledger/claude.md): no-op UPDATE
+          -- suppression. This table has no audit/provenance columns at all
+          -- (no updated_at, no source_synced_at) -- every SET column is a
+          -- genuine business field, so the guard below is a direct
+          -- "did any of the three numbers actually change" check.
           ON CONFLICT (product_code, branch_code, period_start, period_end, source_name)
           DO UPDATE SET
             period_days = EXCLUDED.period_days,
             sold_qty_base = EXCLUDED.sold_qty_base,
             avg_daily_usage = EXCLUDED.avg_daily_usage
+          WHERE
+            analytics.product_sales_summary_periods.period_days IS DISTINCT FROM EXCLUDED.period_days OR
+            analytics.product_sales_summary_periods.sold_qty_base IS DISTINCT FROM EXCLUDED.sold_qty_base OR
+            analytics.product_sales_summary_periods.avg_daily_usage IS DISTINCT FROM EXCLUDED.avg_daily_usage
         `,
         [
           toWrite.map((r) => r.productCode),

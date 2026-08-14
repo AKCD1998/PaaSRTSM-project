@@ -1,0 +1,28 @@
+Seeding 200000 rows...
+Seeded rows: 200000
+
+=== OLD SQL (no WHERE guard) -- 7 reps, identical-replay 200-row batch ===
+rep1: exec=5.064ms hit=3210 read=0 dirtied=3 walRecords=1010 walBytes=82692
+rep2: exec=9.730ms hit=3592 read=0 dirtied=3 walRecords=1007 walBytes=79321
+rep3: exec=7.388ms hit=3550 read=0 dirtied=2 walRecords=1008 walBytes=79496
+rep4: exec=6.337ms hit=3602 read=0 dirtied=2 walRecords=1008 walBytes=79390
+rep5: exec=4.438ms hit=3572 read=0 dirtied=2 walRecords=1011 walBytes=79583
+rep6: exec=5.515ms hit=3533 read=0 dirtied=2 walRecords=1008 walBytes=79734
+rep7: exec=5.898ms hit=3552 read=0 dirtied=3 walRecords=1008 walBytes=79398
+
+=== NEW SQL (WHERE IS DISTINCT FROM guard) -- 7 reps, identical-replay 200-row batch ===
+rep1: exec=2.827ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+rep2: exec=0.869ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+rep3: exec=1.228ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+rep4: exec=2.249ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+rep5: exec=0.857ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+rep6: exec=0.859ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+rep7: exec=0.926ms hit=1200 read=0 dirtied=0 walRecords=206 walBytes=11394
+
+=== SUMMARY (median, variance across 7 reps) ===
+OLD exec: median=5.898ms variance=2.6732
+NEW exec: median=0.926ms variance=0.5544
+OLD WAL bytes: median=79496 variance=1274255
+NEW WAL bytes: median=11394 variance=0
+OLD dirtied buffers: median=2 variance=0.24
+NEW dirtied buffers: median=0 variance=0.00
