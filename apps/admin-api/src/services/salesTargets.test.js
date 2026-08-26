@@ -30,17 +30,19 @@ test("net amount adds sales and subtracts DocType 9 returns", () => {
 
 // Fake pg pool: routes each query by its SQL text and records the actual-sum SQL.
 function fakeDb({ totalActual, dailyRows, targetRows = [] }) {
-  const captured = { actualSql: null };
+  const captured = { actualSql: null, actualParams: null, dailyParams: null };
   return {
     captured,
-    async query(sql) {
+    async query(sql, params) {
       if (/branch_sales_targets/.test(sql)) {
         return { rows: targetRows };
       }
       if (/GROUP BY (?:sh\.)?doc_date/.test(sql)) {
+        captured.dailyParams = params;
         return { rows: dailyRows };
       }
       captured.actualSql = sql; // the month-to-date total
+      captured.actualParams = params;
       return { rows: [{ actual: totalActual }] };
     },
   };
@@ -111,4 +113,70 @@ test("inclusive remaining-day count works for 28, 29, 30, and 31-day months", as
     assert.equal(result.totalDaysInMonth, testCase.totalDays, testCase.asOfDate);
     assert.equal(result.daysRemaining, testCase.daysRemaining, testCase.asOfDate);
   }
+});
+
+test("morning progress divides actuals through yesterday but plans from Bangkok today", async () => {
+  const db = fakeDb({
+    totalActual: 2500,
+    dailyRows: [{ doc_date: "2026-08-25", actual: 100 }],
+    targetRows: [{
+      tier: 1,
+      monthly_target: 3100,
+      updated_at: null,
+      updated_by: null,
+    }],
+  });
+
+  // 18:00Z on August 25 is 01:00 on August 26 in Bangkok.
+  const result = await getSalesProgress({
+    db,
+    branchCode: "004",
+    month: "2026-08",
+    now: new Date("2026-08-25T18:00:00.000Z"),
+  });
+
+  assert.equal(result.asOfDate, "2026-08-25");
+  assert.equal(result.dataThroughDate, "2026-08-25");
+  assert.equal(result.planningDate, "2026-08-26");
+  assert.equal(result.daysElapsed, 25);
+  assert.equal(result.daysRemaining, 6);
+  assert.equal(result.tiers[0].actualAvgPerDay, 100);
+  assert.equal(result.tiers[0].remainingAvgPerDay, 100);
+  assert.equal(result.dailyActuals.at(-1).date, "2026-08-25");
+  assert.deepEqual(db.captured.actualParams, ["004", "2026-08-01", "2026-08-25"]);
+  assert.deepEqual(db.captured.dailyParams, ["004", "2026-08-01", "2026-08-25"]);
+});
+
+test("first day of a month has no completed actual day but all planning days remain", async () => {
+  const db = fakeDb({ totalActual: 0, dailyRows: [] });
+
+  const result = await getSalesProgress({
+    db,
+    branchCode: "004",
+    month: "2026-08",
+    now: new Date("2026-07-31T18:00:00.000Z"),
+  });
+
+  assert.equal(result.dataThroughDate, null);
+  assert.equal(result.planningDate, "2026-08-01");
+  assert.equal(result.daysElapsed, 0);
+  assert.equal(result.daysRemaining, 31);
+  assert.deepEqual(result.dailyActuals, []);
+  assert.deepEqual(db.captured.actualParams, ["004", "2026-08-01", null]);
+});
+
+test("a historical month uses its full data range and has no planning days remaining", async () => {
+  const db = fakeDb({ totalActual: 3100, dailyRows: [] });
+
+  const result = await getSalesProgress({
+    db,
+    branchCode: "004",
+    month: "2026-07",
+    now: new Date("2026-08-25T18:00:00.000Z"),
+  });
+
+  assert.equal(result.dataThroughDate, "2026-07-31");
+  assert.equal(result.planningDate, "2026-08-26");
+  assert.equal(result.daysElapsed, 31);
+  assert.equal(result.daysRemaining, 0);
 });

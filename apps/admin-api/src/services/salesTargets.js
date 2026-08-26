@@ -36,6 +36,7 @@ const DETAIL_ALLOCATIONS = [
 const SALES_NET_AMOUNT = `(CASE WHEN ${DOC_TYPE_EXPR} = '9' THEN -1 ELSE 1 END) * (COALESCE(sl.line_amount, 0) - ${DETAIL_ALLOCATIONS})`;
 
 const TIERS = [1, 2, 3];
+const BANGKOK_TIME_ZONE = "Asia/Bangkok";
 
 function normalizeMonth(monthInput) {
   // Accepts "2026-07" or "2026-07-01" or a Date; always returns the 1st of
@@ -57,6 +58,30 @@ function daysInMonth(monthStartIso) {
 function toIsoDateOnly(value) {
   if (value instanceof Date) return value.toISOString().slice(0, 10);
   return String(value).slice(0, 10);
+}
+
+function dateOnlyInTimeZone(value, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const byType = new Map(parts.map((part) => [part.type, part.value]));
+  return `${byType.get("year")}-${byType.get("month")}-${byType.get("day")}`;
+}
+
+function shiftIsoDate(isoDate, days) {
+  const value = new Date(`${isoDate}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return toIsoDateOnly(value);
+}
+
+function inclusiveDateSpan(startDate, throughDate) {
+  if (!throughDate || throughDate < startDate) return 0;
+  return Math.floor(
+    (new Date(`${throughDate}T00:00:00Z`) - new Date(`${startDate}T00:00:00Z`)) / 86400000,
+  ) + 1;
 }
 
 async function listSalesTargets({ db, branchCode, month }) {
@@ -122,18 +147,32 @@ async function upsertSalesTargets({ db, branchCode, month, tiers, actor }) {
   return listSalesTargets({ db, branchCode, month: monthStart });
 }
 
-async function getSalesProgress({ db, branchCode, month, asOfDate }) {
+async function getSalesProgress({ db, branchCode, month, asOfDate, planningDate, now = new Date() }) {
   const monthStart = normalizeMonth(month);
   const totalDays = daysInMonth(monthStart);
   const monthEnd = new Date(monthStart + "T00:00:00Z");
   monthEnd.setUTCDate(totalDays);
   const monthEndIso = monthEnd.toISOString().slice(0, 10);
 
-  const today = new Date().toISOString().slice(0, 10);
-  const requestedAsOf = asOfDate ? String(asOfDate).slice(0, 10) : today;
-  // Clamp asOfDate into [monthStart, monthEnd] so a stale/future param can't
-  // produce a nonsensical days-elapsed count.
-  const clampedAsOf = requestedAsOf < monthStart ? monthStart : requestedAsOf > monthEndIso ? monthEndIso : requestedAsOf;
+  const bangkokToday = dateOnlyInTimeZone(now, BANGKOK_TIME_ZONE);
+  const hasExplicitAsOf = asOfDate != null && String(asOfDate).trim() !== "";
+  // A scheduled morning sync contains the last fully closed business day. Do
+  // not divide that total by today's still-in-progress date. Explicit asOfDate
+  // keeps the historical/API behavior and also acts as the planning date unless
+  // the caller supplies planningDate separately.
+  const requestedAsOf = hasExplicitAsOf
+    ? String(asOfDate).slice(0, 10)
+    : shiftIsoDate(bangkokToday, -1);
+  const requestedPlanningDate = planningDate
+    ? String(planningDate).slice(0, 10)
+    : hasExplicitAsOf
+      ? requestedAsOf
+      : bangkokToday;
+  const dataThroughDate = requestedAsOf < monthStart
+    ? null
+    : requestedAsOf > monthEndIso
+      ? monthEndIso
+      : requestedAsOf;
 
   const [targetsResult, actualResult, dailyResult] = await Promise.all([
     listSalesTargets({ db, branchCode, month: monthStart }),
@@ -149,7 +188,7 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
           AND sh.doc_date <= $3::date
           AND ${SALES_NET_SCOPE}
       `,
-      [branchCode, monthStart, clampedAsOf],
+      [branchCode, monthStart, dataThroughDate],
     ),
     db.query(
       `
@@ -165,25 +204,31 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
         GROUP BY sh.doc_date
         ORDER BY sh.doc_date
       `,
-      [branchCode, monthStart, clampedAsOf],
+      [branchCode, monthStart, dataThroughDate],
     ),
   ]);
 
   const actualSoFar = Number(actualResult.rows[0].actual);
   const byDate = new Map(dailyResult.rows.map((r) => [r.doc_date.slice(0, 10), Number(r.actual)]));
   const dailyActuals = [];
-  for (let d = new Date(monthStart + "T00:00:00Z"); toIsoDateOnly(d) <= clampedAsOf; d.setUTCDate(d.getUTCDate() + 1)) {
+  for (
+    let d = new Date(monthStart + "T00:00:00Z");
+    dataThroughDate && toIsoDateOnly(d) <= dataThroughDate;
+    d.setUTCDate(d.getUTCDate() + 1)
+  ) {
     const iso = toIsoDateOnly(d);
     dailyActuals.push({ date: iso, actual: byDate.get(iso) || 0 });
   }
-  const daysElapsed = Math.floor(
-    (new Date(clampedAsOf + "T00:00:00Z") - new Date(monthStart + "T00:00:00Z")) / 86400000,
-  ) + 1;
+  const daysElapsed = inclusiveDateSpan(monthStart, dataThroughDate);
   // Business planning follows the source Excel workbook: "remaining days"
-  // includes the as-of date itself. This intentionally overlaps with
-  // daysElapsed, which also includes the as-of date. For example, July 24 is
-  // day 24 of 31 and has 8 planning days remaining (24..31), not 7.
-  const daysRemaining = Math.max(totalDays - daysElapsed + 1, 0);
+  // includes the planning date itself. For a morning read on August 26, sales
+  // are complete through August 25 (25 elapsed data days), while planning still
+  // covers August 26..31 (6 remaining days).
+  const daysRemaining = requestedPlanningDate < monthStart
+    ? totalDays
+    : requestedPlanningDate > monthEndIso
+      ? 0
+      : inclusiveDateSpan(requestedPlanningDate, monthEndIso);
 
   const tiers = targetsResult.tiers.map((t) => {
     if (t.monthlyTarget == null) {
@@ -203,7 +248,10 @@ async function getSalesProgress({ db, branchCode, month, asOfDate }) {
   return {
     branchCode,
     month: monthStart,
-    asOfDate: clampedAsOf,
+    // asOfDate remains as a backward-compatible alias for the data cutoff.
+    asOfDate: dataThroughDate,
+    dataThroughDate,
+    planningDate: requestedPlanningDate,
     totalDaysInMonth: totalDays,
     daysElapsed,
     daysRemaining,
