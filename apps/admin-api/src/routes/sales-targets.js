@@ -72,6 +72,7 @@ function createSalesTargetsRouter(deps) {
         branchCode,
         month: req.query.month,
         asOfDate: req.query.asOfDate,
+        planningDate: req.query.planningDate,
       });
       return res.json({ ok: true, ...result, request_id: req.requestId || null });
     } catch (error) {
