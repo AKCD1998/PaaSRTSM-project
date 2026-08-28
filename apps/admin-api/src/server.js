@@ -58,6 +58,7 @@ const { startPreorderAttachmentCleanupSchedule } = require("./services/preorderA
 const { startStockRecommendationSchedule } = require("./services/stockRecommendationSchedule");
 const { startFocusLinePackageCleanupSchedule } = require("./services/focusLineChatPackages");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
+const { createInternalProductCatalogRouter } = require("./routes/internal-product-catalog");
 
 function appendVaryHeader(res, value) {
   const existing = String(res.getHeader("Vary") || "")
@@ -169,6 +170,11 @@ function createApp(overrides = {}) {
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: false, limit: "1mb" }));
   app.use(cookieParser());
+
+  app.use(
+    "/internal/product-catalog",
+    createInternalProductCatalogRouter({ config, db }),
+  );
 
   app.use("/admin/health", createHealthRouter());
   app.use(

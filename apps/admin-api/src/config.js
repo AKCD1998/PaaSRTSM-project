@@ -222,6 +222,7 @@ function loadConfig(env = process.env) {
     syncV2MaxBatchRecords: parseIntWithFallback(env.SYNC_V2_MAX_BATCH_RECORDS, 100),
     crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
     crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",
+    erpProductCatalogInternalToken: env.ERP_PRODUCT_CATALOG_INTERNAL_TOKEN || "",
     staffBranchAllowlists: parseMultiValueMap(env.STAFF_BRANCH_ALLOWLISTS || "", {
       normalizeKey: (k) => String(k || "").trim().toLowerCase(),
       normalizeItem: (v) => (/^\d{3}$/.test(String(v || "").trim()) ? String(v).trim() : null),
