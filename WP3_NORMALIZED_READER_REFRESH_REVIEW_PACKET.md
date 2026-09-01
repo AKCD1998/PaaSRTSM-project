@@ -2,15 +2,17 @@
 
 ## 1. Status
 
-`READY FOR TECH LEAD RE-REVIEW — ROUND-TWO BLOCKERS ADDRESSED LOCALLY`
+`READY FOR TECH LEAD REVIEW — CI TEST-ISOLATION FIX LOCAL AND UNCOMMITTED`
 
-This is a fresh, local-only, uncommitted WP3 candidate. The second pass addresses the four Tech Lead blockers—shallow-CI independence, branch-scoped candidate discovery, a real branch canary, and served-snapshot shadow evidence—plus retention after shadow is disabled. It does not authorize a commit, PR, merge, migration, deploy, or production cutover.
+PR #19 exists at candidate commit `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. This follow-up fixes only the PostgreSQL integration-test isolation defect exposed by GitHub Actions run `33481655220`; the fix and this packet update are local, unstaged, uncommitted, and not present in the PR. It does not authorize a commit, push, PR update, merge, migration, deploy, or production cutover.
 
 ## 2. Current baseline
 
 - Repository: `PaaSRTSM-project`
 - Fetched `origin/main`: `bbfca5c14cec95c351b9e9a4cdb13b4c7c5683ee`
-- Candidate `HEAD`: the same SHA; `HEAD...origin/main = 0/0`
+- Candidate `HEAD`: `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`; `HEAD...origin/main = 1/0`.
+- Open PR: `#19`, base `main` at `bbfca5c14cec95c351b9e9a4cdb13b4c7c5683ee`, head at the candidate SHA above.
+- GitHub Actions run `33481655220`: 640 tests — 528 pass, 8 fail, 104 skip. Seven failures were `tests/track_r_option_b.test.js` losing `ingest.sync_batches`; one was the time-dependent `focus_products_api` case.
 - Baseline full suite before edits: 606 tests — 432 pass, 1 fail, 173 skip.
 - The sole baseline failure was `tests/focus_products_api.test.js` — `editing a frozen row's date range clears the freeze so it re-evaluates` (`true !== false`). It reproduces alone and is outside WP3.
 - `npm ci` supplied the test dependency missing from the checkout. Tracked `node_modules` content was restored before edits; `package.json` and `package-lock.json` are unchanged.
@@ -21,7 +23,7 @@ This is a fresh, local-only, uncommitted WP3 candidate. The second pass addresse
 - Worktree: `C:\Users\scgro\Desktop\Webapp training project\PaaSRTSM-wp3-normalized-reader-refresh-2026-09-01`
 - Branch: `candidate/wp3-normalized-reader-refresh-2026-09-01`
 - Base: current `origin/main`, not the dirty/stale canonical checkout.
-- State: local modifications and untracked files only; no commit.
+- State before this CI fix: clean at the candidate SHA. Current follow-up state: two tracked local modifications (`tests/stock_recommendation_reader_postgres.test.js` and this packet), no staged file and no new commit.
 
 ## 4. Old candidate review
 
@@ -93,6 +95,13 @@ New:
 
 No `.env`, package manifest/lock, Worker, writer, stock-request, UI, SC coordination, shared-ledger, or owner-only status file changed.
 
+CI isolation follow-up files only:
+
+- `tests/stock_recommendation_reader_postgres.test.js`
+- `WP3_NORMALIZED_READER_REFRESH_REVIEW_PACKET.md`
+
+No runtime implementation, migration, workflow, package script, or unrelated test was changed in this follow-up.
+
 ## 8. Migration number and collision evidence
 
 - Current `origin/main` maximum migration number: 069.
@@ -138,14 +147,22 @@ Migration 070 is additive and idempotent on exact rerun. It stores status, count
 
 ## 10. Tests and counts
 
-- Focused WP3 + API + exact-baseline equivalence: 34/34 pass.
+- Confirmed CI root cause: the new PostgreSQL file connected directly to shared `CP4_TEST_DATABASE_URL` and ran `DROP SCHEMA ingest/ada/core/ordering CASCADE` while Node was running test files concurrently. GitHub then reported seven `42P01 relation "ingest.sync_batches" does not exist` failures in `track_r_option_b`.
+- Post-fix focused WP3: 40/40 pass on Node 20.20.2 and PostgreSQL 18.
   - Reader/config/eligibility/comparator/snapshot unit tests: 17/17.
   - Recommendation API/refresh tests: 16/16.
   - Exact baseline characterization: 1/1.
-- Actual shallow-checkout simulation: 1/1 pass with `git rev-list --count HEAD = 1` and `git rev-parse --is-shallow-repository = true`.
-- Disposable real PostgreSQL 18: 5/5 pass.
-- Final full PaaS suite: 639 tests — 460 pass, 1 fail, 178 skip.
-- The one final failure is the same unrelated baseline `focus_products_api` failure; no new failure was introduced. The five new integration skips in the ordinary full run are separately proven by the 5/5 real-PostgreSQL run.
+  - Isolated real-PostgreSQL tests, including the shared-database refusal guard: 6/6.
+- Targeted concurrent command containing `track_r_option_b` and the WP3 PostgreSQL file: 13/13 pass twice. The original seven failures did not recur.
+- Actual depth-one checkout at candidate commit: 1/1 legacy equivalence pass with `git rev-list --count HEAD = 1` and `git rev-parse --is-shallow-repository = true`.
+- Final-code full concurrent PostgreSQL runs (fresh shared database per run, Node 20.20.2, concurrency 2):
+  - Acceptance round 1: 641 tests — 536 pass, 1 fail, 104 skip. Sole failure: the known `focus_products_api` date fixture.
+  - Acceptance round 2: 641 tests — 529 pass, 8 fail, 104 skip. No WP3 or `track_r_option_b` failure; seven failures were races among pre-existing integration files that still drop/recreate shared schemas, plus the same focus failure.
+- Additional stress evidence: local default concurrency 14 produced 50 failures; concurrency 3 produced nine shared-schema race failures plus focus. Together with the named acceptance-round failures, this validates that the wider integration harness remains concurrency-sensitive even after PR #19 stops contributing destructive shared DDL.
+- `focus_products_api` comparison under identical `TZ=UTC`, Node, dependencies, and current date:
+  - candidate: 18/19 pass, same `true !== false` at line 539;
+  - clean `origin/main` worktree: 18/19 pass, identical failure;
+  - test sets `dateTo` to fixed `2026-08-31`, which is already past on the `2026-09-01` test date. The focus service/test is unchanged by WP3, so no business-rule change was made.
 - Syntax: 10 changed/new JavaScript files checked, 0 failures.
 - `git diff --check`: pass.
 - Migration chain: origin max 069, candidate 070 unique, migration exact rerun passes.
@@ -158,6 +175,8 @@ Adversarial coverage includes null versus numeric zero cost, negative quantity, 
 
 Disposable PostgreSQL 18 proved:
 
+- every WP3 PostgreSQL test creates a random database through a maintenance connection, reconnects its test pool to that database, and performs destructive schema setup only after `current_database()` matches the random name;
+- a regression test calls the guarded reset through the real shared connection and proves it refuses after exactly one read-only `SELECT current_database()` query, with no `DROP`, `CREATE`, `ALTER`, or `TRUNCATE` sent;
 - migration exact rerun, served-snapshot columns/index, and database constraints/indexes;
 - the 12-example bound and absence of payload columns;
 - branch expansion plus zero/null/negative/absent/inactive/retired mapping;
@@ -165,7 +184,7 @@ Disposable PostgreSQL 18 proved:
 - one repeatable-read snapshot continuing to observe the old value after a concurrent transaction commits an update;
 - comparison persistence, exact served cache-batch linkage, and separately invoked bounded expired-row pruning.
 
-The disposable server was stopped, port 5548 was confirmed closed, and its temporary cluster directory was deleted.
+The CI-fix test server was stopped, port 5550 was confirmed closed, and its temporary cluster directory was deleted. Every focused/full run reported zero remaining `wp3_reader_%` databases and connections; every fresh full-run database was also dropped. After the targeted concurrent run, shared `to_regclass('ingest.sync_batches')` still resolved to `ingest.sync_batches`.
 
 Production was queried read-only. Current eligible generations and raw reader inputs are:
 
@@ -219,14 +238,16 @@ Important implementation risk: existing precomputed recommendation rows do not r
 
 Retention now runs on the existing recommendation refresh cadence rather than comparison inserts. If that existing refresh is stopped, expired evidence remains until refresh resumes or the bounded prune function is invoked; there is no new scheduler in WP3.
 
-Critical release gate: Render Web auto-deploy is enabled and runs `npm run db:migrate` before deploy. A merge would therefore cause both migration and deployment automatically. Do not merge until the Tech Lead explicitly approves those two state changes together. Worker auto-deploy remains disabled and behind Web. Metadata differences between wide-row fallbacks and normalized product master data will be visible as shadow mismatches rather than silently accepted.
+CI harness risk outside this follow-up: several pre-existing PostgreSQL integration files still run `DROP SCHEMA ... CASCADE` against the shared `CP4_TEST_DATABASE_URL`. Repeated full concurrent runs exposed schedule-dependent failures among those baseline files. PR #19's new test is now isolated and no longer causes or participates in that shared-schema race, but the broader harness should eventually receive a separate isolation project rather than expanding this WP3 fix.
+
+Operational-source conflict to resolve before any release: this packet previously recorded a Tech Lead observation that Render Web auto-deploy and pre-deploy migration were enabled, while the repository's current canonical `AGENTS.md` says this backend requires Manual Deploy and does not auto-deploy. This CI-only pass made no Render query or change. The operator must verify the current Render setting before merge; migration and deployment remain separately approval-gated regardless of mechanism. Metadata differences between wide-row fallbacks and normalized product master data will be visible as shadow mismatches rather than silently accepted.
 
 ## 14. Production cutover plan — prepared, not executed
 
-Every state-changing step requires fresh explicit approval. Because Web auto-deploy runs migrations before deployment, steps 1–2 are a single approval/merge gate in the current Render setup.
+Every state-changing step requires fresh explicit approval. First reconcile the conflicting Render deployment documentation/observation; do not infer that merge is either sufficient or harmless.
 
-1. Explicitly approve migration 070 and the automatic Web deployment together, while keeping reader mode `legacy`.
-2. Merge only after that combined approval; allow the pre-deploy migration and Web deploy to complete.
+1. Explicitly approve migration 070 and the Web deployment, while keeping reader mode `legacy`.
+2. Merge only after that approval and follow the operator-confirmed migration/deployment mechanism.
 3. Verify legacy API output, latency, errors, and scheduled refresh.
 4. Approve explicit freshness, sample-rate, retention, and observation policies; switch to `shadow`.
 5. Collect old-vs-new evidence for the human-approved duration.
@@ -253,7 +274,7 @@ Rollback is config-only; it does not require reverting migration 070.
 - No Render environment/config change.
 - No deploy, restart, Worker trigger, or reader-mode change.
 - No branch machine, `.env`, or Scheduled Task change.
-- No commit, push, PR, merge, rebase, or cherry-pick.
+- No new commit, push, PR update, merge, rebase, or cherry-pick in this CI-fix pass. Existing PR #19 and its candidate commit were left unchanged.
 - No shared-ledger or owner-only WP3 status edit.
 
 ## 17. WP4 exclusion confirmation
@@ -262,8 +283,8 @@ The candidate contains no WP4 recompute service, queue/debounce behavior, availa
 
 ## 18. Local-only attestation and draft ledger entry
 
-Current state is local-only, uncommitted, unpushed, unreviewed by PR, unmerged, unapplied, undeployed, and not enabled in production. The canonical PaaS checkout, old candidate worktree, SC repo, shared ledger, and owner-only status file were not edited.
+PR #19 remains open at `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. The CI isolation fix is local-only, unstaged, uncommitted, unpushed, absent from the PR, unmerged, unapplied, undeployed, and not enabled in production. The canonical PaaS checkout, old candidate worktree, SC repo, shared ledger, and owner-only status file were not edited.
 
 Draft for Tech Lead review only; do not append without owner approval:
 
-> WP3 normalized recommendation reader refresh round two prepared from `origin/main` `bbfca5c14cec95c351b9e9a4cdb13b4c7c5683ee` in local branch `candidate/wp3-normalized-reader-refresh-2026-09-01`. Shallow-CI fixture, requested-branch candidate scope, explicit normalized branch canary, refresh-only shadow comparison with atomic served-cache linkage, and refresh-driven retention are implemented. Focused 34/34, shallow checkout 1/1, and disposable PostgreSQL 5/5 pass; full suite 460 pass / 1 pre-existing unrelated fail / 178 skip. Production remains unchanged. No commit/PR/merge/deploy/cutover is authorized. Awaiting Tech Lead re-review plus explicit combined approval of migration and Web deployment before any merge.
+> PR #19 CI isolation follow-up prepared locally at candidate `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. GitHub run `33481655220` failed because the new WP3 PostgreSQL test dropped shared schemas during concurrent execution. The test now creates and removes a random disposable database, refuses destructive setup on the shared database, and guarantees cleanup on setup/test failure. Focused WP3 is 40/40; targeted WP3 + `track_r_option_b` is 13/13 twice; depth-one equivalence is 1/1. Final-code full concurrent runs were 536/1/104 and 529/8/104: no WP3/track failure, with remaining failures reproduced as time-dependent focus baseline or races among pre-existing shared-schema integration tests. All disposable databases, connections, port 5550, and the temporary cluster were cleaned. No new commit, push, PR update, merge, migration, deploy, Render change, or production query/write occurred. Awaiting Tech Lead review.

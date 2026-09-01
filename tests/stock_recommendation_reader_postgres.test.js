@@ -20,14 +20,57 @@ const {
 
 const databaseUrl = process.env.CP4_TEST_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
-const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 4 }) : null;
+let maintenancePool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 2 }) : null;
+let pool = null;
+let sharedDatabaseName = null;
+let disposableDatabaseName = null;
 const migrationSql = fs.readFileSync(
   path.join(__dirname, "..", "migrations", "070_add_stock_recommendation_reader_comparisons.sql"),
   "utf8",
 );
 
-async function resetSchema() {
-  await pool.query(`
+function quoteDatabaseIdentifier(value) {
+  if (!/^[a-z][a-z0-9_]{0,62}$/.test(value)) {
+    throw new Error("Invalid disposable PostgreSQL database name.");
+  }
+  return `"${value}"`;
+}
+
+function connectionStringForDatabase(databaseName) {
+  const url = new URL(databaseUrl);
+  url.pathname = `/${databaseName}`;
+  return url.toString();
+}
+
+async function currentDatabase(targetPool) {
+  return String((await targetPool.query(
+    "SELECT current_database() AS database_name",
+  )).rows[0]?.database_name || "");
+}
+
+async function createDisposableDatabase() {
+  sharedDatabaseName = await currentDatabase(maintenancePool);
+  disposableDatabaseName = `wp3_reader_${process.pid}_${crypto.randomBytes(8).toString("hex")}`;
+  assert.notEqual(disposableDatabaseName, sharedDatabaseName);
+  await maintenancePool.query(`CREATE DATABASE ${quoteDatabaseIdentifier(disposableDatabaseName)}`);
+  pool = new Pool({
+    connectionString: connectionStringForDatabase(disposableDatabaseName),
+    max: 4,
+  });
+  assert.equal(await currentDatabase(pool), disposableDatabaseName);
+}
+
+async function resetSchema(targetPool = pool) {
+  const connectedDatabase = await currentDatabase(targetPool);
+  if (
+    !disposableDatabaseName
+    || connectedDatabase !== disposableDatabaseName
+    || connectedDatabase === sharedDatabaseName
+  ) {
+    throw new Error("Refusing destructive WP3 test setup outside its disposable database.");
+  }
+
+  await targetPool.query(`
     DROP TABLE IF EXISTS public.wp3_snapshot_probe;
     DROP SCHEMA IF EXISTS ordering CASCADE;
     DROP SCHEMA IF EXISTS ingest CASCADE;
@@ -95,7 +138,72 @@ async function resetSchema() {
       qty integer NOT NULL
     );
   `);
-  await pool.query(migrationSql);
+  await targetPool.query(migrationSql);
+}
+
+async function cleanupDisposableDatabase() {
+  const cleanupErrors = [];
+  const databaseNameToDrop = disposableDatabaseName;
+  const adminPool = maintenancePool;
+  if (pool) {
+    try {
+      await pool.end();
+    } catch (error) {
+      cleanupErrors.push(error);
+    } finally {
+      pool = null;
+    }
+  }
+
+  if (adminPool && databaseNameToDrop) {
+    try {
+      await adminPool.query(
+        `
+          SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity
+          WHERE datname = $1
+            AND pid <> pg_backend_pid()
+        `,
+        [databaseNameToDrop],
+      );
+      const remainingConnections = Number((await adminPool.query(
+        "SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname = $1",
+        [databaseNameToDrop],
+      )).rows[0]?.count || 0);
+      if (remainingConnections !== 0) {
+        throw new Error("Disposable WP3 database still has open connections after pool shutdown.");
+      }
+      await adminPool.query(
+        `DROP DATABASE IF EXISTS ${quoteDatabaseIdentifier(databaseNameToDrop)}`,
+      );
+      const remainingDatabases = Number((await adminPool.query(
+        "SELECT count(*)::int AS count FROM pg_database WHERE datname = $1",
+        [databaseNameToDrop],
+      )).rows[0]?.count || 0);
+      if (remainingDatabases !== 0) {
+        throw new Error("Disposable WP3 database was not removed.");
+      }
+      console.log(
+        `[wp3-reader-postgres] removed disposable database ${databaseNameToDrop}; open connections=0`,
+      );
+      disposableDatabaseName = null;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+
+  if (adminPool) {
+    try {
+      await adminPool.end();
+    } catch (error) {
+      cleanupErrors.push(error);
+    } finally {
+      maintenancePool = null;
+    }
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "WP3 disposable PostgreSQL cleanup failed.");
+  }
 }
 
 async function seedEligibleBranches() {
@@ -146,13 +254,50 @@ async function seedEligibleBranches() {
 
 if (databaseUrl) {
   test.before(async () => {
-    await resetSchema();
-    await seedEligibleBranches();
+    try {
+      await createDisposableDatabase();
+      await resetSchema();
+      await seedEligibleBranches();
+    } catch (setupError) {
+      try {
+        await cleanupDisposableDatabase();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [setupError, cleanupError],
+          "WP3 disposable PostgreSQL setup and cleanup both failed.",
+        );
+      }
+      throw setupError;
+    }
   });
   test.after(async () => {
-    await pool.end();
+    await cleanupDisposableDatabase();
   });
 }
+
+integration("REAL POSTGRES: isolation guard refuses schema reset against the shared test database", async () => {
+  const sharedQueries = [];
+  const observedSharedPool = {
+    query: async (...args) => {
+      sharedQueries.push(String(args[0]));
+      return maintenancePool.query(...args);
+    },
+  };
+
+  await assert.rejects(
+    resetSchema(observedSharedPool),
+    /Refusing destructive WP3 test setup outside its disposable database/,
+  );
+  assert.equal(await currentDatabase(pool), disposableDatabaseName);
+  assert.equal(await currentDatabase(maintenancePool), sharedDatabaseName);
+  assert.equal(sharedQueries.length, 1);
+  assert.match(sharedQueries[0], /^SELECT current_database\(\)/);
+  assert.equal(
+    sharedQueries.some((sql) => /\b(?:DROP|CREATE|ALTER|TRUNCATE)\b/i.test(sql)),
+    false,
+    "the refused shared-database reset must not issue schema-changing SQL",
+  );
+});
 
 integration("REAL POSTGRES: migration 070 is idempotent, bounded, indexed, and stores no payload column", async () => {
   await pool.query(migrationSql);
