@@ -2,19 +2,19 @@
 
 ## 1. Status
 
-`READY FOR TECH LEAD REVIEW — CI TEST-ISOLATION FIX LOCAL AND UNCOMMITTED`
+`READY FOR TECH LEAD REVIEW — FINAL CI DATE-FIXTURE FIX LOCAL AND UNCOMMITTED`
 
-PR #19 exists at candidate commit `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. This follow-up fixes only the PostgreSQL integration-test isolation defect exposed by GitHub Actions run `33481655220`; the fix and this packet update are local, unstaged, uncommitted, and not present in the PR. It does not authorize a commit, push, PR update, merge, migration, deploy, or production cutover.
+PR #19 is open at candidate commit `42193efb0f5aa0f606f9e23b823bd2d3a4b36caa`, which already contains the reviewed WP3 PostgreSQL test-isolation fix. This final follow-up fixes only the calendar-dependent focus test exposed by GitHub Actions run `33487924182`; the focus test change and this packet update are local, unstaged, uncommitted, and not present in the PR. It does not authorize a commit, push, PR update, merge, migration, deploy, or production cutover.
 
 ## 2. Current baseline
 
 - Repository: `PaaSRTSM-project`
 - Fetched `origin/main`: `bbfca5c14cec95c351b9e9a4cdb13b4c7c5683ee`
-- Candidate `HEAD`: `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`; `HEAD...origin/main = 1/0`.
+- Candidate `HEAD`: `42193efb0f5aa0f606f9e23b823bd2d3a4b36caa`; 2 commits ahead of and 0 behind `origin/main`.
 - Open PR: `#19`, base `main` at `bbfca5c14cec95c351b9e9a4cdb13b4c7c5683ee`, head at the candidate SHA above.
 - GitHub Actions run `33481655220`: 640 tests — 528 pass, 8 fail, 104 skip. Seven failures were `tests/track_r_option_b.test.js` losing `ingest.sync_batches`; one was the time-dependent `focus_products_api` case.
-- Baseline full suite before edits: 606 tests — 432 pass, 1 fail, 173 skip.
-- The sole baseline failure was `tests/focus_products_api.test.js` — `editing a frozen row's date range clears the freeze so it re-evaluates` (`true !== false`). It reproduces alone and is outside WP3.
+- Commit `42193ef` isolated the WP3 PostgreSQL file; the next GitHub Actions run `33487924182` proved that fix: 641 tests — 536 pass, 1 fail, 104 skip, with WP3 and `track_r_option_b` passing.
+- The sole latest-run failure was `tests/focus_products_api.test.js` — `editing a frozen row's date range clears the freeze so it re-evaluates` (`true !== false`). The fixture extended `dateTo` to fixed `2026-08-31`, already expired in `Asia/Bangkok` on the `2026-09-01` run date. Candidate and `origin/main` reproduced the same failure under the same date/environment, so this is a test-fixture defect rather than a WP3 or business-rule regression.
 - `npm ci` supplied the test dependency missing from the checkout. Tracked `node_modules` content was restored before edits; `package.json` and `package-lock.json` are unchanged.
 - Read-only live check: Web is live at the baseline SHA. The sync Worker is live at `4741fd83b5a66dad06480fc6cce9f055cccfd35d`, behind Web/main; reader code is Web-side, but this deploy drift remains an operational risk to acknowledge.
 
@@ -23,7 +23,7 @@ PR #19 exists at candidate commit `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. Th
 - Worktree: `C:\Users\scgro\Desktop\Webapp training project\PaaSRTSM-wp3-normalized-reader-refresh-2026-09-01`
 - Branch: `candidate/wp3-normalized-reader-refresh-2026-09-01`
 - Base: current `origin/main`, not the dirty/stale canonical checkout.
-- State before this CI fix: clean at the candidate SHA. Current follow-up state: two tracked local modifications (`tests/stock_recommendation_reader_postgres.test.js` and this packet), no staged file and no new commit.
+- State before this final CI fix: clean at `42193efb0f5aa0f606f9e23b823bd2d3a4b36caa`. Current follow-up state: two tracked local modifications (`tests/focus_products_api.test.js` and this packet), no staged file and no new commit.
 
 ## 4. Old candidate review
 
@@ -95,12 +95,17 @@ New:
 
 No `.env`, package manifest/lock, Worker, writer, stock-request, UI, SC coordination, shared-ledger, or owner-only status file changed.
 
-CI isolation follow-up files only:
+Committed CI isolation follow-up files at `42193ef`:
 
 - `tests/stock_recommendation_reader_postgres.test.js`
 - `WP3_NORMALIZED_READER_REFRESH_REVIEW_PACKET.md`
 
-No runtime implementation, migration, workflow, package script, or unrelated test was changed in this follow-up.
+Final date-fixture follow-up files only:
+
+- `tests/focus_products_api.test.js`
+- `WP3_NORMALIZED_READER_REFRESH_REVIEW_PACKET.md`
+
+No runtime implementation, business rule, migration, workflow, package script, test skip, or unrelated test was changed in this final follow-up.
 
 ## 8. Migration number and collision evidence
 
@@ -148,22 +153,28 @@ Migration 070 is additive and idempotent on exact rerun. It stores status, count
 ## 10. Tests and counts
 
 - Confirmed CI root cause: the new PostgreSQL file connected directly to shared `CP4_TEST_DATABASE_URL` and ran `DROP SCHEMA ingest/ada/core/ordering CASCADE` while Node was running test files concurrently. GitHub then reported seven `42P01 relation "ingest.sync_batches" does not exist` failures in `track_r_option_b`.
+- GitHub Actions run `33487924182` confirmed that the committed isolation fix removed those failures: WP3 and `track_r_option_b` passed, leaving only the focus date-fixture failure.
+- Confirmed final failure root cause: `attachProgress` compares `date_to` with the current `Asia/Bangkok` calendar date and freezes only when `date_to < today`. The PATCH correctly cleared the old snapshot, but its fixed replacement `2026-08-31` was already expired on `2026-09-01`, so the same response path immediately froze it again.
+- Final fixture fix: derive one Bangkok civil `today`, start the row with `dateTo = today - 1 day`, then PATCH it to `today + 7 days`. Seven days provides a small midnight-boundary margin without using an arbitrary far-future year. Assertions now prove the starting range is expired, the returned `dateTo` is the requested active value, the new range is active in Bangkok, `isFrozen` changes to `false`, and stored `frozen_at` is `NULL`.
+- Focus API file alone: 19/19 pass.
+- All focus-related files (`focus_products_api`, `focus_products_migration`, and the focus service unit tests): 34/34 pass.
 - Post-fix focused WP3: 40/40 pass on Node 20.20.2 and PostgreSQL 18.
   - Reader/config/eligibility/comparator/snapshot unit tests: 17/17.
   - Recommendation API/refresh tests: 16/16.
   - Exact baseline characterization: 1/1.
   - Isolated real-PostgreSQL tests, including the shared-database refusal guard: 6/6.
-- Targeted concurrent command containing `track_r_option_b` and the WP3 PostgreSQL file: 13/13 pass twice. The original seven failures did not recur.
+- Targeted concurrent command containing `track_r_option_b` and the WP3 PostgreSQL file: 13/13 pass. The original seven failures did not recur, `ingest.sync_batches` still resolved in the shared test database afterward, and the WP3 file removed its random disposable database with zero open connections.
 - Actual depth-one checkout at candidate commit: 1/1 legacy equivalence pass with `git rev-list --count HEAD = 1` and `git rev-parse --is-shallow-repository = true`.
-- Final-code full concurrent PostgreSQL runs (fresh shared database per run, Node 20.20.2, concurrency 2):
-  - Acceptance round 1: 641 tests — 536 pass, 1 fail, 104 skip. Sole failure: the known `focus_products_api` date fixture.
-  - Acceptance round 2: 641 tests — 529 pass, 8 fail, 104 skip. No WP3 or `track_r_option_b` failure; seven failures were races among pre-existing integration files that still drop/recreate shared schemas, plus the same focus failure.
-- Additional stress evidence: local default concurrency 14 produced 50 failures; concurrency 3 produced nine shared-schema race failures plus focus. Together with the named acceptance-round failures, this validates that the wider integration harness remains concurrency-sensitive even after PR #19 stops contributing destructive shared DDL.
-- `focus_products_api` comparison under identical `TZ=UTC`, Node, dependencies, and current date:
+- Final-code full concurrent PostgreSQL acceptance runs (fresh shared database per run, Node 20.20.2, `TZ=UTC`, concurrency 2):
+  - Acceptance round 1: 641 tests — 537 pass, 0 fail, 104 skip.
+  - Acceptance round 2: 641 tests — 537 pass, 0 fail, 104 skip.
+- Pre-acceptance harness evidence was retained rather than hidden: one earlier same-code run finished 528 pass, 9 fail, 104 skip, with failures only in pre-existing shared-schema integration files (`42P01`, `23505`, `40P01`, and `42703`); another attempt entered an application-level lock cycle among those same shared-schema tests and was interrupted after lock evidence was captured. Neither involved focus, WP3, or `track_r_option_b`. Fresh databases were used for every retry.
+- This workstation has PostgreSQL 18 only; Docker Desktop's engine was unavailable, so PostgreSQL 16 could not be used locally. Run `33487924182` remains the PostgreSQL 16/Linux evidence and showed no failure outside the now-fixed focus fixture.
+- `focus_products_api` comparison before the fixture edit under identical `TZ=UTC`, Node, dependencies, and current date:
   - candidate: 18/19 pass, same `true !== false` at line 539;
   - clean `origin/main` worktree: 18/19 pass, identical failure;
-  - test sets `dateTo` to fixed `2026-08-31`, which is already past on the `2026-09-01` test date. The focus service/test is unchanged by WP3, so no business-rule change was made.
-- Syntax: 10 changed/new JavaScript files checked, 0 failures.
+  - the focus service was unchanged by WP3, and this follow-up makes no production-code or business-rule change.
+- Syntax: the changed focus test and all candidate changed/new JavaScript files checked, 0 failures.
 - `git diff --check`: pass.
 - Migration chain: origin max 069, candidate 070 unique, migration exact rerun passes.
 - Secret/env scan: 0 newly introduced secret-pattern matches; the one URL-shaped test fixture match already exists at baseline. There are 0 `.env` changes and 0 package-file changes.
@@ -184,7 +195,7 @@ Disposable PostgreSQL 18 proved:
 - one repeatable-read snapshot continuing to observe the old value after a concurrent transaction commits an update;
 - comparison persistence, exact served cache-batch linkage, and separately invoked bounded expired-row pruning.
 
-The CI-fix test server was stopped, port 5550 was confirmed closed, and its temporary cluster directory was deleted. Every focused/full run reported zero remaining `wp3_reader_%` databases and connections; every fresh full-run database was also dropped. After the targeted concurrent run, shared `to_regclass('ingest.sync_batches')` still resolved to `ingest.sync_batches`.
+The final follow-up used one disposable PostgreSQL 18 cluster on port 5551. Every WP3 run removed its `wp3_reader_%` database with zero open connections; each full run used a fresh shared database. After the targeted concurrent run, shared `to_regclass('ingest.sync_batches')` still resolved to `ingest.sync_batches`. At final cleanup every named test database was dropped (remaining `wp3_%` database count 0), the server stopped, port 5551 had zero listeners, the cluster directory was deleted, and zero cluster PostgreSQL or repository test Node processes remained.
 
 Production was queried read-only. Current eligible generations and raw reader inputs are:
 
@@ -274,7 +285,7 @@ Rollback is config-only; it does not require reverting migration 070.
 - No Render environment/config change.
 - No deploy, restart, Worker trigger, or reader-mode change.
 - No branch machine, `.env`, or Scheduled Task change.
-- No new commit, push, PR update, merge, rebase, or cherry-pick in this CI-fix pass. Existing PR #19 and its candidate commit were left unchanged.
+- No new commit, push, PR update, merge, rebase, or cherry-pick in this final CI-fix pass. Existing PR #19 and its `42193ef` head were left unchanged.
 - No shared-ledger or owner-only WP3 status edit.
 
 ## 17. WP4 exclusion confirmation
@@ -283,8 +294,8 @@ The candidate contains no WP4 recompute service, queue/debounce behavior, availa
 
 ## 18. Local-only attestation and draft ledger entry
 
-PR #19 remains open at `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. The CI isolation fix is local-only, unstaged, uncommitted, unpushed, absent from the PR, unmerged, unapplied, undeployed, and not enabled in production. The canonical PaaS checkout, old candidate worktree, SC repo, shared ledger, and owner-only status file were not edited.
+PR #19 remains open at `42193efb0f5aa0f606f9e23b823bd2d3a4b36caa`. The final focus date-fixture fix is local-only, unstaged, uncommitted, unpushed, absent from the PR, unmerged, unapplied, undeployed, and not enabled in production. The canonical PaaS checkout, old candidate worktree, SC repo, shared ledger, and owner-only status file were not edited.
 
 Draft for Tech Lead review only; do not append without owner approval:
 
-> PR #19 CI isolation follow-up prepared locally at candidate `bcba8bd44078d34cbf4f7e1cfd59c5c52e591881`. GitHub run `33481655220` failed because the new WP3 PostgreSQL test dropped shared schemas during concurrent execution. The test now creates and removes a random disposable database, refuses destructive setup on the shared database, and guarantees cleanup on setup/test failure. Focused WP3 is 40/40; targeted WP3 + `track_r_option_b` is 13/13 twice; depth-one equivalence is 1/1. Final-code full concurrent runs were 536/1/104 and 529/8/104: no WP3/track failure, with remaining failures reproduced as time-dependent focus baseline or races among pre-existing shared-schema integration tests. All disposable databases, connections, port 5550, and the temporary cluster were cleaned. No new commit, push, PR update, merge, migration, deploy, Render change, or production query/write occurred. Awaiting Tech Lead review.
+> PR #19 final CI follow-up prepared locally at candidate `42193efb0f5aa0f606f9e23b823bd2d3a4b36caa`. GitHub run `33487924182` proved the committed WP3 database isolation fix and left one failure: a focus test PATCHed a frozen row to fixed `2026-08-31`, which had expired by the Bangkok test date `2026-09-01` and was immediately frozen again. The test now derives expired and active dates from the current `Asia/Bangkok` civil date, with explicit active-range and true-to-false freeze assertions; no runtime/business logic changed. Focus API is 19/19, all focus tests are 34/34, focused WP3 is 40/40, targeted WP3 + `track_r_option_b` is 13/13, and two fresh-database full concurrent acceptance runs are each 537 pass / 0 fail / 104 skip. Intermittent failures/lock cycles among pre-existing tests that destructively share schemas remain documented as an out-of-scope harness risk. All disposable databases, connections, port 5551, and the temporary cluster were cleaned. No new commit, push, PR update, merge, migration, deploy, Render change, or production query/write occurred. Awaiting Tech Lead review.
