@@ -316,6 +316,7 @@ function createApp(overrides = {}) {
     "/api/admin",
     createStockRecommendationsRouter({
       db,
+      config,
       requireAuthMiddleware,
     }),
   );

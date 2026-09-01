@@ -153,6 +153,17 @@ function parseOptionalPositiveInt(value, fallback = null) {
   return n;
 }
 
+function parseOptionalRatio(value, fallback = null) {
+  if (value == null || value === "") {
+    return fallback;
+  }
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    return fallback;
+  }
+  return n;
+}
+
 function loadConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV || "development";
   const cookieSecure = parseBool(env.COOKIE_SECURE, nodeEnv === "production");
@@ -273,6 +284,36 @@ function loadConfig(env = process.env) {
     stockRecommendationCronTargetDays: [...parseCsvSet(env.STOCK_RECOMMENDATION_CRON_TARGET_DAYS || "90")]
       .map((value) => Number(value))
       .filter((value) => Number.isInteger(value) && value > 0),
+    // WP3 recommendation current-stock reader. Legacy is deliberately the
+    // only default. Shadow sampling and normalized freshness require explicit
+    // human-selected values; this candidate does not invent rollout policy.
+    stockRecommendationReaderMode: ["legacy", "shadow", "normalized"].includes(
+      String(env.STOCK_RECOMMENDATION_READER_MODE || "legacy").trim().toLowerCase(),
+    )
+      ? String(env.STOCK_RECOMMENDATION_READER_MODE || "legacy").trim().toLowerCase()
+      : "legacy",
+    stockRecommendationMaxStockAgeHours: parseOptionalPositiveInt(
+      env.STOCK_RECOMMENDATION_MAX_STOCK_AGE_HOURS,
+      null,
+    ),
+    stockRecommendationShadowSampleRate: parseOptionalRatio(
+      env.STOCK_RECOMMENDATION_SHADOW_SAMPLE_RATE,
+      null,
+    ),
+    stockRecommendationShadowRetentionDays: parseOptionalPositiveInt(
+      env.STOCK_RECOMMENDATION_SHADOW_RETENTION_DAYS,
+      30,
+    ),
+    // Normalized activation is fail-safe: the mode alone is insufficient.
+    // Operators must name one or more branches, or explicitly choose "all".
+    stockRecommendationNormalizedCanaryBranches:
+      env.STOCK_RECOMMENDATION_NORMALIZED_CANARY_BRANCHES == null
+      || String(env.STOCK_RECOMMENDATION_NORMALIZED_CANARY_BRANCHES).trim() === ""
+        ? null
+        : [...parseCsvSet(env.STOCK_RECOMMENDATION_NORMALIZED_CANARY_BRANCHES)]
+          .map((value) => String(value).trim().toLowerCase())
+          .filter((value) => value === "all" || /^\d{3}$/.test(value))
+          .sort(),
   };
 }
 
