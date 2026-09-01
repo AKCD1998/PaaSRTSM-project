@@ -30,7 +30,7 @@ async function runStockRecommendationRefresh({ db, config, logger = console }) {
   const results = [];
   for (const targetDays of targetDaysList) {
     // eslint-disable-next-line no-await-in-loop
-    const result = await refreshStockRecommendationSnapshots(db, { targetDays });
+    const result = await refreshStockRecommendationSnapshots(db, { targetDays, config });
     results.push(result);
     logInfo(
       logger,

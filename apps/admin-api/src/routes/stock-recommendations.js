@@ -9,13 +9,30 @@ const {
 } = require("../services/stockRecommendations");
 
 function createStockRecommendationsRouter(deps) {
-  const { db, requireAuthMiddleware } = deps;
+  const { db, config = {}, requireAuthMiddleware } = deps;
   const router = express.Router();
+  const handleError = (error, req, res, next) => {
+    if (error?.code === "STOCK_RECOMMENDATION_INPUT_UNAVAILABLE") {
+      return res.status(503).json({
+        ok: false,
+        error: "Recommendation input unavailable",
+        code: error.code,
+        availability: error.availability || {
+          status: "unavailable",
+          failures: [],
+          failuresTruncated: false,
+        },
+        request_id: req.requestId || null,
+      });
+    }
+    return next(error);
+  };
 
   router.get("/stock-recommendations", requireAuthMiddleware, async (req, res, next) => {
     try {
       const payload = await listStockRecommendations({
         db,
+        config,
         auth: req.auth,
         filters: req.query || {},
       });
@@ -25,7 +42,7 @@ function createStockRecommendationsRouter(deps) {
         ...payload,
       });
     } catch (error) {
-      return next(error);
+      return handleError(error, req, res, next);
     }
   });
 
@@ -36,6 +53,7 @@ function createStockRecommendationsRouter(deps) {
     try {
       const payload = await listStockRecommendationsByProduct({
         db,
+        config,
         auth: req.auth,
         filters: req.query || {},
       });
@@ -45,7 +63,7 @@ function createStockRecommendationsRouter(deps) {
         ...payload,
       });
     } catch (error) {
-      return next(error);
+      return handleError(error, req, res, next);
     }
   });
 
@@ -53,6 +71,7 @@ function createStockRecommendationsRouter(deps) {
     try {
       const payload = await getStockRecommendationSummary({
         db,
+        config,
         auth: req.auth,
         filters: req.query || {},
       });
@@ -62,7 +81,7 @@ function createStockRecommendationsRouter(deps) {
         ...payload,
       });
     } catch (error) {
-      return next(error);
+      return handleError(error, req, res, next);
     }
   });
 
@@ -70,6 +89,7 @@ function createStockRecommendationsRouter(deps) {
     try {
       const payload = await getStockRecommendationDetail({
         db,
+        config,
         auth: req.auth,
         branchCode: req.params.branchCode,
         productCode: req.params.productCode,
@@ -81,7 +101,7 @@ function createStockRecommendationsRouter(deps) {
         ...payload,
       });
     } catch (error) {
-      return next(error);
+      return handleError(error, req, res, next);
     }
   });
 

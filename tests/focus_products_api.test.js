@@ -34,6 +34,22 @@ function normalizeSql(sql) {
   return String(sql).replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function todayBangkokIso() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const valueByType = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${valueByType.year}-${valueByType.month}-${valueByType.day}`;
+}
+
+function addIsoDays(isoDate, days) {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
 function createMockDb() {
   const state = {
     nextId: 2,
@@ -520,8 +536,12 @@ test("a focus row whose date_to has already passed is frozen on first read", asy
 
 test("editing a frozen row's date range clears the freeze so it re-evaluates", async () => {
   const { app, db } = createTestApp();
-  db.state.rows.get(1).date_from = "2026-01-01";
-  db.state.rows.get(1).date_to = "2026-01-31";
+  const bangkokToday = todayBangkokIso();
+  const expiredDateTo = addIsoDays(bangkokToday, -1);
+  const activeDateTo = addIsoDays(bangkokToday, 7);
+  db.state.rows.get(1).date_from = addIsoDays(bangkokToday, -30);
+  db.state.rows.get(1).date_to = expiredDateTo;
+  assert.ok(expiredDateTo < bangkokToday, "fixture must start expired in Asia/Bangkok");
 
   const admin = request.agent(app);
   const csrf = await loginAs(admin);
@@ -534,8 +554,10 @@ test("editing a frozen row's date range clears the freeze so it re-evaluates", a
   const updated = await admin
     .patch("/api/admin/focus-products/1")
     .set("x-csrf-token", csrf)
-    .send({ dateTo: "2026-08-31" });
+    .send({ dateTo: activeDateTo });
   assert.equal(updated.status, 200);
+  assert.equal(updated.body.focusProduct.dateTo, activeDateTo);
+  assert.ok(updated.body.focusProduct.dateTo >= bangkokToday, "updated range must remain active in Asia/Bangkok");
   assert.equal(updated.body.focusProduct.isFrozen, false);
   assert.equal(db.state.rows.get(1).frozen_at, null);
 });

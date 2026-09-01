@@ -1,5 +1,23 @@
 "use strict";
 
+const crypto = require("node:crypto");
+
+const {
+  resolveRecommendationReaderPolicy,
+  createInputUnavailableError,
+  loadNormalizedActiveBranches,
+  loadLegacyCurrentStockByProduct,
+  loadNormalizedGenerationEvidence,
+  loadNormalizedCandidateProductCodes,
+  loadNormalizedCurrentStockByProduct,
+  compareStockReaderResults,
+  shouldRunShadowComparison,
+  persistReaderComparison,
+  linkReaderComparisonToServedSnapshot,
+  pruneExpiredReaderComparisons,
+  withRepeatableReadSnapshot,
+} = require("./stockRecommendationReaders");
+
 const BRANCH_SNAPSHOT_COLUMNS = {
   "000": { qty: "qty_branch_000", cost: "cost_avg_branch_000" },
   "001": { qty: "qty_branch_001", cost: "cost_avg_branch_001" },
@@ -143,14 +161,20 @@ async function loadActiveBranches(db) {
   }));
 }
 
-async function resolveEffectiveBranchScope(db, auth, requestedBranchCode) {
+async function resolveEffectiveBranchScope(db, auth, requestedBranchCode, options = {}) {
   const role = String(auth?.role || "");
   const effectiveBranchCode = normalizeText(auth?.effectiveBranchCode || "");
   const normalizedRequested = normalizeText(requestedBranchCode || "");
-  const activeBranches = await loadActiveBranches(db);
+  const activeBranches = options.readerKind === "normalized"
+    ? await loadNormalizedActiveBranches(db, {
+      legacyBranchCodes: Object.keys(BRANCH_SNAPSHOT_COLUMNS),
+    })
+    : await loadActiveBranches(db);
   const activeBranchCodes = activeBranches
     .map((branch) => branch.branchCode)
-    .filter((branchCode) => BRANCH_SNAPSHOT_COLUMNS[branchCode]);
+    .filter((branchCode) => (
+      options.readerKind === "normalized" || BRANCH_SNAPSHOT_COLUMNS[branchCode]
+    ));
 
   if (role !== "admin") {
     if (!effectiveBranchCode) {
@@ -325,11 +349,27 @@ function buildBranchQtyPositiveSql(branchCodes, alias = "bs") {
   return parts.length ? `(${parts.join(" OR ")})` : "FALSE";
 }
 
-async function loadCandidateProductCodes(db, { scope, search, rawSalesAgg }) {
+async function loadCandidateProductCodes(db, {
+  scope,
+  search,
+  rawSalesAgg,
+  readerKind = "legacy",
+  readerEvidence = null,
+}) {
   const normalizedSearch = normalizeText(search || "");
   const productCodes = new Set();
 
-  if (normalizedSearch) {
+  if (readerKind === "normalized") {
+    const normalizedCodes = await loadNormalizedCandidateProductCodes(db, {
+      // Candidate discovery follows the requested output scope, matching the
+      // legacy positive-stock selector. Stock loading still covers every
+      // active donor branch once that bounded candidate set is known.
+      activeBranchCodes: scope.branchCodes,
+      generationByBranch: readerEvidence.generationByBranch,
+      search: normalizedSearch,
+    });
+    for (const productCode of normalizedCodes) productCodes.add(productCode);
+  } else if (normalizedSearch) {
     const searchResult = await db.query(
       `
         SELECT DISTINCT bs.product_code
@@ -361,16 +401,18 @@ async function loadCandidateProductCodes(db, { scope, search, rawSalesAgg }) {
     }
   }
 
-  const stockResult = await db.query(
-    `
-      SELECT bs.product_code
-      FROM ada.branch_stock_snapshots bs
-      WHERE ${buildBranchQtyPositiveSql(scope.branchCodes)}
-      ORDER BY bs.product_code ASC
-    `,
-  );
-  for (const row of stockResult.rows) {
-    if (row.product_code) productCodes.add(String(row.product_code));
+  if (readerKind === "legacy") {
+    const stockResult = await db.query(
+      `
+        SELECT bs.product_code
+        FROM ada.branch_stock_snapshots bs
+        WHERE ${buildBranchQtyPositiveSql(scope.branchCodes)}
+        ORDER BY bs.product_code ASC
+      `,
+    );
+    for (const row of stockResult.rows) {
+      if (row.product_code) productCodes.add(String(row.product_code));
+    }
   }
 
   for (const key of rawSalesAgg.keys()) {
@@ -401,70 +443,6 @@ async function loadCandidateProductCodes(db, { scope, search, rawSalesAgg }) {
   }
 
   return [...productCodes].sort();
-}
-
-async function loadCurrentStockByProduct(db, { productCodes }) {
-  if (!Array.isArray(productCodes) || productCodes.length === 0) {
-    return [];
-  }
-  const result = await db.query(
-    `
-      SELECT
-        bs.product_code,
-        COALESCE(NULLIF(bs.product_name_thai, ''), NULLIF(p.product_name_th, ''), NULLIF(bs.product_name_eng, ''), NULLIF(p.product_name, ''), bs.product_code) AS product_name_thai,
-        COALESCE(NULLIF(bs.product_name_eng, ''), NULLIF(p.product_name, ''), NULLIF(bs.product_name_thai, ''), NULLIF(p.product_name_th, ''), bs.product_code) AS product_name_eng,
-        COALESCE(bs.barcode, pb.barcode, '') AS barcode,
-        COALESCE(bs.unit, p.unit_small, p.unit_medium, p.unit_large, '') AS unit,
-        bs.qty_branch_000,
-        bs.qty_branch_001,
-        bs.qty_branch_002,
-        bs.qty_branch_003,
-        bs.qty_branch_004,
-        bs.qty_branch_005,
-        bs.cost_avg_branch_000,
-        bs.cost_avg_branch_001,
-        bs.cost_avg_branch_002,
-        bs.cost_avg_branch_003,
-        bs.cost_avg_branch_004,
-        bs.cost_avg_branch_005,
-        bs.synced_at
-      FROM ada.branch_stock_snapshots bs
-      LEFT JOIN ada.products p
-        ON p.product_code = bs.product_code
-      LEFT JOIN LATERAL (
-        SELECT barcode
-        FROM ada.product_barcodes pb
-        WHERE pb.product_code = bs.product_code
-        ORDER BY
-          CASE pb.barcode_role
-            WHEN 'primary' THEN 0
-            ELSE 1
-          END,
-          pb.updated_at DESC,
-          pb.barcode ASC
-        LIMIT 1
-      ) pb ON TRUE
-      WHERE bs.product_code = ANY($1::text[])
-      ORDER BY bs.product_code ASC
-    `,
-    [productCodes],
-  );
-
-  return result.rows.map((row) => ({
-    productCode: row.product_code,
-    productNameThai: row.product_name_thai || row.product_code,
-    productNameEng: row.product_name_eng || row.product_code,
-    barcode: row.barcode || null,
-    unit: row.unit || null,
-    syncedAt: row.synced_at || null,
-    branches: Object.entries(BRANCH_SNAPSHOT_COLUMNS).reduce((acc, [branchCode, columns]) => {
-      acc[branchCode] = {
-        qty: numberOrZero(row[columns.qty]),
-        unitCostAvg: numberOrNull(row[columns.cost]),
-      };
-      return acc;
-    }, {}),
-  }));
 }
 
 // Reads straight from ada.sales_lines/ada.sales_headers instead of
@@ -1406,8 +1384,8 @@ function sortProductRows(products, sort) {
   return sorted;
 }
 
-async function listStockRecommendationsByProduct({ db, auth, filters = {} }) {
-  const dataset = await computeRecommendationDataset(db, auth, filters);
+async function listStockRecommendationsByProduct({ db, auth, filters = {}, config = {} }) {
+  const dataset = await computeRecommendationDataset(db, auth, filters, config);
   let pagedRows;
   let total;
 
@@ -1441,6 +1419,7 @@ async function listStockRecommendationsByProduct({ db, auth, filters = {} }) {
       branchCodesInScope: dataset.scope.branchCodes,
       anchorDate: dataset.anchorDate,
       source: dataset.source,
+      ...(dataset.readerMeta ? { reader: dataset.readerMeta } : {}),
     },
   };
 }
@@ -1538,9 +1517,48 @@ async function getPrecomputedRecommendationDetail(db, dataset, productCode) {
   return result.rows[0] ? mapSnapshotRow(result.rows[0]) : null;
 }
 
-async function computeLiveRecommendationDataset(db, auth, filters = {}) {
+function summarizeLegacyInputGenerations(stockRows, branchCodes) {
+  return branchCodes.map((branchCode) => {
+    const generations = new Set();
+    for (const stockRow of stockRows) {
+      const generationId = stockRow.branches?.[branchCode]?.generationId;
+      if (generationId != null) generations.add(String(generationId));
+    }
+    return {
+      branchCode,
+      syncRunId: generations.size === 1
+        ? [...generations][0]
+        : (generations.size === 0 ? "missing" : "mixed"),
+    };
+  });
+}
+
+async function computeLiveRecommendationDatasetForReader(
+  db,
+  auth,
+  filters,
+  readerKind,
+  readerPolicy,
+  options = {},
+) {
   const normalizedFilters = normalizeRecommendationFilters(filters);
-  const scope = await resolveEffectiveBranchScope(db, auth, normalizedFilters.branchCode);
+  const scope = await resolveEffectiveBranchScope(
+    db,
+    auth,
+    normalizedFilters.branchCode,
+    { readerKind },
+  );
+  const generationEvidence = readerKind === "normalized"
+    ? await loadNormalizedGenerationEvidence(db, {
+      activeBranchCodes: scope.activeBranchCodes,
+      maxAgeHours: readerPolicy.maxAgeHours,
+      now: options.now,
+    })
+    : null;
+  if (generationEvidence && !generationEvidence.available) {
+    throw createInputUnavailableError(generationEvidence);
+  }
+
   const anchorDate = await resolveAnchorDate(db, normalizedFilters);
   const policy = buildRecommendationPolicy(normalizedFilters, anchorDate);
   const branchNameByCode = new Map(scope.activeBranches.map((branch) => [branch.branchCode, branch.branchName]));
@@ -1555,8 +1573,20 @@ async function computeLiveRecommendationDataset(db, auth, filters = {}) {
     scope,
     search: normalizedFilters.search,
     rawSalesAgg,
+    readerKind,
+    readerEvidence: generationEvidence,
   });
-  const stockRows = await loadCurrentStockByProduct(db, { productCodes: candidateProductCodes });
+  const stockResult = readerKind === "normalized"
+    ? await loadNormalizedCurrentStockByProduct(db, {
+      productCodes: candidateProductCodes,
+      activeBranchCodes: scope.activeBranchCodes,
+      generationByBranch: generationEvidence.generationByBranch,
+    })
+    : await loadLegacyCurrentStockByProduct(db, {
+      productCodes: candidateProductCodes,
+      includeTrace: Boolean(options.includeLegacyTrace),
+    });
+  const stockRows = stockResult.stockRows;
   const productCodes = stockRows.map((row) => row.productCode);
   const salesAggByProductBranch = rawSalesAgg;
   const incomingByProduct = await loadIncomingReceiptAggByProduct(db, {
@@ -1581,12 +1611,353 @@ async function computeLiveRecommendationDataset(db, auth, filters = {}) {
     branchNameByCode,
     rows: allRows,
     source: "live",
+    readerKind,
+    readerStockRows: stockRows,
+    inputGenerations: generationEvidence
+      ? generationEvidence.inputGenerations
+      : summarizeLegacyInputGenerations(stockRows, scope.activeBranchCodes),
+    generationEvidence,
   };
 }
 
-async function computeRecommendationDataset(db, auth, filters = {}) {
+function shadowExpiry(startedAt, retentionDays) {
+  return new Date(new Date(startedAt).getTime() + retentionDays * 86_400_000).toISOString();
+}
+
+function shadowInputCounts(legacyDataset, normalizedDataset = null) {
+  return {
+    legacyProducts: legacyDataset?.readerStockRows?.length || 0,
+    legacyRows: legacyDataset?.rows?.length || 0,
+    normalizedProducts: normalizedDataset?.readerStockRows?.length || 0,
+    normalizedRows: normalizedDataset?.rows?.length || 0,
+  };
+}
+
+async function persistShadowSuccess({
+  db,
+  comparisonId,
+  legacyDataset,
+  normalizedDataset,
+  readerPolicy,
+  startedAt,
+  sourceSnapshot,
+  durationMs,
+}) {
+  const comparison = compareStockReaderResults(
+    {
+      stockRows: legacyDataset.readerStockRows,
+      rows: legacyDataset.rows,
+      summary: buildListSummary(legacyDataset.rows),
+      inputGenerations: legacyDataset.inputGenerations,
+    },
+    {
+      stockRows: normalizedDataset.readerStockRows,
+      rows: normalizedDataset.rows,
+      summary: buildListSummary(normalizedDataset.rows),
+      inputGenerations: normalizedDataset.inputGenerations,
+    },
+  );
+  await persistReaderComparison(db, {
+    comparisonId,
+    readerMode: "shadow",
+    servedReader: "legacy",
+    status: comparison.matches ? "match" : "mismatch",
+    branchCodes: normalizedDataset.scope.activeBranchCodes,
+    comparison,
+    inputCounts: shadowInputCounts(legacyDataset, normalizedDataset),
+    inputGenerations: normalizedDataset.inputGenerations,
+    availability: { status: "available", failures: [] },
+    sourceSnapshot,
+    durationMs,
+    startedAt,
+    expiresAt: shadowExpiry(startedAt, readerPolicy.shadowRetentionDays),
+  });
+  return comparison;
+}
+
+async function persistShadowFailure({
+  db,
+  comparisonId,
+  legacyDataset,
+  readerPolicy,
+  error,
+  startedAt,
+  sourceSnapshot,
+  durationMs,
+}) {
+  const unavailable = error?.code === "STOCK_RECOMMENDATION_INPUT_UNAVAILABLE";
+  const failureBranchCodes = unavailable
+    ? (error.availability?.failures || [])
+      .map((failure) => failure.branchCode)
+      .filter(Boolean)
+    : [];
+  await persistReaderComparison(db, {
+    comparisonId,
+    readerMode: "shadow",
+    servedReader: "legacy",
+    status: unavailable ? "unavailable" : "error",
+    branchCodes: [...new Set([
+      ...legacyDataset.scope.activeBranchCodes,
+      ...failureBranchCodes,
+    ])].sort(),
+    inputCounts: shadowInputCounts(legacyDataset),
+    inputGenerations: [],
+    availability: unavailable
+      ? error.availability
+      : {
+        status: "error",
+        failures: [{ branchCode: null, reason: "SHADOW_READER_ERROR", status: "error" }],
+      },
+    sourceSnapshot,
+    durationMs,
+    startedAt,
+    expiresAt: shadowExpiry(startedAt, readerPolicy.shadowRetentionDays),
+  });
+}
+
+async function computeShadowRecommendationDataset(
+  db,
+  auth,
+  filters,
+  readerPolicy,
+  servedLegacyDataset = null,
+) {
+  const startedAt = new Date().toISOString();
+  const comparisonId = crypto.randomUUID();
+  const sampling = shouldRunShadowComparison(readerPolicy, comparisonId);
+  if (!sampling.run) {
+    const legacyDataset = servedLegacyDataset || await computeLiveRecommendationDatasetForReader(
+      db, auth, filters, "legacy", readerPolicy,
+    );
+    legacyDataset.readerMeta = {
+      mode: "shadow",
+      servedReader: "legacy",
+      comparisonStatus: sampling.status,
+    };
+    return legacyDataset;
+  }
+
+  let client = null;
+  let transactionOpen = false;
+  let comparisonLegacyDataset = null;
+  let sourceSnapshot = null;
+  const startedMs = Date.now();
+  try {
+    if (!db || typeof db.connect !== "function") {
+      throw createInputUnavailableError({
+        status: "unavailable",
+        failures: [{
+          branchCode: null,
+          reason: "CONSISTENT_SNAPSHOT_UNAVAILABLE",
+          status: "unavailable",
+        }],
+      });
+    }
+    client = await db.connect();
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    transactionOpen = true;
+    sourceSnapshot = (await client.query(
+      "SELECT txid_current_snapshot()::text AS source_snapshot",
+    )).rows[0]?.source_snapshot || null;
+
+    comparisonLegacyDataset = await computeLiveRecommendationDatasetForReader(
+      client,
+      auth,
+      filters,
+      "legacy",
+      readerPolicy,
+      { includeLegacyTrace: true },
+    );
+    const normalizedDataset = await computeLiveRecommendationDatasetForReader(
+      client,
+      auth,
+      filters,
+      "normalized",
+      readerPolicy,
+    );
+    await client.query("COMMIT");
+    transactionOpen = false;
+
+    const durationMs = Date.now() - startedMs;
+    let evidencePersisted = true;
+    let comparison;
+    try {
+      comparison = await persistShadowSuccess({
+        db,
+        comparisonId,
+        legacyDataset: comparisonLegacyDataset,
+        normalizedDataset,
+        readerPolicy,
+        startedAt,
+        sourceSnapshot,
+        durationMs,
+      });
+    } catch (_) {
+      evidencePersisted = false;
+      console.error("[stock-recommendation-shadow] comparison persistence failed");
+      comparison = compareStockReaderResults(
+        {
+          stockRows: comparisonLegacyDataset.readerStockRows,
+          rows: comparisonLegacyDataset.rows,
+          summary: buildListSummary(comparisonLegacyDataset.rows),
+          inputGenerations: comparisonLegacyDataset.inputGenerations,
+        },
+        {
+          stockRows: normalizedDataset.readerStockRows,
+          rows: normalizedDataset.rows,
+          summary: buildListSummary(normalizedDataset.rows),
+          inputGenerations: normalizedDataset.inputGenerations,
+        },
+      );
+    }
+    const legacyDataset = servedLegacyDataset || comparisonLegacyDataset;
+    legacyDataset.readerMeta = {
+      mode: "shadow",
+      servedReader: "legacy",
+      comparisonId: evidencePersisted ? comparisonId : null,
+      comparisonStatus: comparison.matches ? "match" : "mismatch",
+      evidencePersisted,
+      sourceSnapshot,
+      inputGenerations: normalizedDataset.inputGenerations,
+    };
+    return legacyDataset;
+  } catch (error) {
+    if (transactionOpen && client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {
+        // Preserve the shadow failure; serving legacy remains the priority.
+      }
+      transactionOpen = false;
+    }
+    const legacyDataset = servedLegacyDataset || comparisonLegacyDataset
+      || await computeLiveRecommendationDatasetForReader(
+        db,
+        auth,
+        filters,
+        "legacy",
+        readerPolicy,
+      );
+    let evidencePersisted = true;
+    try {
+      await persistShadowFailure({
+        db,
+        comparisonId,
+        legacyDataset,
+        readerPolicy,
+        error,
+        startedAt,
+        sourceSnapshot,
+        durationMs: Date.now() - startedMs,
+      });
+    } catch (_) {
+      evidencePersisted = false;
+      console.error("[stock-recommendation-shadow] failure evidence persistence failed");
+    }
+    const unavailable = error?.code === "STOCK_RECOMMENDATION_INPUT_UNAVAILABLE";
+    legacyDataset.readerMeta = {
+      mode: "shadow",
+      servedReader: "legacy",
+      comparisonId: evidencePersisted ? comparisonId : null,
+      comparisonStatus: unavailable ? "unavailable" : "error",
+      evidencePersisted,
+      sourceSnapshot,
+      availability: unavailable
+        ? error.availability
+        : { status: "error", failures: [] },
+    };
+    return legacyDataset;
+  } finally {
+    if (client && typeof client.release === "function") client.release();
+  }
+}
+
+async function computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy) {
+  try {
+    const { value: dataset, sourceSnapshot } = await withRepeatableReadSnapshot(
+      db,
+      (client) => computeLiveRecommendationDatasetForReader(
+        client,
+        auth,
+        filters,
+        "normalized",
+        readerPolicy,
+      ),
+    );
+    dataset.readerMeta = {
+      mode: "normalized",
+      servedReader: "normalized",
+      sourceSnapshot,
+      inputGenerations: dataset.inputGenerations,
+    };
+    return dataset;
+  } catch (error) {
+    if (error?.code === "STOCK_RECOMMENDATION_INPUT_UNAVAILABLE") throw error;
+    throw createInputUnavailableError({
+      status: "error",
+      failures: [{ branchCode: null, reason: "NORMALIZED_READER_ERROR", status: "error" }],
+    });
+  }
+}
+
+function resolveNormalizedCanarySelection(readerPolicy, auth, filters = {}) {
+  const canaryBranches = readerPolicy.normalizedCanaryBranches;
+  if (!Array.isArray(canaryBranches) || canaryBranches.length === 0) {
+    return { selected: false, status: "canary_configuration_required", branchCode: null };
+  }
+  if (canaryBranches.includes("all")) {
+    return { selected: true, status: "all_branches", branchCode: "all" };
+  }
+
+  const role = String(auth?.role || "");
+  const branchCode = role === "admin"
+    ? normalizeText(filters?.branchCode || "")
+    : normalizeText(auth?.effectiveBranchCode || "");
+  if (branchCode && branchCode !== "all" && canaryBranches.includes(branchCode)) {
+    return { selected: true, status: "canary_branch", branchCode };
+  }
+  return { selected: false, status: "outside_canary", branchCode: branchCode || null };
+}
+
+async function computeLiveRecommendationDataset(db, auth, filters = {}, config = {}) {
+  const readerPolicy = resolveRecommendationReaderPolicy(config);
+  if (readerPolicy.mode === "normalized") {
+    const selection = resolveNormalizedCanarySelection(readerPolicy, auth, filters);
+    if (selection.selected) {
+      return computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy);
+    }
+    const legacyDataset = await computeLiveRecommendationDatasetForReader(
+      db, auth, filters, "legacy", readerPolicy,
+    );
+    legacyDataset.readerMeta = {
+      mode: "normalized",
+      servedReader: "legacy",
+      selectionStatus: selection.status,
+    };
+    return legacyDataset;
+  }
+  if (readerPolicy.mode === "shadow") {
+    return computeShadowRecommendationDataset(db, auth, filters, readerPolicy);
+  }
+  // This is intentionally the original production path: no normalized query,
+  // transaction, evidence write, response metadata, or extra stock column.
+  return computeLiveRecommendationDatasetForReader(
+    db,
+    auth,
+    filters,
+    "legacy",
+    readerPolicy,
+  );
+}
+
+async function computeLegacyRecommendationDataset(db, auth, filters = {}) {
   const normalizedFilters = normalizeRecommendationFilters(filters);
-  const scope = await resolveEffectiveBranchScope(db, auth, normalizedFilters.branchCode);
+  const scope = await resolveEffectiveBranchScope(
+    db,
+    auth,
+    normalizedFilters.branchCode,
+    { readerKind: "legacy" },
+  );
   const branchNameByCode = new Map(scope.activeBranches.map((branch) => [branch.branchCode, branch.branchName]));
 
   // A specific dateTo is a deliberate historical/point-in-time query — honor
@@ -1623,11 +1994,48 @@ async function computeRecommendationDataset(db, auth, filters = {}) {
     }
   }
 
-  return computeLiveRecommendationDataset(db, auth, normalizedFilters);
+  return computeLiveRecommendationDatasetForReader(
+    db,
+    auth,
+    normalizedFilters,
+    "legacy",
+    resolveRecommendationReaderPolicy({}),
+  );
 }
 
-async function listStockRecommendations({ db, auth, filters = {} }) {
-  const dataset = await computeRecommendationDataset(db, auth, filters);
+async function computeRecommendationDataset(db, auth, filters = {}, config = {}) {
+  const readerPolicy = resolveRecommendationReaderPolicy(config);
+  if (readerPolicy.mode === "normalized") {
+    const selection = resolveNormalizedCanarySelection(readerPolicy, auth, filters);
+    if (selection.selected) {
+      // Existing precomputed rows have no reader/generation provenance, so a
+      // selected normalized response must use the gated reader directly.
+      return computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy);
+    }
+    const legacyDataset = await computeLegacyRecommendationDataset(db, auth, filters);
+    legacyDataset.readerMeta = {
+      mode: "normalized",
+      servedReader: "legacy",
+      selectionStatus: selection.status,
+    };
+    return legacyDataset;
+  }
+  const legacyDataset = await computeLegacyRecommendationDataset(db, auth, filters);
+  if (readerPolicy.mode === "shadow") {
+    // Request traffic never performs the expensive comparison. Shadow
+    // evidence is generated by the existing refresh path, which can link the
+    // compared legacy rows to the exact precomputed batch it writes.
+    legacyDataset.readerMeta = {
+      mode: "shadow",
+      servedReader: "legacy",
+      comparisonStatus: "refresh_only",
+    };
+  }
+  return legacyDataset;
+}
+
+async function listStockRecommendations({ db, auth, filters = {}, config = {} }) {
+  const dataset = await computeRecommendationDataset(db, auth, filters, config);
   let pagedRows;
   let summary;
   let total;
@@ -1662,15 +2070,16 @@ async function listStockRecommendations({ db, auth, filters = {} }) {
       branchCodesInScope: dataset.scope.branchCodes,
       anchorDate: dataset.anchorDate,
       source: dataset.source,
+      ...(dataset.readerMeta ? { reader: dataset.readerMeta } : {}),
     },
   };
 }
 
-async function getStockRecommendationSummary({ db, auth, filters = {} }) {
+async function getStockRecommendationSummary({ db, auth, filters = {}, config = {} }) {
   const dataset = await computeRecommendationDataset(db, auth, {
     ...filters,
     branchCode: filters.branchCode || "all",
-  });
+  }, config);
 
   const company =
     dataset.source === "precomputed"
@@ -1692,11 +2101,19 @@ async function getStockRecommendationSummary({ db, auth, filters = {} }) {
       isAllBranches: dataset.scope.isAllBranches,
       anchorDate: dataset.anchorDate,
       source: dataset.source,
+      ...(dataset.readerMeta ? { reader: dataset.readerMeta } : {}),
     },
   };
 }
 
-async function getStockRecommendationDetail({ db, auth, branchCode, productCode, filters = {} }) {
+async function getStockRecommendationDetail({
+  db,
+  auth,
+  branchCode,
+  productCode,
+  filters = {},
+  config = {},
+}) {
   const normalizedProductCode = normalizeText(productCode);
   if (!normalizedProductCode) {
     throw createHttpError("productCode is required.", 400);
@@ -1705,7 +2122,7 @@ async function getStockRecommendationDetail({ db, auth, branchCode, productCode,
   const dataset = await computeRecommendationDataset(db, auth, {
     ...filters,
     branchCode,
-  });
+  }, config);
 
   const row = dataset.source === "precomputed"
     ? await getPrecomputedRecommendationDetail(db, dataset, normalizedProductCode)
@@ -1727,6 +2144,7 @@ async function getStockRecommendationDetail({ db, auth, branchCode, productCode,
     meta: {
       anchorDate: dataset.anchorDate,
       source: dataset.source,
+      ...(dataset.readerMeta ? { reader: dataset.readerMeta } : {}),
     },
   };
 }
@@ -1737,19 +2155,47 @@ async function refreshStockRecommendationSnapshots(db, options = {}) {
     throw createHttpError("targetDays must be a positive integer.", 400);
   }
 
+  // Retention must continue after shadow is turned off. The existing refresh
+  // cadence provides that lifecycle hook without coupling deletion to a new
+  // comparison insert.
+  const expiredComparisonCount = await pruneExpiredReaderComparisons(db);
+
+  const readerPolicy = resolveRecommendationReaderPolicy(options.config || {});
   const requestedBranchCodes = Array.isArray(options.branchCodes)
-    ? options.branchCodes.map((value) => normalizeText(value)).filter((value) => BRANCH_SNAPSHOT_COLUMNS[value])
+    ? options.branchCodes
+      .map((value) => normalizeText(value))
+      .filter((value) => readerPolicy.mode === "normalized" || BRANCH_SNAPSHOT_COLUMNS[value])
     : null;
 
   const liveDataset = await computeLiveRecommendationDataset(db, { role: "admin" }, {
     branchCode: "all",
     targetDays,
-  });
+  }, options.config || {});
 
   const rowsToPersist = requestedBranchCodes && requestedBranchCodes.length > 0
     ? liveDataset.rows.filter((row) => requestedBranchCodes.includes(row.branchCode))
     : liveDataset.rows;
   const generatedAt = new Date().toISOString();
+  let shadowEvidenceLinked = false;
+
+  if (liveDataset.readerMeta?.servedReader === "normalized") {
+    // The shared snapshot table has no generation provenance. Overwriting it
+    // with normalized results would make a later legacy rollback silently
+    // serve normalized rows. Until a separately reviewed provenance design
+    // exists, normalized requests compute live and leave the rollback cache.
+    return {
+      anchorDate: liveDataset.anchorDate,
+      targetDays,
+      generatedAt,
+      rowCount: rowsToPersist.length,
+      persistedRowCount: 0,
+      branchCount: new Set(rowsToPersist.map((row) => row.branchCode)).size,
+      source: "live_without_snapshot_write",
+      snapshotWrite: "skipped_normalized_reader_without_provenance",
+      reader: liveDataset.readerMeta,
+      expiredComparisonCount,
+    };
+  }
 
   const client = typeof db.connect === "function" ? await db.connect() : db;
   try {
@@ -1891,6 +2337,20 @@ async function refreshStockRecommendationSnapshots(db, options = {}) {
       );
     }
 
+    if (liveDataset.readerMeta?.mode === "shadow" && liveDataset.readerMeta.comparisonId) {
+      shadowEvidenceLinked = await linkReaderComparisonToServedSnapshot(client, {
+        comparisonId: liveDataset.readerMeta.comparisonId,
+        anchorDate: liveDataset.anchorDate,
+        targetDays,
+        generatedAt,
+        rowCount: rowsToPersist.length,
+        branchCodes: [...new Set(rowsToPersist.map((row) => row.branchCode))].sort(),
+      });
+      if (!shadowEvidenceLinked) {
+        throw new Error("Shadow comparison could not be linked to the served snapshot batch.");
+      }
+    }
+
     if (typeof client.query === "function" && typeof client.release === "function") {
       await client.query("COMMIT");
     }
@@ -1912,6 +2372,9 @@ async function refreshStockRecommendationSnapshots(db, options = {}) {
     rowCount: rowsToPersist.length,
     branchCount: new Set(rowsToPersist.map((row) => row.branchCode)).size,
     source: "live_to_snapshot",
+    expiredComparisonCount,
+    shadowEvidenceLinked,
+    ...(liveDataset.readerMeta ? { reader: liveDataset.readerMeta } : {}),
   };
 }
 

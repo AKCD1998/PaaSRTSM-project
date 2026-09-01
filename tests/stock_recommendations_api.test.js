@@ -6,6 +6,7 @@ const bcrypt = require("bcryptjs");
 const request = require("supertest");
 
 const { createApp } = require("../apps/admin-api/src/server");
+const { refreshStockRecommendationSnapshots } = require("../apps/admin-api/src/services/stockRecommendations");
 
 function buildConfig() {
   return {
@@ -41,6 +42,15 @@ function normalizeSql(sql) {
 function createMockDb() {
   const state = {
     auditActions: [],
+    queryLog: [],
+    reconciliationStatus003: "pass",
+    comparisonPersistenceFails: false,
+    normalizedLoaderFails: false,
+    precomputedEnabled: false,
+    expiredComparisonCount: 0,
+    comparisonLinks: [],
+    normalizedCandidateParams: null,
+    normalizedLoaderParams: null,
     activeBranches: [
       { branch_code: "001", branch_name: "Branch 001", is_active: true, is_hq: false },
       { branch_code: "003", branch_name: "Branch 003", is_active: true, is_hq: false },
@@ -120,7 +130,39 @@ function createMockDb() {
     incomingRows: [
       { product_code: "P2", incoming_qty_total: 10 },
     ],
+    precomputedRow: {
+      branch_code: "001",
+      branch_label: "Branch 001",
+      product_code: "P-CACHED",
+      product_name_thai: "Cached product",
+      product_name_eng: "Cached product",
+      barcode: "CACHED",
+      unit: "ชิ้น",
+      current_stock: 1,
+      unit_cost_avg: 2,
+      target_qty: 3,
+      action: "PURCHASE",
+      recommendation_flags: [],
+      donors_json: [],
+    },
   };
+
+  state.normalizedRows = state.stockRows.flatMap((stockRow) => (
+    ["001", "003"].map((branchCode) => ({
+      product_code: stockRow.product_code,
+      product_name_thai: stockRow.product_name_thai,
+      product_name_eng: stockRow.product_name_eng,
+      barcode: stockRow.barcode,
+      unit: stockRow.unit,
+      branch_code: branchCode,
+      eligible_sync_run_id: branchCode === "001" ? "201" : "203",
+      stock_product_code: stockRow.product_code,
+      qty: stockRow[`qty_branch_${branchCode}`],
+      cost_avg: stockRow[`cost_avg_branch_${branchCode}`],
+      synced_at: stockRow.synced_at,
+      last_full_sync_run_id: branchCode === "001" ? "201" : "203",
+    }))
+  ));
 
   const db = {
     state,
@@ -132,6 +174,38 @@ function createMockDb() {
     },
     async query(sql, params = []) {
       const normalized = normalizeSql(sql);
+      state.queryLog.push(normalized);
+
+      if ([
+        "begin",
+        "begin isolation level repeatable read read only",
+        "commit",
+        "rollback",
+      ].includes(normalized)) {
+        return { rowCount: 0, rows: [] };
+      }
+      if (normalized === "select txid_current_snapshot()::text as source_snapshot") {
+        return { rowCount: 1, rows: [{ source_snapshot: "100:100:" }] };
+      }
+      if (normalized.startsWith("insert into ordering.stock_recommendation_reader_comparisons")) {
+        if (state.comparisonPersistenceFails) throw new Error("synthetic persistence failure");
+        return { rowCount: 1, rows: [] };
+      }
+      if (normalized.startsWith("delete from ordering.stock_recommendation_reader_comparisons")) {
+        const rowCount = state.expiredComparisonCount;
+        state.expiredComparisonCount = 0;
+        return { rowCount, rows: [] };
+      }
+      if (normalized.startsWith("update ordering.stock_recommendation_reader_comparisons")) {
+        state.comparisonLinks.push(params);
+        return { rowCount: 1, rows: [] };
+      }
+      if (
+        normalized.startsWith("delete from ordering.stock_recommendation_snapshots")
+        || normalized.startsWith("insert into ordering.stock_recommendation_snapshots")
+      ) {
+        return { rowCount: 1, rows: [] };
+      }
 
       if (normalized.startsWith("insert into public.audit_logs")) {
         state.auditActions.push(params[2]);
@@ -166,10 +240,66 @@ function createMockDb() {
       }
 
       if (
+        normalized.includes("from core.branches branch")
+        && normalized.includes("from ingest.sync_runs run")
+      ) {
+        return {
+          rowCount: state.activeBranches.length,
+          rows: state.activeBranches.map((row) => ({
+            branch_code: row.branch_code,
+            branch_name: row.branch_name,
+            is_hq: row.is_hq,
+          })),
+        };
+      }
+
+      if (normalized.includes("with required(branch_code) as (select unnest($1::text[]))")) {
+        const mismatchSummary = {
+          generationMembership: { matches: true },
+          normalizedVsWide: { matches: true },
+          normalizedVsWideRows: { mismatchCount: 0 },
+        };
+        return {
+          rowCount: 2,
+          rows: [
+            {
+              branch_code: "001", sync_run_id: "201", run_status: "success",
+              ingestion_mode: "hybrid_v2", snapshot_mode: "full",
+              handoff_status: "success", apply_status: "applied",
+              finalized_at: "2026-07-12T01:01:00.000Z", finished_at: "2026-07-12T01:01:00.000Z",
+              retirement_status: "done", expected_membership_count: 3,
+              actual_membership_count: 3, reconciliation_status: "pass",
+              mismatch_summary: mismatchSummary, generation_row_count: 3,
+              min_stock_synced_at: "2026-07-12T01:00:00.000Z",
+              max_stock_synced_at: "2026-07-12T01:00:00.000Z",
+            },
+            {
+              branch_code: "003", sync_run_id: "203", run_status: "success",
+              ingestion_mode: "hybrid_v2", snapshot_mode: "full",
+              handoff_status: "success", apply_status: "applied",
+              finalized_at: "2026-07-12T01:01:00.000Z", finished_at: "2026-07-12T01:01:00.000Z",
+              retirement_status: "done", expected_membership_count: 3,
+              actual_membership_count: 3, reconciliation_status: state.reconciliationStatus003,
+              mismatch_summary: mismatchSummary, generation_row_count: 3,
+              min_stock_synced_at: "2026-07-12T01:00:00.000Z",
+              max_stock_synced_at: "2026-07-12T01:00:00.000Z",
+            },
+          ],
+        };
+      }
+
+      if (
         normalized.includes("from ordering.stock_recommendation_snapshots") &&
         normalized.includes("max(anchor_date)::date as latest_anchor_date")
       ) {
-        return { rowCount: 1, rows: [{ latest_anchor_date: null }] };
+        return {
+          rowCount: 1,
+          rows: [{
+            latest_anchor_date: state.precomputedEnabled
+              ? new Date("2026-07-12T00:00:00.000Z")
+              : null,
+          }],
+        };
       }
 
       if (
@@ -178,6 +308,33 @@ function createMockDb() {
         normalized.includes("period_end = $1::date")
       ) {
         return { rowCount: 0, rows: [] };
+      }
+
+      if (
+        state.precomputedEnabled
+        && normalized.includes("with filtered as (")
+        && normalized.includes("count(*)::int as sku_count")
+      ) {
+        return {
+          rowCount: 1,
+          rows: [{
+            sku_count: 1,
+            recommend_transfer_count: 0,
+            recommend_purchase_count: 1,
+            recommend_mixed_count: 0,
+            slow_moving_count: 0,
+            current_inventory_value: 2,
+            projected_inventory_value_at_target: 6,
+            potential_reduction_value: 0,
+          }],
+        };
+      }
+
+      if (
+        state.precomputedEnabled
+        && normalized.startsWith("select * from ordering.stock_recommendation_snapshots")
+      ) {
+        return { rowCount: 1, rows: [state.precomputedRow] };
       }
 
       if (normalized.startsWith("select max(period_end)::date as latest_date from analytics.product_sales_summary_periods")) {
@@ -192,7 +349,9 @@ function createMockDb() {
         normalized.includes("from ordering.stock_recommendation_snapshots") &&
         normalized.includes("count(*)::int as row_count")
       ) {
-        return { rowCount: 0, rows: [] };
+        return state.precomputedEnabled
+          ? { rowCount: 1, rows: [{ row_count: 1, generated_at: "2026-07-12T02:00:00.000Z" }] }
+          : { rowCount: 0, rows: [] };
       }
 
       if (
@@ -210,6 +369,17 @@ function createMockDb() {
       }
 
       if (
+        normalized.includes("select distinct current.product_code")
+        && normalized.includes("from ada.branch_stock_current current")
+      ) {
+        state.normalizedCandidateParams = params;
+        return {
+          rowCount: state.stockRows.length,
+          rows: state.stockRows.map((row) => ({ product_code: row.product_code })),
+        };
+      }
+
+      if (
         normalized.includes("from ada.branch_stock_snapshots bs") &&
         normalized.includes("select bs.product_code") &&
         normalized.includes("coalesce(bs.qty_branch_")
@@ -218,6 +388,17 @@ function createMockDb() {
         const rows = state.stockRows
           .filter((row) => branchMatches.some((branchCode) => Number(row[`qty_branch_${branchCode}`] || 0) > 0))
           .map((row) => ({ product_code: row.product_code }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.includes("with candidates(product_code) as")
+        && normalized.includes("left join ada.branch_stock_current current")
+      ) {
+        state.normalizedLoaderParams = params;
+        if (state.normalizedLoaderFails) throw new Error("synthetic normalized failure");
+        const productCodes = Array.isArray(params[0]) ? params[0] : [];
+        const rows = state.normalizedRows.filter((row) => productCodes.includes(row.product_code));
         return { rowCount: rows.length, rows };
       }
 
@@ -265,8 +446,8 @@ function createMockDb() {
   return db;
 }
 
-function createTestApp() {
-  const config = buildConfig();
+function createTestApp(configOverrides = {}) {
+  const config = { ...buildConfig(), ...configOverrides };
   const db = createMockDb();
   const { app } = createApp({
     config,
@@ -292,7 +473,7 @@ test("GET /api/admin/stock-recommendations requires auth", async () => {
 });
 
 test("branch user recommendation list is forced to its own branch scope and returns computed actions", async () => {
-  const { app } = createTestApp();
+  const { app, db } = createTestApp();
   const agent = request.agent(app);
 
   await loginAs(agent, {
@@ -306,6 +487,12 @@ test("branch user recommendation list is forced to its own branch scope and retu
   assert.equal(response.body.branchCode, "001");
   assert.equal(response.body.meta.isAllBranches, false);
   assert.deepEqual(response.body.meta.branchCodesInScope, ["001"]);
+  assert.equal("reader" in response.body.meta, false, "legacy response shape stays unchanged");
+  assert.equal(
+    db.state.queryLog.some((sql) => sql.includes("branch_stock_current") || sql.includes("branch_stock_reconciliations")),
+    false,
+    "legacy mode never touches normalized evidence or stock",
+  );
 
   const rows = response.body.rows;
   assert.equal(rows.length, 3);
@@ -408,4 +595,221 @@ test("recommendation detail returns the computed row for one branch/product", as
   assert.equal(response.body.recommendation.productCode, "P1");
   assert.equal(response.body.recommendation.action, "TRANSFER_IN");
   assert.equal(response.body.recommendation.donors[0].branchCode, "003");
+});
+
+test("normalized reader fails closed with bounded 503 evidence and never queries the wide table", async () => {
+  const { app, db } = createTestApp({
+    stockRecommendationReaderMode: "normalized",
+    stockRecommendationMaxStockAgeHours: 10000,
+    stockRecommendationNormalizedCanaryBranches: ["all"],
+  });
+  db.state.reconciliationStatus003 = "pending";
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
+
+  const response = await agent.get("/api/admin/stock-recommendations?branchCode=all");
+  assert.equal(response.status, 503);
+  assert.equal(response.body.code, "STOCK_RECOMMENDATION_INPUT_UNAVAILABLE");
+  assert.deepEqual(
+    response.body.availability.failures.find((item) => item.branchCode === "003"),
+    { branchCode: "003", reason: "RECONCILIATION_NOT_PASS", status: "pending" },
+  );
+  assert.equal(JSON.stringify(response.body).includes("synthetic"), false);
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("from ada.branch_stock_snapshots bs")), false);
+  assert.ok(db.state.queryLog.includes("rollback"));
+});
+
+test("normalized reader serves only normalized rows and traces every input generation", async () => {
+  const { app, db } = createTestApp({
+    stockRecommendationReaderMode: "normalized",
+    stockRecommendationMaxStockAgeHours: 10000,
+    stockRecommendationNormalizedCanaryBranches: ["all"],
+  });
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
+
+  const response = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.meta.reader.servedReader, "normalized");
+  assert.deepEqual(
+    response.body.meta.reader.inputGenerations.map((item) => [item.branchCode, item.syncRunId]),
+    [["001", "201"], ["003", "203"]],
+  );
+  assert.equal(response.body.meta.reader.sourceSnapshot, "100:100:");
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("from ada.branch_stock_snapshots bs")), false);
+  assert.ok(db.state.queryLog.some((sql) => sql.includes("from ada.branch_stock_current current")));
+  assert.ok(db.state.queryLog.includes("commit"));
+});
+
+test("shadow requests serve the exact legacy cache and never run comparison work inline", async () => {
+  const { app, db } = createTestApp({ stockRecommendationReaderMode: "shadow" });
+  db.state.precomputedEnabled = true;
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
+
+  const response = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.meta.reader.servedReader, "legacy");
+  assert.equal(response.body.meta.reader.comparisonStatus, "refresh_only");
+  assert.equal(response.body.meta.source, "precomputed");
+  assert.equal(response.body.rows[0].productCode, "P-CACHED");
+  assert.equal(response.body.generatedAt, "2026-07-12T02:00:00.000Z");
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("from ada.branch_stock_snapshots bs")), false);
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("branch_stock_current")), false);
+  assert.equal(db.state.queryLog.includes("begin isolation level repeatable read read only"), false);
+});
+
+test("even a 100% shadow sample rate adds no normalized query or transaction to request latency", async () => {
+  const { app, db } = createTestApp({
+    stockRecommendationReaderMode: "shadow",
+    stockRecommendationMaxStockAgeHours: 10000,
+    stockRecommendationShadowSampleRate: 1,
+    stockRecommendationShadowRetentionDays: 7,
+  });
+  db.state.precomputedEnabled = true;
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
+
+  const response = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.meta.reader.servedReader, "legacy");
+  assert.equal(response.body.meta.reader.comparisonStatus, "refresh_only");
+  assert.equal(response.body.meta.source, "precomputed");
+  assert.equal(response.body.rows[0].productCode, "P-CACHED");
+  assert.equal(db.state.queryLog.includes("begin isolation level repeatable read read only"), false);
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("branch_stock_current")), false);
+  assert.equal(db.state.queryLog.some((sql) => sql.startsWith("insert into ordering.stock_recommendation_reader_comparisons")), false);
+});
+
+test("shadow request serving is independent of normalized and evidence persistence availability", async () => {
+  const { app, db } = createTestApp({
+    stockRecommendationReaderMode: "shadow",
+    stockRecommendationMaxStockAgeHours: 10000,
+    stockRecommendationShadowSampleRate: 1,
+  });
+  db.state.normalizedLoaderFails = true;
+  db.state.comparisonPersistenceFails = true;
+  db.state.precomputedEnabled = true;
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "branch001@example.com", password: "branch-pass-001" });
+
+  const response = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.branchCode, "001");
+  assert.equal(response.body.meta.source, "precomputed");
+  assert.equal(response.body.rows[0].productCode, "P-CACHED");
+  assert.equal(response.body.rows[0].action, "PURCHASE");
+  assert.equal(response.body.meta.reader.servedReader, "legacy");
+  assert.equal(response.body.meta.reader.comparisonStatus, "refresh_only");
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("branch_stock_current")), false);
+  assert.equal(db.state.queryLog.includes("rollback"), false);
+});
+
+test("shadow refresh compares one snapshot and atomically links evidence to the exact cache batch it writes", async () => {
+  const db = createMockDb();
+  db.state.expiredComparisonCount = 2;
+  const result = await refreshStockRecommendationSnapshots(db, {
+    targetDays: 90,
+    config: {
+      stockRecommendationReaderMode: "shadow",
+      stockRecommendationMaxStockAgeHours: 10000,
+      stockRecommendationShadowSampleRate: 1,
+      stockRecommendationShadowRetentionDays: 7,
+    },
+  });
+  assert.equal(result.source, "live_to_snapshot");
+  assert.equal(result.reader.servedReader, "legacy");
+  assert.equal(result.reader.evidencePersisted, true);
+  assert.equal(result.expiredComparisonCount, 2);
+  assert.equal(result.shadowEvidenceLinked, true);
+  assert.equal(db.state.comparisonLinks.length, 1);
+  assert.equal(db.state.comparisonLinks[0][1], result.anchorDate);
+  assert.equal(db.state.comparisonLinks[0][2], 90);
+  assert.equal(db.state.comparisonLinks[0][3], result.generatedAt);
+  assert.equal(db.state.comparisonLinks[0][4], result.rowCount);
+  const compareCommit = db.state.queryLog.indexOf("commit");
+  const snapshotInsert = db.state.queryLog.findIndex((sql) => (
+    sql.startsWith("insert into ordering.stock_recommendation_snapshots")
+  ));
+  const evidenceLink = db.state.queryLog.findIndex((sql) => (
+    sql.startsWith("update ordering.stock_recommendation_reader_comparisons")
+  ));
+  assert.ok(compareCommit >= 0 && compareCommit < snapshotInsert && snapshotInsert < evidenceLink);
+});
+
+test("legacy refresh still prunes expired shadow evidence after shadow is disabled", async () => {
+  const db = createMockDb();
+  db.state.expiredComparisonCount = 3;
+  const result = await refreshStockRecommendationSnapshots(db, {
+    targetDays: 90,
+    config: { stockRecommendationReaderMode: "legacy" },
+  });
+  assert.equal(result.expiredComparisonCount, 3);
+  assert.equal(result.shadowEvidenceLinked, false);
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("branch_stock_current")), false);
+  assert.equal(db.state.queryLog.some((sql) => (
+    sql.startsWith("insert into ordering.stock_recommendation_reader_comparisons")
+  )), false);
+});
+
+test("normalized canary selects one branch, bounds stock candidates to that scope, and keeps donor loading global", async () => {
+  const { app, db } = createTestApp({
+    stockRecommendationReaderMode: "normalized",
+    stockRecommendationMaxStockAgeHours: 10000,
+    stockRecommendationNormalizedCanaryBranches: ["001"],
+  });
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
+
+  const selected = await agent.get("/api/admin/stock-recommendations?branchCode=001&pageSize=20");
+  assert.equal(selected.status, 200);
+  assert.equal(selected.body.meta.reader.servedReader, "normalized");
+  assert.deepEqual(db.state.normalizedCandidateParams[0], ["001"]);
+  assert.deepEqual(db.state.normalizedLoaderParams[1], ["001", "003"]);
+
+  db.state.queryLog.length = 0;
+  db.state.precomputedEnabled = true;
+  const outside = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  assert.equal(outside.status, 200);
+  assert.equal(outside.body.meta.reader.servedReader, "legacy");
+  assert.equal(outside.body.meta.reader.selectionStatus, "outside_canary");
+  assert.equal(outside.body.meta.source, "precomputed");
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("branch_stock_current")), false);
+});
+
+test("normalized mode without an explicit canary is fail-safe legacy", async () => {
+  const { app, db } = createTestApp({
+    stockRecommendationReaderMode: "normalized",
+    stockRecommendationMaxStockAgeHours: 10000,
+  });
+  db.state.precomputedEnabled = true;
+  const agent = request.agent(app);
+  await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
+  const response = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.meta.reader.servedReader, "legacy");
+  assert.equal(response.body.meta.reader.selectionStatus, "canary_configuration_required");
+  assert.equal(db.state.queryLog.some((sql) => sql.includes("branch_stock_current")), false);
+});
+
+test("normalized refresh never overwrites the unprovenanced legacy snapshot cache", async () => {
+  const db = createMockDb();
+  const result = await refreshStockRecommendationSnapshots(db, {
+    targetDays: 90,
+    config: {
+      stockRecommendationReaderMode: "normalized",
+      stockRecommendationMaxStockAgeHours: 10000,
+      stockRecommendationNormalizedCanaryBranches: ["all"],
+    },
+  });
+  assert.equal(result.reader.servedReader, "normalized");
+  assert.equal(result.persistedRowCount, 0);
+  assert.equal(result.snapshotWrite, "skipped_normalized_reader_without_provenance");
+  assert.equal(
+    db.state.queryLog.some((sql) => (
+      sql.startsWith("delete from ordering.stock_recommendation_snapshots")
+      || sql.startsWith("insert into ordering.stock_recommendation_snapshots")
+    )),
+    false,
+  );
 });

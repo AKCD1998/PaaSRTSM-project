@@ -1,0 +1,91 @@
+{
+  "baselineSha": "bbfca5c14cec95c351b9e9a4cdb13b4c7c5683ee",
+  "response": {
+    "branchCode": "all",
+    "targetDays": 90,
+    "generatedAt": "<dynamic>",
+    "policy": {
+      "targetDays": 90,
+      "incomingAllocationMode": "shortage_weighted_with_demand_fallback",
+      "incomingSourceMode": "pending_and_approved_receipts",
+      "demandMode": "sales_90d_with_30d_trend_adjustment",
+      "anchorDate": "2026-07-12",
+      "salesWindow30dFrom": "2026-06-13",
+      "salesWindow90dFrom": "2026-04-14"
+    },
+    "summary": {
+      "skuCount": 1,
+      "recommendTransferCount": 0,
+      "recommendPurchaseCount": 1,
+      "recommendMixedCount": 0,
+      "slowMovingCount": 0,
+      "currentInventoryValue": 0,
+      "projectedInventoryValueAtTarget": 0,
+      "potentialReductionValue": 0
+    },
+    "pagination": {
+      "page": 1,
+      "pageSize": 20,
+      "total": 1
+    },
+    "rows": [
+      {
+        "branchCode": "001",
+        "branchLabel": "One",
+        "productCode": "P1",
+        "productNameThai": "หนึ่ง",
+        "productNameEng": "One",
+        "barcode": "111",
+        "unit": "EA",
+        "currentStock": 2,
+        "unitCostAvg": 0,
+        "inventoryValue": 0,
+        "soldQty30d": 3,
+        "soldQty90d": 9,
+        "soldQtySamePeriodLastYear": null,
+        "adu30": 0.1,
+        "adu90": 0.1,
+        "trendRatio30Vs90": 1,
+        "adjustedAdu": 0.1,
+        "incomingPoQtyTotal": 0,
+        "incomingPoAllocationQty": 0,
+        "effectiveStock": 2,
+        "currentDaysCover": 20,
+        "effectiveDaysCover": 20,
+        "targetDays": 90,
+        "targetQty": 9,
+        "surplusQty": 0,
+        "shortageQty": 7,
+        "transferPlanQty": 0,
+        "purchaseQty": 7,
+        "priorityScore": 0,
+        "action": "PURCHASE",
+        "reason": "สต๊อกหลังรวม incoming PO ยังต่ำกว่าเป้าหมาย และยังไม่มีสาขาอื่นช่วยเติมได้",
+        "recommendationReason": "สต๊อกหลังรวม incoming PO ยังต่ำกว่าเป้าหมาย และยังไม่มีสาขาอื่นช่วยเติมได้",
+        "flags": [],
+        "donors": [],
+        "primarySuggestedDonorBranchCode": null,
+        "syncedAt": "2026-07-12T01:00:00.000Z"
+      }
+    ],
+    "meta": {
+      "isAllBranches": true,
+      "activeBranchCodes": ["001"],
+      "branchCodesInScope": ["001"],
+      "anchorDate": "2026-07-12",
+      "source": "live"
+    }
+  },
+  "normalizedSqlSha256": [
+    "6fb6c32e06d01e56c08588c0f49922d8c9c5c8369e818fa4a594e0446f9ab904",
+    "e43eb5b10545540ddc2dd97fe9646661fce6964de952f7b6d15572d215e49133",
+    "6fb6c32e06d01e56c08588c0f49922d8c9c5c8369e818fa4a594e0446f9ab904",
+    "770d2cca5f93f81c83a140b83e8e87105918a7ff3e41e296299724616b5ea362",
+    "dc23f7af3dfc9c2f40dfd6548ecd65f8e47c80b7a5de466c1df4f9e5e00c963e",
+    "e1cee766a78dfc3fe3fbb49f178b4c11e2ea5b0c5e3e45b8adad5c76c03e79c5",
+    "c1ea9d533fe798293abd9332cd089a20bb565b09a2847a17e0816c539ebdc41c",
+    "a6ab05830f4b4b5c93bedb40017f9c7d89cd9008d765695a562c5e2ba1391830",
+    "756c4cbe6e91b815993e852dc1b40ebf8b0e61015f2f109f2a35721c52e46a54",
+    "a5637523af23f6256f7fb96214d493836eae8d28a740ffbe12e64d9b2b406760"
+  ]
+}
