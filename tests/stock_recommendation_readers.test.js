@@ -11,6 +11,7 @@ const {
   createInputUnavailableError,
   loadNormalizedActiveBranches,
   loadLegacyCurrentStockByProduct,
+  loadLegacyCompatibleProductMetadataByProduct,
   loadNormalizedGenerationEvidence,
   loadNormalizedCurrentStockByProduct,
   compareStockReaderResults,
@@ -276,16 +277,31 @@ test("normalized eligibility refuses to query when the freshness policy is not c
 });
 
 test("normalized loader preserves absent vs present-zero, null vs zero cost, negative quantity, and expanded branches", async () => {
+  const queries = [];
   const db = {
     async query(sql, params) {
-      assert.match(compactSql(sql), /cross join eligible/);
+      const normalizedSql = compactSql(sql);
+      queries.push({ sql: normalizedSql, params });
+      if (normalizedSql.includes("left join ada.branch_stock_snapshots bs")) {
+        assert.deepEqual(params, [["ABSENT", "P1"], ""]);
+        return {
+          rows: [
+            { product_code: "ABSENT", product_name_thai: "ไม่มี", product_name_eng: "Absent", barcode: null, unit: "EA" },
+            { product_code: "P1", product_name_thai: "หนึ่งจาก wide", product_name_eng: "One from wide", barcode: "WIDE111", unit: "BOX" },
+          ],
+        };
+      }
+      assert.match(normalizedSql, /cross join eligible/);
+      assert.match(normalizedSql, /left join ada\.branch_stock_current current/);
+      assert.equal(normalizedSql.includes("branch_stock_snapshots"), false);
+      assert.equal(normalizedSql.includes("qty_branch_"), false);
       assert.deepEqual(params, [["ABSENT", "P1"], ["001", "006"], ["501", "506"]]);
       return {
         rows: [
-          { product_code: "ABSENT", product_name_thai: "Absent", product_name_eng: "Absent", barcode: null, unit: "EA", branch_code: "001", stock_product_code: null, qty: null, cost_avg: null, synced_at: null, last_full_sync_run_id: null },
-          { product_code: "ABSENT", product_name_thai: "Absent", product_name_eng: "Absent", barcode: null, unit: "EA", branch_code: "006", stock_product_code: null, qty: null, cost_avg: null, synced_at: null, last_full_sync_run_id: null },
-          { product_code: "P1", product_name_thai: "One", product_name_eng: "One", barcode: "111", unit: "EA", branch_code: "001", stock_product_code: "P1", qty: "0", cost_avg: null, synced_at: "2026-09-01T01:00:00Z", last_full_sync_run_id: "501" },
-          { product_code: "P1", product_name_thai: "One", product_name_eng: "One", barcode: "111", unit: "EA", branch_code: "006", stock_product_code: "P1", qty: "-3", cost_avg: "0", synced_at: "2026-09-01T01:01:00Z", last_full_sync_run_id: "506" },
+          { product_code: "ABSENT", branch_code: "001", stock_product_code: null, qty: null, cost_avg: null, synced_at: null, last_full_sync_run_id: null },
+          { product_code: "ABSENT", branch_code: "006", stock_product_code: null, qty: null, cost_avg: null, synced_at: null, last_full_sync_run_id: null },
+          { product_code: "P1", branch_code: "001", stock_product_code: "P1", qty: "0", cost_avg: null, synced_at: "2026-09-01T01:00:00Z", last_full_sync_run_id: "501" },
+          { product_code: "P1", branch_code: "006", stock_product_code: "P1", qty: "-3", cost_avg: "0", synced_at: "2026-09-01T01:01:00Z", last_full_sync_run_id: "506" },
         ],
       };
     },
@@ -304,6 +320,44 @@ test("normalized loader preserves absent vs present-zero, null vs zero cost, neg
   assert.equal(p1.branches["001"].unitCostAvg, null);
   assert.equal(p1.branches["006"].qty, -3);
   assert.equal(p1.branches["006"].unitCostAvg, 0);
+  assert.deepEqual(
+    [p1.productNameThai, p1.productNameEng, p1.barcode, p1.unit],
+    ["หนึ่งจาก wide", "One from wide", "WIDE111", "BOX"],
+  );
+  assert.equal(queries.length, 2);
+});
+
+test("legacy-compatible metadata loader keeps visible wide metadata and uses sparse master data only as fallback", async () => {
+  const db = {
+    async query(sql, params) {
+      const normalizedSql = compactSql(sql);
+      assert.match(normalizedSql, /left join ada\.branch_stock_snapshots bs/);
+      assert.match(normalizedSql, /left join ada\.products p/);
+      assert.equal(normalizedSql.includes("qty_branch_"), false);
+      assert.equal(normalizedSql.includes("branch_stock_current"), false);
+      assert.deepEqual(params, [["P1"], "สินค้า"]);
+      return {
+        rows: [{
+          product_code: "P1",
+          product_name_thai: "สินค้าจาก wide",
+          product_name_eng: "Wide product",
+          barcode: "WIDE111",
+          unit: "กล่อง",
+        }],
+      };
+    },
+  };
+  const metadata = await loadLegacyCompatibleProductMetadataByProduct(db, {
+    productCodes: ["P1"],
+    search: "สินค้า",
+  });
+  assert.deepEqual(metadata.get("P1"), {
+    productCode: "P1",
+    productNameThai: "สินค้าจาก wide",
+    productNameEng: "Wide product",
+    barcode: "WIDE111",
+    unit: "กล่อง",
+  });
 });
 
 test("shadow comparator covers input membership/metadata/freshness/generation and output actions/quantities/donors/summary with bounded identifiers", () => {
@@ -328,24 +382,138 @@ test("shadow comparator covers input membership/metadata/freshness/generation an
     qty: 0, unitCostAvg: 0, sourcePresent: false, generationId: "2",
   });
   Object.assign(normalized.rows[0], {
-    action: "TRANSFER_IN", currentStock: 0, transferPlanQty: 4, purchaseQty: 0,
-    donors: [{ branchCode: "006", qty: 4 }],
+    action: "TRANSFER_IN", currentStock: 0, targetQty: 6, shortageQty: 6,
+    transferPlanQty: 4, purchaseQty: 2, priorityScore: 30,
+    donors: [{ branchCode: "006", qty: 4 }], flags: ["CHANGED"],
   });
   normalized.summary = { skuCount: 2 };
   normalized.inputGenerations = [{ branchCode: "001", syncRunId: "2" }];
 
-  const comparison = compareStockReaderResults(legacy, normalized, { maxExamples: 3 });
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    maxExamples: 3,
+    activeBranchCodes: ["001", "006"],
+  });
   assert.equal(comparison.matches, false);
   assert.equal(comparison.counts.inputBranchMembership, 1);
   assert.equal(comparison.counts.inputQuantity, 1);
   assert.equal(comparison.counts.inputCost, 1);
   assert.equal(comparison.counts.outputAction, 1);
+  assert.equal(comparison.counts.outputCurrentStock, 1);
+  assert.equal(comparison.counts.outputTargetQuantity, 1);
+  assert.equal(comparison.counts.outputShortageQuantity, 1);
   assert.equal(comparison.counts.outputTransferQuantity, 1);
+  assert.equal(comparison.counts.outputPurchaseQuantity, 1);
   assert.equal(comparison.counts.outputDonorPlan, 1);
+  assert.equal(comparison.counts.outputPriority, 1);
+  assert.equal(comparison.counts.outputFlags, 1);
   assert.equal(comparison.counts.outputSummary, 1);
   assert.equal(comparison.examples.length, 3);
   assert.equal(JSON.stringify(comparison).includes("NEW"), false);
   assert.match(comparison.legacyDigest, /^[0-9a-f]{64}$/);
+});
+
+test("shadow comparator ignores inactive legacy placeholders and aggregate freshness advanced by 002", () => {
+  const activeBranch = {
+    qty: 4,
+    unitCostAvg: 10,
+    sourcePresent: true,
+    generationId: "501",
+    syncedAt: "2026-09-02T01:00:00Z",
+  };
+  const visibleMetadata = {
+    productCode: "P1",
+    productNameThai: "หนึ่ง",
+    productNameEng: "One",
+    barcode: "111",
+    unit: "EA",
+    syncedAt: "2026-09-02T01:00:00Z",
+  };
+  const legacy = {
+    stockRows: [{
+      ...visibleMetadata,
+      syncedAt: "2026-09-03T01:00:00Z",
+      branches: {
+        "001": activeBranch,
+        "002": { qty: 0, unitCostAvg: 0, sourcePresent: true, generationId: "old-002", syncedAt: "2026-09-03T01:00:00Z" },
+        "999": { qty: 8, unitCostAvg: 99, sourcePresent: true, generationId: "old-999", syncedAt: "2020-01-01T00:00:00Z" },
+      },
+    }],
+    rows: [{ productCode: "P1", branchCode: "001", action: "HOLD", donors: [], flags: [] }],
+    summary: { skuCount: 1 },
+    inputGenerations: [
+      { branchCode: "001", syncRunId: "501" },
+      { branchCode: "002", syncRunId: "old-002" },
+      { branchCode: "999", syncRunId: "old-999" },
+    ],
+  };
+  const normalized = {
+    stockRows: [{ ...visibleMetadata, branches: { "001": { ...activeBranch } } }],
+    rows: structuredClone(legacy.rows),
+    summary: structuredClone(legacy.summary),
+    inputGenerations: [{ branchCode: "001", syncRunId: "501" }],
+  };
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    activeBranchCodes: ["001"],
+  });
+  assert.equal(comparison.matches, true);
+  assert.equal(comparison.counts.inputFreshness, 0);
+  assert.equal(Object.values(comparison.counts).every((count) => count === 0), true);
+  assert.equal(comparison.legacyDigest, comparison.normalizedDigest);
+});
+
+test("shadow comparator still reports freshness drift on an active branch", () => {
+  const legacy = {
+    stockRows: [{
+      productCode: "P1", productNameThai: "หนึ่ง", productNameEng: "One",
+      barcode: "111", unit: "EA", syncedAt: "2026-09-02T02:00:00Z",
+      branches: {
+        "001": {
+          qty: 4, unitCostAvg: 10, sourcePresent: true, generationId: "501",
+          syncedAt: "2026-09-02T01:00:00Z",
+        },
+      },
+    }],
+    rows: [{ productCode: "P1", branchCode: "001", action: "HOLD", donors: [], flags: [] }],
+    summary: { skuCount: 1 },
+    inputGenerations: [{ branchCode: "001", syncRunId: "501" }],
+  };
+  const normalized = structuredClone(legacy);
+  normalized.stockRows[0].branches["001"].syncedAt = "2026-09-02T02:00:00Z";
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    activeBranchCodes: ["001"],
+  });
+  assert.equal(comparison.matches, false);
+  assert.equal(comparison.counts.inputFreshness, 1);
+  assert.notEqual(comparison.legacyDigest, comparison.normalizedDigest);
+  assert.ok(comparison.examples.some((example) => (
+    example.kind === "inputFreshness" && example.branchCode === "001"
+  )));
+});
+
+test("shadow comparator still reports an actually active branch missing from normalized stock", () => {
+  const legacy = {
+    stockRows: [{
+      productCode: "P1", productNameThai: "หนึ่ง", productNameEng: "One",
+      barcode: "111", unit: "EA", syncedAt: "2026-09-02T01:00:00Z",
+      branches: {
+        "001": { qty: 1, unitCostAvg: 10, sourcePresent: true, generationId: "501", syncedAt: "2026-09-02T01:00:00Z" },
+        "003": { qty: 2, unitCostAvg: 10, sourcePresent: true, generationId: "503", syncedAt: "2026-09-02T01:00:00Z" },
+      },
+    }],
+    rows: [],
+    summary: {},
+    inputGenerations: [{ branchCode: "001", syncRunId: "501" }, { branchCode: "003", syncRunId: "503" }],
+  };
+  const normalized = structuredClone(legacy);
+  delete normalized.stockRows[0].branches["003"];
+  normalized.inputGenerations = [{ branchCode: "001", syncRunId: "501" }];
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    activeBranchCodes: ["001", "003"],
+  });
+  assert.equal(comparison.matches, false);
+  assert.equal(comparison.counts.inputBranchMembership, 1);
+  assert.ok(comparison.counts.inputGeneration >= 1);
+  assert.ok(comparison.examples.some((example) => example.branchCode === "003"));
 });
 
 test("shadow sampling requires an explicit rate and is deterministic for an evidence token", () => {
