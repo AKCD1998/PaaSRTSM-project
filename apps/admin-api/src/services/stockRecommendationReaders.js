@@ -169,6 +169,67 @@ async function loadNormalizedActiveBranches(db, { legacyBranchCodes = [] } = {})
   }));
 }
 
+function mapLegacyCompatibleProductMetadata(row) {
+  const productCode = String(row.product_code);
+  return {
+    productCode,
+    productNameThai: row.product_name_thai || productCode,
+    productNameEng: row.product_name_eng || productCode,
+    barcode: row.barcode || null,
+    unit: row.unit || null,
+  };
+}
+
+// WP3 moves only branch stock state to ada.branch_stock_current. Until the
+// product-master writer is separately migrated, the wide snapshot remains the
+// canonical compatibility source for the metadata users already see. Keep the
+// same fallback order as the unchanged legacy reader, while deliberately
+// selecting no quantity, cost, freshness, or generation columns here.
+async function loadLegacyCompatibleProductMetadataByProduct(db, options = {}) {
+  const productCodes = [...new Set((options.productCodes || []).map(String))].sort();
+  if (productCodes.length === 0) return new Map();
+  const search = String(options.search || "").trim();
+  const result = await db.query(
+    `
+      WITH candidates(product_code) AS (SELECT unnest($1::text[]))
+      SELECT
+        candidates.product_code,
+        COALESCE(NULLIF(bs.product_name_thai, ''), NULLIF(p.product_name_th, ''), NULLIF(bs.product_name_eng, ''), NULLIF(p.product_name, ''), candidates.product_code) AS product_name_thai,
+        COALESCE(NULLIF(bs.product_name_eng, ''), NULLIF(p.product_name, ''), NULLIF(bs.product_name_thai, ''), NULLIF(p.product_name_th, ''), candidates.product_code) AS product_name_eng,
+        COALESCE(bs.barcode, pb.barcode, '') AS barcode,
+        COALESCE(bs.unit, p.unit_small, p.unit_medium, p.unit_large, '') AS unit
+      FROM candidates
+      LEFT JOIN ada.branch_stock_snapshots bs
+        ON bs.product_code = candidates.product_code
+      LEFT JOIN ada.products p
+        ON p.product_code = candidates.product_code
+      LEFT JOIN LATERAL (
+        SELECT barcode
+        FROM ada.product_barcodes pb
+        WHERE pb.product_code = candidates.product_code
+        ORDER BY
+          CASE pb.barcode_role
+            WHEN 'primary' THEN 0
+            ELSE 1
+          END,
+          pb.updated_at DESC,
+          pb.barcode ASC
+        LIMIT 1
+      ) pb ON TRUE
+      WHERE $2::text = ''
+         OR candidates.product_code ILIKE '%' || $2 || '%'
+         OR COALESCE(bs.product_name_thai, p.product_name_th, bs.product_name_eng, p.product_name, '') ILIKE '%' || $2 || '%'
+         OR COALESCE(bs.barcode, pb.barcode, '') ILIKE '%' || $2 || '%'
+      ORDER BY candidates.product_code ASC
+    `,
+    [productCodes, search],
+  );
+  return new Map(result.rows.map((row) => {
+    const metadata = mapLegacyCompatibleProductMetadata(row);
+    return [metadata.productCode, metadata];
+  }));
+}
+
 function legacyTraceColumnsSql() {
   return Object.values(LEGACY_BRANCH_COLUMNS)
     .flatMap((columns) => [`bs.${columns.generation}`, `bs.${columns.freshness}`])
@@ -242,11 +303,7 @@ async function loadLegacyCurrentStockByProduct(db, { productCodes, includeTrace 
       if (generationId) productGenerations.set(`${row.product_code}|${branchCode}`, generationId);
     }
     return {
-      productCode: String(row.product_code),
-      productNameThai: row.product_name_thai || row.product_code,
-      productNameEng: row.product_name_eng || row.product_code,
-      barcode: row.barcode || null,
-      unit: row.unit || null,
+      ...mapLegacyCompatibleProductMetadata(row),
       // Preserve the pg driver value used by the existing engine/response.
       syncedAt: row.synced_at || null,
       branches,
@@ -446,31 +503,19 @@ async function loadNormalizedCandidateProductCodes(db, options = {}) {
       FROM ada.branch_stock_current current
       JOIN unnest($1::text[], $2::bigint[]) AS eligible(branch_code, sync_run_id)
         ON eligible.branch_code = current.branch_code
-      LEFT JOIN ada.products product
-        ON product.product_code = current.product_code
-      LEFT JOIN LATERAL (
-        SELECT barcode
-        FROM ada.product_barcodes candidate
-        WHERE candidate.product_code = current.product_code
-        ORDER BY CASE candidate.barcode_role WHEN 'primary' THEN 0 ELSE 1 END,
-          candidate.updated_at DESC, candidate.barcode ASC
-        LIMIT 1
-      ) barcode ON TRUE
-      WHERE (
-          (current.last_full_sync_run_id = eligible.sync_run_id AND current.qty > 0)
-          OR $3::text <> ''
-        )
-        AND (
-          $3::text = ''
-          OR current.product_code ILIKE '%' || $3 || '%'
-          OR COALESCE(product.product_name_th, product.product_name, '') ILIKE '%' || $3 || '%'
-          OR COALESCE(barcode.barcode, '') ILIKE '%' || $3 || '%'
-        )
+      WHERE (current.last_full_sync_run_id = eligible.sync_run_id AND current.qty > 0)
+         OR $3::text <> ''
       ORDER BY current.product_code
     `,
     [activeBranchCodes, generationIds, search],
   );
-  return result.rows.map((row) => String(row.product_code));
+  const candidateProductCodes = result.rows.map((row) => String(row.product_code));
+  if (!search || candidateProductCodes.length === 0) return candidateProductCodes;
+  const matchingMetadata = await loadLegacyCompatibleProductMetadataByProduct(db, {
+    productCodes: candidateProductCodes,
+    search,
+  });
+  return candidateProductCodes.filter((productCode) => matchingMetadata.has(productCode));
 }
 
 async function loadNormalizedCurrentStockByProduct(db, options = {}) {
@@ -497,10 +542,6 @@ async function loadNormalizedCurrentStockByProduct(db, options = {}) {
       )
       SELECT
         candidates.product_code,
-        COALESCE(NULLIF(product.product_name_th, ''), NULLIF(product.product_name, ''), candidates.product_code) AS product_name_thai,
-        COALESCE(NULLIF(product.product_name, ''), NULLIF(product.product_name_th, ''), candidates.product_code) AS product_name_eng,
-        barcode.barcode,
-        COALESCE(product.unit_small, product.unit_medium, product.unit_large, '') AS unit,
         eligible.branch_code,
         eligible.sync_run_id AS eligible_sync_run_id,
         current.product_code AS stock_product_code,
@@ -510,16 +551,6 @@ async function loadNormalizedCurrentStockByProduct(db, options = {}) {
         current.last_full_sync_run_id
       FROM candidates
       CROSS JOIN eligible
-      LEFT JOIN ada.products product
-        ON product.product_code = candidates.product_code
-      LEFT JOIN LATERAL (
-        SELECT candidate.barcode
-        FROM ada.product_barcodes candidate
-        WHERE candidate.product_code = candidates.product_code
-        ORDER BY CASE candidate.barcode_role WHEN 'primary' THEN 0 ELSE 1 END,
-          candidate.updated_at DESC, candidate.barcode ASC
-        LIMIT 1
-      ) barcode ON TRUE
       LEFT JOIN ada.branch_stock_current current
         ON current.product_code = candidates.product_code
        AND current.branch_code = eligible.branch_code
@@ -528,6 +559,7 @@ async function loadNormalizedCurrentStockByProduct(db, options = {}) {
     `,
     [productCodes, activeBranchCodes, generationIds],
   );
+  const metadataByProduct = await loadLegacyCompatibleProductMetadataByProduct(db, { productCodes });
 
   const byProduct = new Map();
   const productGenerations = new Map();
@@ -535,12 +567,15 @@ async function loadNormalizedCurrentStockByProduct(db, options = {}) {
     const productCode = String(row.product_code);
     let stockRow = byProduct.get(productCode);
     if (!stockRow) {
-      stockRow = {
+      const metadata = metadataByProduct.get(productCode) || {
         productCode,
-        productNameThai: row.product_name_thai || productCode,
-        productNameEng: row.product_name_eng || productCode,
-        barcode: row.barcode || null,
-        unit: row.unit || null,
+        productNameThai: productCode,
+        productNameEng: productCode,
+        barcode: null,
+        unit: null,
+      };
+      stockRow = {
+        ...metadata,
         syncedAt: null,
         branches: {},
       };
@@ -587,11 +622,13 @@ function rowKey(row) {
   return `${row.productCode}|${row.branchCode}`;
 }
 
-function normalizedDonors(donors) {
-  return (donors || []).map((donor) => ({
-    branchCode: donor.branchCode,
-    qty: numberOrZero(donor.qty ?? donor.transferQty ?? donor.availableQty),
-  }));
+function normalizedDonors(donors, activeBranchSet = null) {
+  return (donors || [])
+    .filter((donor) => !activeBranchSet || activeBranchSet.has(String(donor.branchCode)))
+    .map((donor) => ({
+      branchCode: donor.branchCode,
+      qty: numberOrZero(donor.qty ?? donor.transferQty ?? donor.availableQty),
+    }));
 }
 
 function compareStockReaderResults(legacy, normalized, options = {}) {
@@ -622,6 +659,10 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     outputSummary: 0,
   };
   const examples = [];
+  const activeBranchCodes = Array.isArray(options.activeBranchCodes)
+    ? [...new Set(options.activeBranchCodes.map(String))].sort()
+    : null;
+  const activeBranchSet = activeBranchCodes ? new Set(activeBranchCodes) : null;
   const addExample = (kind, productCode = null, branchCode = null) => {
     if (examples.length < maxExamples) examples.push({ kind, productCode, branchCode });
   };
@@ -643,14 +684,22 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
         addExample(countKey, productCode);
       }
     }
-    if (timestampOrNull(oldProduct.syncedAt) !== timestampOrNull(newProduct.syncedAt)) {
+    // The product-level legacy timestamp can be advanced by an inactive wide
+    // branch. Once the caller supplies an active scope, per-branch timestamps
+    // below are the complete freshness contract for that comparison.
+    if (
+      !activeBranchCodes
+      && timestampOrNull(oldProduct.syncedAt) !== timestampOrNull(newProduct.syncedAt)
+    ) {
       counts.inputFreshness += 1;
       addExample("inputFreshness", productCode);
     }
 
     const oldBranches = oldProduct.branches || {};
     const newBranches = newProduct.branches || {};
-    for (const branchCode of new Set([...Object.keys(oldBranches), ...Object.keys(newBranches)])) {
+    const branchCodes = activeBranchCodes
+      || [...new Set([...Object.keys(oldBranches), ...Object.keys(newBranches)])].sort();
+    for (const branchCode of branchCodes) {
       const oldBranch = oldBranches[branchCode] || {};
       const newBranch = newBranches[branchCode] || {};
       if (Boolean(oldBranch.sourcePresent) !== Boolean(newBranch.sourcePresent)) {
@@ -676,8 +725,9 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     }
   }
 
-  const oldRows = new Map((legacy.rows || []).map((row) => [rowKey(row), row]));
-  const newRows = new Map((normalized.rows || []).map((row) => [rowKey(row), row]));
+  const inActiveScope = (row) => !activeBranchSet || activeBranchSet.has(String(row.branchCode));
+  const oldRows = new Map((legacy.rows || []).filter(inActiveScope).map((row) => [rowKey(row), row]));
+  const newRows = new Map((normalized.rows || []).filter(inActiveScope).map((row) => [rowKey(row), row]));
   for (const key of new Set([...oldRows.keys(), ...newRows.keys()])) {
     const oldRow = oldRows.get(key);
     const newRow = newRows.get(key);
@@ -705,7 +755,10 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
         addExample(countKey, productCode, branchCode);
       }
     }
-    if (stableJson(normalizedDonors(oldRow.donors)) !== stableJson(normalizedDonors(newRow.donors))) {
+    if (
+      stableJson(normalizedDonors(oldRow.donors, activeBranchSet))
+      !== stableJson(normalizedDonors(newRow.donors, activeBranchSet))
+    ) {
       counts.outputDonorPlan += 1;
       addExample("outputDonorPlan", productCode, branchCode);
     }
@@ -728,7 +781,9 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     item.branchCode,
     String(item.syncRunId),
   ]));
-  for (const branchCode of new Set([...oldGenerations.keys(), ...newGenerations.keys()])) {
+  const generationBranchCodes = activeBranchCodes
+    || [...new Set([...oldGenerations.keys(), ...newGenerations.keys()])].sort();
+  for (const branchCode of generationBranchCodes) {
     if (oldGenerations.get(branchCode) !== newGenerations.get(branchCode)) {
       counts.inputGeneration += 1;
       addExample("inputGeneration", null, branchCode);
@@ -736,10 +791,26 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
   }
 
   const comparable = (dataset) => ({
-    stockRows: dataset.stockRows,
-    rows: dataset.rows,
+    stockRows: (dataset.stockRows || []).map((row) => {
+      if (!activeBranchCodes) return { ...row, branches: row.branches };
+      const { syncedAt: ignoredAggregateFreshness, ...scopedRow } = row;
+      return {
+        ...scopedRow,
+        branches: Object.fromEntries(activeBranchCodes
+          .filter((branchCode) => Object.hasOwn(row.branches || {}, branchCode))
+          .map((branchCode) => [branchCode, row.branches[branchCode]])),
+      };
+    }),
+    rows: (dataset.rows || []).filter(inActiveScope).map((row) => ({
+      ...row,
+      donors: activeBranchSet
+        ? (row.donors || []).filter((donor) => activeBranchSet.has(String(donor.branchCode)))
+        : row.donors,
+    })),
     summary: dataset.summary,
-    inputGenerations: dataset.inputGenerations,
+    inputGenerations: activeBranchSet
+      ? (dataset.inputGenerations || []).filter((item) => activeBranchSet.has(String(item.branchCode)))
+      : dataset.inputGenerations,
   });
   return {
     matches: Object.values(counts).every((count) => count === 0),
@@ -882,6 +953,7 @@ module.exports = {
   createInputUnavailableError,
   loadNormalizedActiveBranches,
   loadLegacyCurrentStockByProduct,
+  loadLegacyCompatibleProductMetadataByProduct,
   loadNormalizedGenerationEvidence,
   loadNormalizedCandidateProductCodes,
   loadNormalizedCurrentStockByProduct,

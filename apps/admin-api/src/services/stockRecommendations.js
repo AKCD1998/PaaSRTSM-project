@@ -1656,6 +1656,7 @@ async function persistShadowSuccess({
       summary: buildListSummary(normalizedDataset.rows),
       inputGenerations: normalizedDataset.inputGenerations,
     },
+    { activeBranchCodes: normalizedDataset.scope.activeBranchCodes },
   );
   await persistReaderComparison(db, {
     comparisonId,
@@ -1808,6 +1809,7 @@ async function computeShadowRecommendationDataset(
           summary: buildListSummary(normalizedDataset.rows),
           inputGenerations: normalizedDataset.inputGenerations,
         },
+        { activeBranchCodes: normalizedDataset.scope.activeBranchCodes },
       );
     }
     const legacyDataset = servedLegacyDataset || comparisonLegacyDataset;

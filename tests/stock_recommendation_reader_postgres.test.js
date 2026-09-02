@@ -102,6 +102,13 @@ async function resetSchema(targetPool = pool) {
       barcode_role text,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE ada.branch_stock_snapshots (
+      product_code text PRIMARY KEY,
+      product_name_thai text,
+      product_name_eng text,
+      barcode text,
+      unit text
+    );
     CREATE TABLE ada.branch_stock_current (
       product_code text NOT NULL,
       branch_code text NOT NULL,
@@ -226,8 +233,16 @@ async function seedEligibleBranches() {
       ('PINACTIVE', 'ไม่ใช้งาน', 'Inactive', 'EA', 'inactive'),
       ('PRETIRED', 'เลิกใช้', 'Retired', 'EA', '1');
     INSERT INTO ada.product_barcodes (product_code, barcode, barcode_role) VALUES
-      ('PZERO', '111', 'primary'),
-      ('PNEG', '222', 'primary');
+      ('PZERO', 'MASTER111', 'primary'),
+      ('PNEG', 'MASTER222', 'primary');
+    INSERT INTO ada.branch_stock_snapshots (
+      product_code, product_name_thai, product_name_eng, barcode, unit
+    ) VALUES
+      ('PZERO', 'ศูนย์จาก wide', 'Zero from wide', 'WIDE111', 'กล่อง'),
+      ('PNEG', 'ติดลบจาก wide', 'Negative from wide', 'WIDE222', 'ขวด'),
+      ('ABSENT', 'ไม่มีจาก wide', 'Absent from wide', 'WIDE333', 'ชิ้น'),
+      ('PINACTIVE', 'ไม่ใช้งานจาก wide', 'Inactive from wide', 'WIDE444', 'แพ็ก'),
+      ('PRETIRED', 'เลิกใช้จาก wide', 'Retired from wide', 'WIDE555', 'หลอด');
     INSERT INTO ingest.sync_runs (
       sync_run_id, branch_code, status, ingestion_mode, snapshot_mode,
       handoff_status, apply_status, finalized_at, finished_at
@@ -353,7 +368,12 @@ integration("REAL POSTGRES: branch expansion, eligibility, and normalized loader
   assert.deepEqual(await loadNormalizedCandidateProductCodes(pool, {
     activeBranchCodes: ["001", "006"],
     generationByBranch: evidence.generationByBranch,
-    search: "Zero",
+    search: "ศูนย์จาก wide",
+  }), ["PZERO"]);
+  assert.deepEqual(await loadNormalizedCandidateProductCodes(pool, {
+    activeBranchCodes: ["001", "006"],
+    generationByBranch: evidence.generationByBranch,
+    search: "WIDE111",
   }), ["PZERO"]);
   assert.deepEqual(await loadNormalizedCandidateProductCodes(pool, {
     activeBranchCodes: ["001", "006"],
@@ -361,7 +381,14 @@ integration("REAL POSTGRES: branch expansion, eligibility, and normalized loader
     search: "Retired",
   }), ["PRETIRED"]);
 
-  const loaded = await loadNormalizedCurrentStockByProduct(pool, {
+  const observedSql = [];
+  const observedPool = {
+    async query(...args) {
+      observedSql.push(String(args[0]).replace(/\s+/g, " ").trim().toLowerCase());
+      return pool.query(...args);
+    },
+  };
+  const loaded = await loadNormalizedCurrentStockByProduct(observedPool, {
     productCodes: ["PZERO", "PNEG", "ABSENT", "PINACTIVE", "PRETIRED"],
     activeBranchCodes: ["001", "006"],
     generationByBranch: evidence.generationByBranch,
@@ -374,6 +401,10 @@ integration("REAL POSTGRES: branch expansion, eligibility, and normalized loader
   assert.equal(zero.branches["001"].sourcePresent, true);
   assert.equal(zero.branches["001"].qty, 0);
   assert.equal(zero.branches["001"].unitCostAvg, null);
+  assert.deepEqual(
+    [zero.productNameThai, zero.productNameEng, zero.barcode, zero.unit],
+    ["ศูนย์จาก wide", "Zero from wide", "WIDE111", "กล่อง"],
+  );
   assert.equal(negative.branches["006"].qty, -3);
   assert.equal(negative.branches["006"].unitCostAvg, 0);
   assert.equal(absent.branches["001"].sourcePresent, false);
@@ -382,6 +413,14 @@ integration("REAL POSTGRES: branch expansion, eligibility, and normalized loader
   assert.equal(inactive.branches["001"].qty, 4);
   assert.equal(retired.branches["001"].sourcePresent, false);
   assert.equal(retired.branches["001"].qty, 0);
+  const stockSql = observedSql.find((sql) => sql.includes("left join ada.branch_stock_current current"));
+  const metadataSql = observedSql.find((sql) => sql.includes("left join ada.branch_stock_snapshots bs"));
+  assert.ok(stockSql);
+  assert.equal(stockSql.includes("qty_branch_"), false);
+  assert.equal(stockSql.includes("branch_stock_snapshots"), false);
+  assert.ok(metadataSql);
+  assert.equal(metadataSql.includes("qty_branch_"), false);
+  assert.equal(metadataSql.includes("branch_stock_current"), false);
 });
 
 integration("REAL POSTGRES: reconciliation mismatch makes the normalized generation ineligible", async () => {

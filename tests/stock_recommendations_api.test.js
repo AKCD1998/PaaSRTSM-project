@@ -49,6 +49,7 @@ function createMockDb() {
     precomputedEnabled: false,
     expiredComparisonCount: 0,
     comparisonLinks: [],
+    comparisonRecords: [],
     normalizedCandidateParams: null,
     normalizedLoaderParams: null,
     activeBranches: [
@@ -95,7 +96,7 @@ function createMockDb() {
         cost_avg_branch_000: null,
         cost_avg_branch_001: 5,
         cost_avg_branch_002: null,
-        cost_avg_branch_003: null,
+        cost_avg_branch_003: 0,
         cost_avg_branch_004: null,
         cost_avg_branch_005: null,
         synced_at: "2026-07-12T01:00:00.000Z",
@@ -115,7 +116,7 @@ function createMockDb() {
         cost_avg_branch_000: null,
         cost_avg_branch_001: 12,
         cost_avg_branch_002: null,
-        cost_avg_branch_003: null,
+        cost_avg_branch_003: 0,
         cost_avg_branch_004: null,
         cost_avg_branch_005: null,
         synced_at: "2026-07-12T01:00:00.000Z",
@@ -146,6 +147,15 @@ function createMockDb() {
       donors_json: [],
     },
   };
+
+  for (const stockRow of state.stockRows) {
+    Object.assign(stockRow, {
+      full_sync_run_id_branch_001: "201",
+      full_sync_run_id_branch_003: "203",
+      synced_at_branch_001: stockRow.synced_at,
+      synced_at_branch_003: stockRow.synced_at,
+    });
+  }
 
   state.normalizedRows = state.stockRows.flatMap((stockRow) => (
     ["001", "003"].map((branchCode) => ({
@@ -189,6 +199,7 @@ function createMockDb() {
       }
       if (normalized.startsWith("insert into ordering.stock_recommendation_reader_comparisons")) {
         if (state.comparisonPersistenceFails) throw new Error("synthetic persistence failure");
+        state.comparisonRecords.push(params);
         return { rowCount: 1, rows: [] };
       }
       if (normalized.startsWith("delete from ordering.stock_recommendation_reader_comparisons")) {
@@ -259,32 +270,25 @@ function createMockDb() {
           normalizedVsWide: { matches: true },
           normalizedVsWideRows: { mismatchCount: 0 },
         };
+        const rows = state.activeBranches.map((branch) => {
+          const branchCode = String(branch.branch_code);
+          const syncRunId = String(200 + Number(branchCode));
+          return {
+            branch_code: branchCode, sync_run_id: syncRunId, run_status: "success",
+            ingestion_mode: "hybrid_v2", snapshot_mode: "full",
+            handoff_status: "success", apply_status: "applied",
+            finalized_at: "2026-07-12T01:01:00.000Z", finished_at: "2026-07-12T01:01:00.000Z",
+            retirement_status: "done", expected_membership_count: state.stockRows.length,
+            actual_membership_count: state.stockRows.length,
+            reconciliation_status: branchCode === "003" ? state.reconciliationStatus003 : "pass",
+            mismatch_summary: mismatchSummary, generation_row_count: state.stockRows.length,
+            min_stock_synced_at: "2026-07-12T01:00:00.000Z",
+            max_stock_synced_at: "2026-07-12T01:00:00.000Z",
+          };
+        });
         return {
-          rowCount: 2,
-          rows: [
-            {
-              branch_code: "001", sync_run_id: "201", run_status: "success",
-              ingestion_mode: "hybrid_v2", snapshot_mode: "full",
-              handoff_status: "success", apply_status: "applied",
-              finalized_at: "2026-07-12T01:01:00.000Z", finished_at: "2026-07-12T01:01:00.000Z",
-              retirement_status: "done", expected_membership_count: 3,
-              actual_membership_count: 3, reconciliation_status: "pass",
-              mismatch_summary: mismatchSummary, generation_row_count: 3,
-              min_stock_synced_at: "2026-07-12T01:00:00.000Z",
-              max_stock_synced_at: "2026-07-12T01:00:00.000Z",
-            },
-            {
-              branch_code: "003", sync_run_id: "203", run_status: "success",
-              ingestion_mode: "hybrid_v2", snapshot_mode: "full",
-              handoff_status: "success", apply_status: "applied",
-              finalized_at: "2026-07-12T01:01:00.000Z", finished_at: "2026-07-12T01:01:00.000Z",
-              retirement_status: "done", expected_membership_count: 3,
-              actual_membership_count: 3, reconciliation_status: state.reconciliationStatus003,
-              mismatch_summary: mismatchSummary, generation_row_count: 3,
-              min_stock_synced_at: "2026-07-12T01:00:00.000Z",
-              max_stock_synced_at: "2026-07-12T01:00:00.000Z",
-            },
-          ],
+          rowCount: rows.length,
+          rows,
         };
       }
 
@@ -388,6 +392,29 @@ function createMockDb() {
         const rows = state.stockRows
           .filter((row) => branchMatches.some((branchCode) => Number(row[`qty_branch_${branchCode}`] || 0) > 0))
           .map((row) => ({ product_code: row.product_code }));
+        return { rowCount: rows.length, rows };
+      }
+
+      if (
+        normalized.includes("with candidates(product_code) as")
+        && normalized.includes("left join ada.branch_stock_snapshots bs")
+        && !normalized.includes("branch_stock_current")
+      ) {
+        const productCodes = Array.isArray(params[0]) ? params[0] : [];
+        const search = String(params[1] || "").toLowerCase();
+        const rows = state.stockRows.filter((row) => {
+          if (!productCodes.includes(row.product_code)) return false;
+          if (!search) return true;
+          return [row.product_code, row.product_name_thai, row.product_name_eng, row.barcode]
+            .filter(Boolean)
+            .some((value) => String(value).toLowerCase().includes(search));
+        }).map((row) => ({
+          product_code: row.product_code,
+          product_name_thai: row.product_name_thai,
+          product_name_eng: row.product_name_eng,
+          barcode: row.barcode,
+          unit: row.unit,
+        }));
         return { rowCount: rows.length, rows };
       }
 
@@ -619,7 +646,7 @@ test("normalized reader fails closed with bounded 503 evidence and never queries
   assert.ok(db.state.queryLog.includes("rollback"));
 });
 
-test("normalized reader serves only normalized rows and traces every input generation", async () => {
+test("normalized reader serves current-table stock with legacy-compatible visible metadata and traces every generation", async () => {
   const { app, db } = createTestApp({
     stockRecommendationReaderMode: "normalized",
     stockRecommendationMaxStockAgeHours: 10000,
@@ -636,8 +663,25 @@ test("normalized reader serves only normalized rows and traces every input gener
     [["001", "201"], ["003", "203"]],
   );
   assert.equal(response.body.meta.reader.sourceSnapshot, "100:100:");
-  assert.equal(db.state.queryLog.some((sql) => sql.includes("from ada.branch_stock_snapshots bs")), false);
-  assert.ok(db.state.queryLog.some((sql) => sql.includes("from ada.branch_stock_current current")));
+  const p1 = response.body.rows.find((row) => row.productCode === "P1");
+  assert.deepEqual(
+    [p1.productNameThai, p1.productNameEng, p1.barcode, p1.unit],
+    ["สินค้าตัวที่หนึ่ง", "Product One", "111", "ชิ้น"],
+  );
+  const stockSql = db.state.queryLog.find((sql) => (
+    sql.includes("with candidates(product_code) as")
+    && sql.includes("left join ada.branch_stock_current current")
+  ));
+  const metadataSql = db.state.queryLog.find((sql) => (
+    sql.includes("with candidates(product_code) as")
+    && sql.includes("left join ada.branch_stock_snapshots bs")
+  ));
+  assert.ok(stockSql);
+  assert.equal(stockSql.includes("qty_branch_"), false);
+  assert.equal(stockSql.includes("branch_stock_snapshots"), false);
+  assert.ok(metadataSql);
+  assert.equal(metadataSql.includes("qty_branch_"), false);
+  assert.equal(metadataSql.includes("branch_stock_current"), false);
   assert.ok(db.state.queryLog.includes("commit"));
 });
 
@@ -719,7 +763,10 @@ test("shadow refresh compares one snapshot and atomically links evidence to the 
   });
   assert.equal(result.source, "live_to_snapshot");
   assert.equal(result.reader.servedReader, "legacy");
+  assert.equal(result.reader.comparisonStatus, "match");
   assert.equal(result.reader.evidencePersisted, true);
+  assert.deepEqual(db.state.comparisonRecords[0][4], ["001", "003"]);
+  assert.equal(db.state.comparisonRecords[0][4].includes("002"), false);
   assert.equal(result.expiredComparisonCount, 2);
   assert.equal(result.shadowEvidenceLinked, true);
   assert.equal(db.state.comparisonLinks.length, 1);
@@ -752,24 +799,39 @@ test("legacy refresh still prunes expired shadow evidence after shadow is disabl
   )), false);
 });
 
-test("normalized canary selects one branch, bounds stock candidates to that scope, and keeps donor loading global", async () => {
+test("normalized canary selects only 004, bounds candidates to 004, and leaves other branches on legacy", async () => {
   const { app, db } = createTestApp({
     stockRecommendationReaderMode: "normalized",
     stockRecommendationMaxStockAgeHours: 10000,
-    stockRecommendationNormalizedCanaryBranches: ["001"],
+    stockRecommendationNormalizedCanaryBranches: ["004"],
   });
+  const branch004 = { branch_code: "004", branch_name: "Branch 004", is_active: true, is_hq: false };
+  db.state.activeBranches.push(branch004);
+  db.state.branchLookup.set("004", branch004);
+  for (const stockRow of db.state.stockRows) {
+    db.state.normalizedRows.push({
+      product_code: stockRow.product_code,
+      branch_code: "004",
+      eligible_sync_run_id: "204",
+      stock_product_code: stockRow.product_code,
+      qty: stockRow.qty_branch_004,
+      cost_avg: stockRow.cost_avg_branch_004,
+      synced_at: stockRow.synced_at,
+      last_full_sync_run_id: "204",
+    });
+  }
   const agent = request.agent(app);
   await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
 
-  const selected = await agent.get("/api/admin/stock-recommendations?branchCode=001&pageSize=20");
+  const selected = await agent.get("/api/admin/stock-recommendations?branchCode=004&pageSize=20");
   assert.equal(selected.status, 200);
   assert.equal(selected.body.meta.reader.servedReader, "normalized");
-  assert.deepEqual(db.state.normalizedCandidateParams[0], ["001"]);
-  assert.deepEqual(db.state.normalizedLoaderParams[1], ["001", "003"]);
+  assert.deepEqual(db.state.normalizedCandidateParams[0], ["004"]);
+  assert.deepEqual(db.state.normalizedLoaderParams[1], ["001", "003", "004"]);
 
   db.state.queryLog.length = 0;
   db.state.precomputedEnabled = true;
-  const outside = await agent.get("/api/admin/stock-recommendations?branchCode=all&pageSize=20");
+  const outside = await agent.get("/api/admin/stock-recommendations?branchCode=001&pageSize=20");
   assert.equal(outside.status, 200);
   assert.equal(outside.body.meta.reader.servedReader, "legacy");
   assert.equal(outside.body.meta.reader.selectionStatus, "outside_canary");
