@@ -784,6 +784,39 @@ test("shadow refresh compares one snapshot and atomically links evidence to the 
   assert.ok(compareCommit >= 0 && compareCommit < snapshotInsert && snapshotInsert < evidenceLink);
 });
 
+test("shadow refresh does not persist a false mismatch for a stale active-branch wide placeholder", async () => {
+  const db = createMockDb();
+  const legacyPlaceholder = db.state.stockRows.find((row) => row.product_code === "P3");
+  legacyPlaceholder.full_sync_run_id_branch_003 = "202";
+  legacyPlaceholder.synced_at_branch_003 = "2026-07-11T01:00:00.000Z";
+  const normalizedPlaceholder = db.state.normalizedRows.find((row) => (
+    row.product_code === "P3" && row.branch_code === "003"
+  ));
+  Object.assign(normalizedPlaceholder, {
+    stock_product_code: null,
+    qty: null,
+    cost_avg: null,
+    synced_at: null,
+    last_full_sync_run_id: null,
+  });
+
+  const result = await refreshStockRecommendationSnapshots(db, {
+    targetDays: 90,
+    config: {
+      stockRecommendationReaderMode: "shadow",
+      stockRecommendationMaxStockAgeHours: 10000,
+      stockRecommendationShadowSampleRate: 1,
+      stockRecommendationShadowRetentionDays: 7,
+    },
+  });
+
+  assert.equal(result.reader.comparisonStatus, "match");
+  assert.equal(db.state.comparisonRecords[0][3], "match");
+  assert.equal(db.state.comparisonRecords[0][5], db.state.comparisonRecords[0][6]);
+  const mismatchCounts = JSON.parse(db.state.comparisonRecords[0][7]);
+  assert.equal(Object.values(mismatchCounts).every((count) => count === 0), true);
+});
+
 test("legacy refresh still prunes expired shadow evidence after shadow is disabled", async () => {
   const db = createMockDb();
   db.state.expiredComparisonCount = 3;

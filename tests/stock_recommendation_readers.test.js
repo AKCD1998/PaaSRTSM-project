@@ -461,6 +461,183 @@ test("shadow comparator ignores inactive legacy placeholders and aggregate fresh
   assert.equal(comparison.legacyDigest, comparison.normalizedDigest);
 });
 
+test("scoped shadow comparison treats stale wide placeholders as absent from the accepted generation", () => {
+  const legacy = {
+    stockRows: [{
+      productCode: "P1",
+      productNameThai: "หนึ่ง",
+      productNameEng: "One",
+      barcode: "111",
+      unit: "EA",
+      syncedAt: "2026-09-03T01:00:00Z",
+      branches: {
+        "001": {
+          qty: 0,
+          unitCostAvg: 25,
+          sourcePresent: true,
+          generationId: "500",
+          syncedAt: "2026-09-02T01:00:00Z",
+        },
+      },
+    }],
+    rows: [],
+    summary: {},
+    inputGenerations: [{ branchCode: "001", syncRunId: "mixed" }],
+  };
+  const normalized = {
+    stockRows: [{
+      productCode: "P1",
+      productNameThai: "หนึ่ง",
+      productNameEng: "One",
+      barcode: "111",
+      unit: "EA",
+      syncedAt: null,
+      branches: {
+        "001": {
+          qty: 0,
+          unitCostAvg: null,
+          sourcePresent: false,
+          generationId: null,
+          syncedAt: null,
+        },
+      },
+    }],
+    rows: [],
+    summary: {},
+    inputGenerations: [{ branchCode: "001", syncRunId: "501" }],
+  };
+
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    activeBranchCodes: ["001"],
+    acceptedGenerationByBranch: new Map([["001", "501"]]),
+  });
+
+  assert.equal(comparison.matches, true);
+  assert.equal(comparison.counts.inputBranchMembership, 0);
+  assert.equal(comparison.counts.inputCost, 0);
+  assert.equal(comparison.counts.inputFreshness, 0);
+  assert.equal(comparison.counts.inputGeneration, 0);
+  assert.equal(comparison.legacyDigest, comparison.normalizedDigest);
+});
+
+test("scoped shadow comparison preserves genuine zero-stock membership in the accepted generation", () => {
+  const stockRow = {
+    productCode: "ZERO",
+    productNameThai: "ศูนย์",
+    productNameEng: "Zero",
+    barcode: "000",
+    unit: "EA",
+    syncedAt: "2026-09-03T01:00:00Z",
+    branches: {
+      "001": {
+        qty: 0,
+        unitCostAvg: 10,
+        sourcePresent: true,
+        generationId: "501",
+        syncedAt: "2026-09-03T01:00:00Z",
+      },
+    },
+  };
+  const dataset = {
+    stockRows: [stockRow],
+    rows: [],
+    summary: {},
+    inputGenerations: [{ branchCode: "001", syncRunId: "501" }],
+  };
+
+  const comparison = compareStockReaderResults(dataset, structuredClone(dataset), {
+    activeBranchCodes: ["001"],
+    acceptedGenerationByBranch: new Map([["001", "501"]]),
+  });
+
+  assert.equal(comparison.matches, true);
+  assert.equal(comparison.counts.inputBranchMembership, 0);
+  assert.equal(comparison.legacyDigest, comparison.normalizedDigest);
+});
+
+test("scoped shadow comparison still reports a genuine accepted-generation membership mismatch", () => {
+  const legacy = {
+    stockRows: [{
+      productCode: "P1",
+      productNameThai: "หนึ่ง",
+      productNameEng: "One",
+      barcode: "111",
+      unit: "EA",
+      syncedAt: "2026-09-03T01:00:00Z",
+      branches: {
+        "001": {
+          qty: 0,
+          unitCostAvg: null,
+          sourcePresent: true,
+          generationId: "501",
+          syncedAt: "2026-09-03T01:00:00Z",
+        },
+      },
+    }],
+    rows: [],
+    summary: {},
+    inputGenerations: [{ branchCode: "001", syncRunId: "501" }],
+  };
+  const normalized = structuredClone(legacy);
+  normalized.stockRows[0].branches["001"] = {
+    qty: 0,
+    unitCostAvg: null,
+    sourcePresent: false,
+    generationId: null,
+    syncedAt: null,
+  };
+
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    activeBranchCodes: ["001"],
+    acceptedGenerationByBranch: new Map([["001", "501"]]),
+  });
+
+  assert.equal(comparison.matches, false);
+  assert.equal(comparison.counts.inputBranchMembership, 1);
+  assert.equal(comparison.counts.inputGeneration, 1);
+  assert.notEqual(comparison.legacyDigest, comparison.normalizedDigest);
+  assert.ok(comparison.examples.some((example) => (
+    example.kind === "inputBranchMembership"
+      && example.productCode === "P1"
+      && example.branchCode === "001"
+  )));
+});
+
+test("unscoped shadow comparison preserves legacy wide-slot membership behavior", () => {
+  const legacy = {
+    stockRows: [{
+      productCode: "P1", productNameThai: "หนึ่ง", productNameEng: "One",
+      barcode: "111", unit: "EA", syncedAt: "2026-09-02T01:00:00Z",
+      branches: {
+        "001": {
+          qty: 0, unitCostAvg: 25, sourcePresent: true, generationId: "500",
+          syncedAt: "2026-09-02T01:00:00Z",
+        },
+      },
+    }],
+    rows: [],
+    summary: {},
+    inputGenerations: [{ branchCode: "001", syncRunId: "mixed" }],
+  };
+  const normalized = structuredClone(legacy);
+  normalized.stockRows[0].branches["001"] = {
+    qty: 0,
+    unitCostAvg: null,
+    sourcePresent: false,
+    generationId: null,
+    syncedAt: null,
+  };
+  normalized.inputGenerations = [{ branchCode: "001", syncRunId: "501" }];
+
+  const comparison = compareStockReaderResults(legacy, normalized, {
+    acceptedGenerationByBranch: new Map([["001", "501"]]),
+  });
+
+  assert.equal(comparison.matches, false);
+  assert.equal(comparison.counts.inputBranchMembership, 1);
+  assert.notEqual(comparison.legacyDigest, comparison.normalizedDigest);
+});
+
 test("shadow comparator still reports freshness drift on an active branch", () => {
   const legacy = {
     stockRows: [{

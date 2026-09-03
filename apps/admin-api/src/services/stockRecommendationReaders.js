@@ -663,6 +663,38 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     ? [...new Set(options.activeBranchCodes.map(String))].sort()
     : null;
   const activeBranchSet = activeBranchCodes ? new Set(activeBranchCodes) : null;
+  const acceptedGenerationByBranch = activeBranchCodes
+    && options.acceptedGenerationByBranch instanceof Map
+    ? new Map([...options.acceptedGenerationByBranch.entries()].map(([branchCode, generationId]) => (
+      [String(branchCode), idOrNull(generationId)]
+    )))
+    : null;
+  // A wide row exists once for the product and therefore materializes every
+  // fixed legacy branch slot. For scoped shadow evidence, membership is the
+  // branch slot's stamp matching that branch's independently accepted current
+  // generation -- not the mere existence of the product-level wide row.
+  // Canonicalizing only the comparison view preserves the Legacy reader and
+  // every user-facing recommendation exactly as served today.
+  const legacyBranchForComparison = (branchCode, branch = {}) => {
+    if (!acceptedGenerationByBranch?.has(branchCode)) return branch;
+    const acceptedGenerationId = acceptedGenerationByBranch.get(branchCode);
+    const belongsToAcceptedGeneration = acceptedGenerationId != null
+      && idOrNull(branch.generationId) === acceptedGenerationId;
+    if (belongsToAcceptedGeneration) {
+      return {
+        ...branch,
+        sourcePresent: true,
+        generationId: acceptedGenerationId,
+      };
+    }
+    return {
+      qty: 0,
+      unitCostAvg: null,
+      sourcePresent: false,
+      generationId: null,
+      syncedAt: null,
+    };
+  };
   const addExample = (kind, productCode = null, branchCode = null) => {
     if (examples.length < maxExamples) examples.push({ kind, productCode, branchCode });
   };
@@ -700,7 +732,7 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     const branchCodes = activeBranchCodes
       || [...new Set([...Object.keys(oldBranches), ...Object.keys(newBranches)])].sort();
     for (const branchCode of branchCodes) {
-      const oldBranch = oldBranches[branchCode] || {};
+      const oldBranch = legacyBranchForComparison(branchCode, oldBranches[branchCode] || {});
       const newBranch = newBranches[branchCode] || {};
       if (Boolean(oldBranch.sourcePresent) !== Boolean(newBranch.sourcePresent)) {
         counts.inputBranchMembership += 1;
@@ -777,6 +809,12 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     item.branchCode,
     String(item.syncRunId),
   ]));
+  if (acceptedGenerationByBranch) {
+    for (const branchCode of activeBranchCodes) {
+      const acceptedGenerationId = acceptedGenerationByBranch.get(branchCode);
+      if (acceptedGenerationId != null) oldGenerations.set(branchCode, acceptedGenerationId);
+    }
+  }
   const newGenerations = new Map((normalized.inputGenerations || []).map((item) => [
     item.branchCode,
     String(item.syncRunId),
@@ -790,7 +828,7 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     }
   }
 
-  const comparable = (dataset) => ({
+  const comparable = (dataset, readerKind) => ({
     stockRows: (dataset.stockRows || []).map((row) => {
       if (!activeBranchCodes) return { ...row, branches: row.branches };
       const { syncedAt: ignoredAggregateFreshness, ...scopedRow } = row;
@@ -798,7 +836,12 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
         ...scopedRow,
         branches: Object.fromEntries(activeBranchCodes
           .filter((branchCode) => Object.hasOwn(row.branches || {}, branchCode))
-          .map((branchCode) => [branchCode, row.branches[branchCode]])),
+          .map((branchCode) => [
+            branchCode,
+            readerKind === "legacy"
+              ? legacyBranchForComparison(branchCode, row.branches[branchCode])
+              : row.branches[branchCode],
+          ])),
       };
     }),
     rows: (dataset.rows || []).filter(inActiveScope).map((row) => ({
@@ -809,7 +852,20 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     })),
     summary: dataset.summary,
     inputGenerations: activeBranchSet
-      ? (dataset.inputGenerations || []).filter((item) => activeBranchSet.has(String(item.branchCode)))
+      ? activeBranchCodes.map((branchCode) => {
+        if (readerKind === "legacy" && acceptedGenerationByBranch?.has(branchCode)) {
+          return {
+            branchCode,
+            syncRunId: acceptedGenerationByBranch.get(branchCode),
+          };
+        }
+        const item = (dataset.inputGenerations || []).find((candidate) => (
+          String(candidate.branchCode) === branchCode
+        ));
+        return item
+          ? { branchCode, syncRunId: idOrNull(item.syncRunId) }
+          : null;
+      }).filter(Boolean)
       : dataset.inputGenerations,
   });
   return {
@@ -817,8 +873,8 @@ function compareStockReaderResults(legacy, normalized, options = {}) {
     counts,
     examples,
     examplesTruncated: Object.values(counts).reduce((sum, count) => sum + count, 0) > examples.length,
-    legacyDigest: digest(comparable(legacy)),
-    normalizedDigest: digest(comparable(normalized)),
+    legacyDigest: digest(comparable(legacy, "legacy")),
+    normalizedDigest: digest(comparable(normalized, "normalized")),
   };
 }
 
