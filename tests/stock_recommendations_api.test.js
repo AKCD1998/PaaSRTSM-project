@@ -51,7 +51,13 @@ function createMockDb() {
     comparisonLinks: [],
     comparisonRecords: [],
     normalizedCandidateParams: null,
+    normalizedCandidateCalls: [],
     normalizedLoaderParams: null,
+    normalizedLoaderCalls: [],
+    legacyLoaderCalls: [],
+    salesAggCalls: [],
+    incomingAggCalls: [],
+    broadIncomingDiscoveryCount: 0,
     activeBranches: [
       { branch_code: "001", branch_name: "Branch 001", is_active: true, is_hq: false },
       { branch_code: "003", branch_name: "Branch 003", is_active: true, is_hq: false },
@@ -377,6 +383,7 @@ function createMockDb() {
         && normalized.includes("from ada.branch_stock_current current")
       ) {
         state.normalizedCandidateParams = params;
+        state.normalizedCandidateCalls.push({ sql: normalized, params });
         return {
           rowCount: state.stockRows.length,
           rows: state.stockRows.map((row) => ({ product_code: row.product_code })),
@@ -423,6 +430,7 @@ function createMockDb() {
         && normalized.includes("left join ada.branch_stock_current current")
       ) {
         state.normalizedLoaderParams = params;
+        state.normalizedLoaderCalls.push({ sql: normalized, params });
         if (state.normalizedLoaderFails) throw new Error("synthetic normalized failure");
         const productCodes = Array.isArray(params[0]) ? params[0] : [];
         const rows = state.normalizedRows.filter((row) => productCodes.includes(row.product_code));
@@ -433,6 +441,7 @@ function createMockDb() {
         normalized.includes("select distinct product_code") &&
         normalized.includes("from ( select l.product_code from ada.pending_receipt_lines l")
       ) {
+        state.broadIncomingDiscoveryCount += 1;
         const rows = state.incomingRows.map((row) => ({ product_code: row.product_code }));
         return { rowCount: rows.length, rows };
       }
@@ -443,6 +452,7 @@ function createMockDb() {
         normalized.includes("order by bs.product_code asc")
       ) {
         const productCodes = Array.isArray(params[0]) ? params[0] : [];
+        state.legacyLoaderCalls.push({ sql: normalized, params });
         const rows = state.stockRows.filter((row) => {
           if (!productCodes.includes(row.product_code)) return false;
           return true;
@@ -455,12 +465,18 @@ function createMockDb() {
         normalized.includes("join ada.sales_lines sl")
       ) {
         const branchCodes = Array.isArray(params[0]) ? params[0] : [];
-        const rows = state.salesAggRows.filter((row) => branchCodes.includes(row.branch_code));
+        const exactProductCode = params.length >= 5 ? String(params[4]) : null;
+        state.salesAggCalls.push({ sql: normalized, params });
+        const rows = state.salesAggRows.filter((row) => (
+          branchCodes.includes(row.branch_code)
+          && (!exactProductCode || row.product_code === exactProductCode)
+        ));
         return { rowCount: rows.length, rows };
       }
 
       if (normalized.includes("with incoming_lines as (")) {
         const productCodes = Array.isArray(params[0]) ? params[0] : [];
+        state.incomingAggCalls.push({ sql: normalized, params });
         const rows = state.incomingRows.filter((row) => productCodes.includes(row.product_code));
         return { rowCount: rows.length, rows };
       }
@@ -606,7 +622,7 @@ test("by-product action filter only returns products where some branch matches, 
 });
 
 test("recommendation detail returns the computed row for one branch/product", async () => {
-  const { app } = createTestApp();
+  const { app, db } = createTestApp();
   const agent = request.agent(app);
 
   await loginAs(agent, {
@@ -622,6 +638,11 @@ test("recommendation detail returns the computed row for one branch/product", as
   assert.equal(response.body.recommendation.productCode, "P1");
   assert.equal(response.body.recommendation.action, "TRANSFER_IN");
   assert.equal(response.body.recommendation.donors[0].branchCode, "003");
+  assert.deepEqual(db.state.legacyLoaderCalls.at(-1).params[0], ["P1"]);
+  assert.match(db.state.salesAggCalls.at(-1).sql, /sl\.product_code = \$5::text/);
+  assert.equal(db.state.salesAggCalls.at(-1).params[4], "P1");
+  assert.deepEqual(db.state.incomingAggCalls.at(-1).params[0], ["P1"]);
+  assert.equal(db.state.broadIncomingDiscoveryCount, 0);
 });
 
 test("normalized reader fails closed with bounded 503 evidence and never queries the wide table", async () => {
@@ -853,6 +874,12 @@ test("normalized canary selects only 004, bounds candidates to 004, and leaves o
       last_full_sync_run_id: "204",
     });
   }
+  db.state.salesAggRows.push({
+    product_code: "P1",
+    branch_code: "004",
+    sold_qty_30d: 30,
+    sold_qty_90d: 90,
+  });
   const agent = request.agent(app);
   await loginAs(agent, { username: "admin@example.com", password: "admin-pass-123" });
 
@@ -860,7 +887,82 @@ test("normalized canary selects only 004, bounds candidates to 004, and leaves o
   assert.equal(selected.status, 200);
   assert.equal(selected.body.meta.reader.servedReader, "normalized");
   assert.deepEqual(db.state.normalizedCandidateParams[0], ["004"]);
+  assert.deepEqual(db.state.normalizedLoaderParams[0], ["P1", "P2", "P3"]);
   assert.deepEqual(db.state.normalizedLoaderParams[1], ["001", "003", "004"]);
+  assert.equal(db.state.salesAggCalls.at(-1).params.length, 4);
+  assert.doesNotMatch(db.state.salesAggCalls.at(-1).sql, /sl\.product_code = \$5::text/);
+  const catalogSalesCalls = db.state.salesAggCalls.length;
+  const selectedAgain = await agent.get("/api/admin/stock-recommendations?branchCode=004&pageSize=20");
+  assert.equal(selectedAgain.status, 200);
+  assert.equal(db.state.salesAggCalls.length, catalogSalesCalls);
+
+  const callsBeforeDetail = {
+    candidate: db.state.normalizedCandidateCalls.length,
+    loader: db.state.normalizedLoaderCalls.length,
+    sales: db.state.salesAggCalls.length,
+    incoming: db.state.incomingAggCalls.length,
+    broadIncoming: db.state.broadIncomingDiscoveryCount,
+  };
+  // Even a conflicting fuzzy search must not replace the path identity or
+  // widen exact-product detail execution to P2/P3, which also have positive
+  // stock/sales/incoming fixtures in this test database.
+  const detail = await agent.get("/api/admin/stock-recommendations/004/P1?search=P2");
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.meta.reader.servedReader, "normalized");
+  assert.equal(detail.body.targetDays, 90);
+  assert.equal(detail.body.productCode, "P1");
+  assert.equal(db.state.normalizedCandidateCalls.length, callsBeforeDetail.candidate);
+  assert.equal(db.state.broadIncomingDiscoveryCount, callsBeforeDetail.broadIncoming);
+  assert.equal(db.state.normalizedLoaderCalls.length, callsBeforeDetail.loader + 1);
+  assert.deepEqual(db.state.normalizedLoaderCalls.at(-1).params[0], ["P1"]);
+  assert.deepEqual(db.state.normalizedLoaderCalls.at(-1).params[1], ["001", "003", "004"]);
+  assert.equal(db.state.salesAggCalls.length, callsBeforeDetail.sales + 1);
+  assert.match(db.state.salesAggCalls.at(-1).sql, /sl\.product_code = \$5::text/);
+  assert.equal(db.state.salesAggCalls.at(-1).params[4], "P1");
+  assert.equal(db.state.incomingAggCalls.length, callsBeforeDetail.incoming + 1);
+  assert.deepEqual(db.state.incomingAggCalls.at(-1).params[0], ["P1"]);
+  assert.deepEqual(
+    {
+      currentStock: detail.body.recommendation.currentStock,
+      soldQty30d: detail.body.recommendation.soldQty30d,
+      soldQty90d: detail.body.recommendation.soldQty90d,
+      adu30: detail.body.recommendation.adu30,
+      adu90: detail.body.recommendation.adu90,
+      adjustedAdu: detail.body.recommendation.adjustedAdu,
+      targetQty: detail.body.recommendation.targetQty,
+      shortageQty: detail.body.recommendation.shortageQty,
+      transferPlanQty: detail.body.recommendation.transferPlanQty,
+      purchaseQty: detail.body.recommendation.purchaseQty,
+      action: detail.body.recommendation.action,
+    },
+    {
+      currentStock: 0,
+      soldQty30d: 30,
+      soldQty90d: 90,
+      adu30: 1,
+      adu90: 1,
+      adjustedAdu: 1,
+      targetQty: 90,
+      shortageQty: 90,
+      transferPlanQty: 90,
+      purchaseQty: 0,
+      action: "TRANSFER_IN",
+    },
+  );
+  assert.deepEqual(detail.body.recommendation.donors, [{
+    branchCode: "003",
+    qty: 90,
+    daysCoverAfterTransfer: 100,
+    branchName: "Branch 003",
+  }]);
+
+  const exactSalesCallsAfterFirstDetail = db.state.salesAggCalls.length;
+  const repeatedDetail = await agent.get("/api/admin/stock-recommendations/004/P1");
+  assert.equal(repeatedDetail.status, 200);
+  assert.equal(repeatedDetail.body.productCode, "P1");
+  assert.equal(db.state.salesAggCalls.length, exactSalesCallsAfterFirstDetail + 1);
+  assert.match(db.state.salesAggCalls.at(-1).sql, /sl\.product_code = \$5::text/);
+  assert.equal(db.state.salesAggCalls.at(-1).params[4], "P1");
 
   db.state.queryLog.length = 0;
   db.state.precomputedEnabled = true;

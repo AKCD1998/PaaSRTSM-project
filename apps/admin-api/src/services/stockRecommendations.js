@@ -355,8 +355,15 @@ async function loadCandidateProductCodes(db, {
   rawSalesAgg,
   readerKind = "legacy",
   readerEvidence = null,
+  exactProductCode = null,
 }) {
   const normalizedSearch = normalizeText(search || "");
+  const normalizedExactProductCode = normalizeText(exactProductCode || "");
+  // Detail execution supplies an already validated product identity. Returning
+  // it directly avoids the catalog-wide positive-stock, sales, and incoming
+  // discovery used by list views. A fuzzy search is deliberately not used as
+  // an execution bound because it can match multiple products.
+  if (normalizedExactProductCode) return [normalizedExactProductCode];
   const productCodes = new Set();
 
   if (readerKind === "normalized") {
@@ -468,22 +475,58 @@ async function loadCandidateProductCodes(db, {
 const RAW_SALES_AGG_CACHE_TTL_MS = 15 * 60_000;
 const rawSalesAggCache = new Map(); // cacheKey -> { promise, expiresAt }
 
-async function loadRawSalesAggByBranch(db, { branchCodes, window30From, window90From, anchorDate }) {
+async function loadRawSalesAggByBranch(db, {
+  branchCodes,
+  window30From,
+  window90From,
+  anchorDate,
+  exactProductCode = null,
+}) {
   if (!Array.isArray(branchCodes) || branchCodes.length === 0) {
     return new Map();
   }
 
+  const normalizedExactProductCode = normalizeText(exactProductCode || "") || null;
+  // A detail request is already narrowly bounded by SQL. Do not retain one
+  // module-global cache entry per product: modal traffic would otherwise make
+  // this Map grow with every distinct SKU opened during the process lifetime.
+  if (normalizedExactProductCode) {
+    return loadRawSalesAggByBranchUncached(db, {
+      branchCodes,
+      window30From,
+      window90From,
+      anchorDate,
+      exactProductCode: normalizedExactProductCode,
+    });
+  }
+
+  // Preserve the existing whole-catalog cache and key exactly for list,
+  // summary, refresh, and shadow callers.
   const cacheKey = `${[...branchCodes].sort().join(",")}|${anchorDate}`;
   const cached = rawSalesAggCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.promise;
 
-  const promise = loadRawSalesAggByBranchUncached(db, { branchCodes, window30From, window90From, anchorDate });
+  const promise = loadRawSalesAggByBranchUncached(db, {
+    branchCodes,
+    window30From,
+    window90From,
+    anchorDate,
+  });
   rawSalesAggCache.set(cacheKey, { promise, expiresAt: Date.now() + RAW_SALES_AGG_CACHE_TTL_MS });
   promise.catch(() => rawSalesAggCache.delete(cacheKey));
   return promise;
 }
 
-async function loadRawSalesAggByBranchUncached(db, { branchCodes, window30From, window90From, anchorDate }) {
+async function loadRawSalesAggByBranchUncached(db, {
+  branchCodes,
+  window30From,
+  window90From,
+  anchorDate,
+  exactProductCode = null,
+}) {
+  const exactProductPredicate = exactProductCode
+    ? "\n        AND sl.product_code = $5::text"
+    : "";
   const result = await db.query(
     `
       SELECT
@@ -499,9 +542,12 @@ async function loadRawSalesAggByBranchUncached(db, { branchCodes, window30From, 
         AND sh.doc_date BETWEEN $2::date AND $3::date
         AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
         AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
+        ${exactProductPredicate}
       GROUP BY sl.product_code, sh.branch_code
     `,
-    [branchCodes, window90From, anchorDate, window30From],
+    exactProductCode
+      ? [branchCodes, window90From, anchorDate, window30From, exactProductCode]
+      : [branchCodes, window90From, anchorDate, window30From],
   );
 
   const map = new Map();
@@ -1542,6 +1588,7 @@ async function computeLiveRecommendationDatasetForReader(
   options = {},
 ) {
   const normalizedFilters = normalizeRecommendationFilters(filters);
+  const exactProductCode = normalizeText(options.exactProductCode || "") || null;
   const scope = await resolveEffectiveBranchScope(
     db,
     auth,
@@ -1568,6 +1615,7 @@ async function computeLiveRecommendationDatasetForReader(
     window30From: policy.salesWindow30dFrom,
     window90From: policy.salesWindow90dFrom,
     anchorDate,
+    exactProductCode,
   });
   const candidateProductCodes = await loadCandidateProductCodes(db, {
     scope,
@@ -1575,6 +1623,7 @@ async function computeLiveRecommendationDatasetForReader(
     rawSalesAgg,
     readerKind,
     readerEvidence: generationEvidence,
+    exactProductCode,
   });
   const stockResult = readerKind === "normalized"
     ? await loadNormalizedCurrentStockByProduct(db, {
@@ -1880,7 +1929,7 @@ async function computeShadowRecommendationDataset(
   }
 }
 
-async function computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy) {
+async function computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy, options = {}) {
   try {
     const { value: dataset, sourceSnapshot } = await withRepeatableReadSnapshot(
       db,
@@ -1890,6 +1939,7 @@ async function computeNormalizedRecommendationDataset(db, auth, filters, readerP
         filters,
         "normalized",
         readerPolicy,
+        options,
       ),
     );
     dataset.readerMeta = {
@@ -1958,7 +2008,7 @@ async function computeLiveRecommendationDataset(db, auth, filters = {}, config =
   );
 }
 
-async function computeLegacyRecommendationDataset(db, auth, filters = {}) {
+async function computeLegacyRecommendationDataset(db, auth, filters = {}, options = {}) {
   const normalizedFilters = normalizeRecommendationFilters(filters);
   const scope = await resolveEffectiveBranchScope(
     db,
@@ -2008,19 +2058,20 @@ async function computeLegacyRecommendationDataset(db, auth, filters = {}) {
     normalizedFilters,
     "legacy",
     resolveRecommendationReaderPolicy({}),
+    options,
   );
 }
 
-async function computeRecommendationDataset(db, auth, filters = {}, config = {}) {
+async function computeRecommendationDataset(db, auth, filters = {}, config = {}, options = {}) {
   const readerPolicy = resolveRecommendationReaderPolicy(config);
   if (readerPolicy.mode === "normalized") {
     const selection = resolveNormalizedCanarySelection(readerPolicy, auth, filters);
     if (selection.selected) {
       // Existing precomputed rows have no reader/generation provenance, so a
       // selected normalized response must use the gated reader directly.
-      return computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy);
+      return computeNormalizedRecommendationDataset(db, auth, filters, readerPolicy, options);
     }
-    const legacyDataset = await computeLegacyRecommendationDataset(db, auth, filters);
+    const legacyDataset = await computeLegacyRecommendationDataset(db, auth, filters, options);
     legacyDataset.readerMeta = {
       mode: "normalized",
       servedReader: "legacy",
@@ -2028,7 +2079,7 @@ async function computeRecommendationDataset(db, auth, filters = {}, config = {})
     };
     return legacyDataset;
   }
-  const legacyDataset = await computeLegacyRecommendationDataset(db, auth, filters);
+  const legacyDataset = await computeLegacyRecommendationDataset(db, auth, filters, options);
   if (readerPolicy.mode === "shadow") {
     // Request traffic never performs the expensive comparison. Shadow
     // evidence is generated by the existing refresh path, which can link the
@@ -2130,7 +2181,7 @@ async function getStockRecommendationDetail({
   const dataset = await computeRecommendationDataset(db, auth, {
     ...filters,
     branchCode,
-  }, config);
+  }, config, { exactProductCode: normalizedProductCode });
 
   const row = dataset.source === "precomputed"
     ? await getPrecomputedRecommendationDetail(db, dataset, normalizedProductCode)
