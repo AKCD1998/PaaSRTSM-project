@@ -4,6 +4,7 @@ const express = require("express");
 const {
   listStockRecommendations,
   listStockRecommendationsByProduct,
+  getStockRecommendationPriorityIndex,
   getStockRecommendationSummary,
   getStockRecommendationDetail,
 } = require("../services/stockRecommendations");
@@ -70,6 +71,24 @@ function createStockRecommendationsRouter(deps) {
   router.get("/stock-recommendations/summary", requireAuthMiddleware, async (req, res, next) => {
     try {
       const payload = await getStockRecommendationSummary({
+        db,
+        config,
+        auth: req.auth,
+        filters: req.query || {},
+      });
+      return res.json({
+        ok: true,
+        request_id: req.requestId || null,
+        ...payload,
+      });
+    } catch (error) {
+      return handleError(error, req, res, next);
+    }
+  });
+
+  router.get("/stock-recommendations/priority-index", requireAuthMiddleware, async (req, res, next) => {
+    try {
+      const payload = await getStockRecommendationPriorityIndex({
         db,
         config,
         auth: req.auth,
