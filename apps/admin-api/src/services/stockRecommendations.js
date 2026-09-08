@@ -2134,6 +2134,36 @@ async function listStockRecommendations({ db, auth, filters = {}, config = {} })
   };
 }
 
+function buildStockRecommendationPriorityIndexRows(rows = []) {
+  return rows
+    .map((row) => ({
+      productCode: normalizeText(row.productCode),
+      action: normalizeUpperText(row.action),
+      neededQty: round(numberOrZero(row.shortageQty), 4),
+      transferPlanQty: round(numberOrZero(row.transferPlanQty), 4),
+      purchaseQty: round(numberOrZero(row.purchaseQty), 4),
+    }))
+    .filter((row) => row.productCode);
+}
+
+async function getStockRecommendationPriorityIndex({ db, auth, filters = {}, config = {} }) {
+  const dataset = await computeRecommendationDataset(db, auth, filters, config);
+  const active = dataset.readerMeta?.servedReader === "normalized" && !dataset.scope.isAllBranches;
+
+  return {
+    branchCode: dataset.scope.branchCode,
+    targetDays: dataset.policy.targetDays,
+    generatedAt: dataset.snapshotMeta?.generatedAt || new Date().toISOString(),
+    active,
+    rows: active ? buildStockRecommendationPriorityIndexRows(dataset.rows) : [],
+    meta: {
+      anchorDate: dataset.anchorDate,
+      source: dataset.source,
+      ...(dataset.readerMeta ? { reader: dataset.readerMeta } : {}),
+    },
+  };
+}
+
 async function getStockRecommendationSummary({ db, auth, filters = {}, config = {} }) {
   const dataset = await computeRecommendationDataset(db, auth, {
     ...filters,
@@ -2440,7 +2470,9 @@ async function refreshStockRecommendationSnapshots(db, options = {}) {
 module.exports = {
   listStockRecommendations,
   listStockRecommendationsByProduct,
+  getStockRecommendationPriorityIndex,
   getStockRecommendationSummary,
   getStockRecommendationDetail,
+  buildStockRecommendationPriorityIndexRows,
   refreshStockRecommendationSnapshots,
 };

@@ -515,6 +515,41 @@ test("GET /api/admin/stock-recommendations requires auth", async () => {
   assert.equal(response.status, 401);
 });
 
+test("GET /api/admin/stock-recommendations/priority-index requires auth", async () => {
+  const { app } = createTestApp();
+
+  const response = await request(app).get("/api/admin/stock-recommendations/priority-index?branchCode=001");
+  assert.equal(response.status, 401);
+});
+
+test("normalized branch priority index returns one compact branch-scoped payload", async () => {
+  const { app } = createTestApp({
+    stockRecommendationReaderMode: "normalized",
+    stockRecommendationMaxStockAgeHours: 10000,
+    stockRecommendationNormalizedCanaryBranches: ["all"],
+  });
+  const agent = request.agent(app);
+  await loginAs(agent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+
+  const response = await agent.get("/api/admin/stock-recommendations/priority-index?branchCode=all");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.active, true);
+  assert.equal(response.body.branchCode, "001");
+  assert.equal(response.body.meta.reader.servedReader, "normalized");
+  assert.deepEqual(response.body.rows.map((row) => row.productCode).sort(), ["P1", "P2", "P3"]);
+  assert.deepEqual(
+    Object.keys(response.body.rows[0]).sort(),
+    ["action", "neededQty", "productCode", "purchaseQty", "transferPlanQty"].sort(),
+  );
+  const purchase = response.body.rows.find((row) => row.productCode === "P2");
+  assert.equal(purchase.action, "PURCHASE");
+  assert.equal(purchase.neededQty, 6);
+  assert.equal(purchase.purchaseQty, 6);
+});
+
 test("branch user recommendation list is forced to its own branch scope and returns computed actions", async () => {
   const { app, db } = createTestApp();
   const agent = request.agent(app);
