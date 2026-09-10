@@ -86,6 +86,22 @@ test("non-admin listing filters drafts and exposes due schedules", async () => {
   assert.deepEqual(rows, []);
   assert.match(queries[0], /publication_status = 'published'/);
   assert.match(queries[0], /scheduled_publish_at <= now\(\)/);
+  assert.match(queries[0], /ORDER BY fp\.created_at DESC, fp\.id ASC/);
+});
+
+test("admin listing uses the same deterministic tie-breaker", async () => {
+  const queries = [];
+  const db = {
+    async query(sql) {
+      queries.push(sql);
+      if (/SELECT branch_code FROM core\.branches/.test(sql)) return { rows: [] };
+      return { rows: [] };
+    },
+  };
+
+  const rows = await listFocusProducts(db, { includeInactive: true });
+  assert.deepEqual(rows, []);
+  assert.match(queries[0], /ORDER BY fp\.created_at DESC, fp\.id ASC/);
 });
 
 test("focus success rules remain unchanged", () => {
