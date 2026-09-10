@@ -250,6 +250,35 @@ function normalizeSearchTerm(value) {
   return normalizeNullableText(value, 128);
 }
 
+function getTimestampMillis(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const timestamp = value instanceof Date
+    ? value.getTime()
+    : new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function compareBatchRowsNewestFirst(left, right) {
+  // pg decodes timestamp columns as Date objects; their string form starts
+  // with a weekday name, so lexical comparison does not preserve chronology.
+  const leftTimestamp = getTimestampMillis(left?.created_at);
+  const rightTimestamp = getTimestampMillis(right?.created_at);
+
+  if (leftTimestamp != null && rightTimestamp != null) {
+    if (leftTimestamp !== rightTimestamp) {
+      return rightTimestamp - leftTimestamp;
+    }
+  } else if (leftTimestamp != null) {
+    return -1;
+  } else if (rightTimestamp != null) {
+    return 1;
+  }
+
+  return Number(right?.batch_id || 0) - Number(left?.batch_id || 0);
+}
+
 function normalizeSubmitPayload(body) {
   const source = body || {};
   const idempotencyKey = normalizeNullableText(source.idempotencyKey, 256);
@@ -1542,7 +1571,7 @@ async function listOutgoingStockRequestBatches({ db, auth, search }) {
   }
 
   return batchRows
-    .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")) || Number(right.batch_id) - Number(left.batch_id))
+    .sort(compareBatchRowsNewestFirst)
     .map((batchRow) => mapBatchSummary(batchRow, requestRowsByBatchId, lineCountsByRequestId));
 }
 
