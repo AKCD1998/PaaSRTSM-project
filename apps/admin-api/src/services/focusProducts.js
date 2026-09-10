@@ -423,14 +423,14 @@ async function listFocusProducts(db, { includeInactive = false, debug = false } 
     ? `SELECT fp.*, bs.hire_date AS assigned_staff_hire_date
        FROM focus.focus_products fp
        LEFT JOIN core.branch_staff bs ON bs.staff_id = fp.assigned_staff_id
-       ORDER BY fp.created_at DESC`
+       ORDER BY fp.created_at DESC, fp.id ASC`
     : `SELECT fp.*, bs.hire_date AS assigned_staff_hire_date
        FROM focus.focus_products fp
        LEFT JOIN core.branch_staff bs ON bs.staff_id = fp.assigned_staff_id
        WHERE fp.is_active = TRUE
          AND (fp.publication_status = 'published'
            OR (fp.publication_status = 'scheduled' AND fp.scheduled_publish_at <= now()))
-       ORDER BY fp.created_at DESC`;
+       ORDER BY fp.created_at DESC, fp.id ASC`;
   const result = await db.query(sql);
   mark("select focus_products", t);
 
