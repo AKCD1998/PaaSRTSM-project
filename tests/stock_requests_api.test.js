@@ -1267,6 +1267,74 @@ test("staff with branch override can submit, list mine, and read incoming reques
   assert.equal(detailResponse.body.request.sourceBranchCode, "003");
 });
 
+test("outgoing batches are ordered by actual creation time when PostgreSQL returns Date objects", async () => {
+  const { app, db } = createTestApp();
+  const agent = request.agent(app);
+  await login(agent, {
+    username: "branch001@example.com",
+    password: "branch-pass-001",
+  });
+
+  const batches = [
+    { batchId: 1, createdAt: new Date("2026-09-08T01:03:24.000Z") }, // Tuesday; newest
+    { batchId: 2, createdAt: new Date("2026-09-02T13:15:07.000Z") }, // Wednesday
+    { batchId: 3, createdAt: new Date("2026-08-26T13:34:23.000Z") }, // Wednesday
+    { batchId: 4, createdAt: new Date("2026-08-12T13:49:05.000Z") },
+    { batchId: 5, createdAt: new Date("2026-08-12T13:49:05.000Z") },
+    { batchId: 6, createdAt: new Date("not-a-timestamp") },
+    { batchId: 7, createdAt: null },
+  ];
+
+  for (const { batchId, createdAt } of batches) {
+    db.state.batches.push({
+      batch_id: batchId,
+      public_id: `SRQ-SORT-${batchId}`,
+      requesting_branch_code: "001",
+      status: "SUBMITTED",
+      created_by: "branch001@example.com",
+      note: null,
+      version: 1,
+      submitted_at: createdAt,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    db.state.requests.push({
+      request_id: batchId,
+      public_id: `SRQ-SORT-${batchId}-000`,
+      batch_id: batchId,
+      requesting_branch_code: "001",
+      source_branch_code: "000",
+      request_mode: "STANDARD",
+      status: "SUBMITTED",
+      response_result: null,
+      response_note: null,
+      responded_by: null,
+      responded_at: null,
+      acknowledged_by: null,
+      acknowledged_at: null,
+      version: 1,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+  }
+
+  const response = await agent.get("/api/stock-requests/mine");
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    response.body.records.map((record) => record.batchPublicId),
+    [
+      "SRQ-SORT-1",
+      "SRQ-SORT-2",
+      "SRQ-SORT-3",
+      "SRQ-SORT-5",
+      "SRQ-SORT-4",
+      "SRQ-SORT-7",
+      "SRQ-SORT-6",
+    ],
+  );
+});
+
 test("admin alert requests to HQ are flagged in admin incoming cards", async () => {
   const { app, db } = createTestApp();
   const requesterAgent = request.agent(app);
