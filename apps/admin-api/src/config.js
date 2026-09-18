@@ -134,6 +134,22 @@ function parseKeyValueMap(value, options = {}) {
   return map;
 }
 
+// Dedicated parser because branch evidence tokens are secrets and may contain
+// ':' characters. Entries use `branch=token` and ';' between branches.
+function parseBranchTokenMap(value) {
+  const map = new Map();
+  for (const rawEntry of String(value || "").split(";")) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const separatorIndex = entry.indexOf("=");
+    if (separatorIndex <= 0 || separatorIndex === entry.length - 1) continue;
+    const branchCode = entry.slice(0, separatorIndex).trim();
+    const token = entry.slice(separatorIndex + 1).trim();
+    if (/^(000|001|003|004|005)$/.test(branchCode) && token) map.set(branchCode, token);
+  }
+  return map;
+}
+
 function parseCookieSameSite(value, fallback = "lax") {
   const normalized = String(value || fallback).trim().toLowerCase();
   if (["lax", "strict", "none"].includes(normalized)) {
@@ -228,6 +244,12 @@ function loadConfig(env = process.env) {
       normalizeValue: (entry) => String(entry || "").trim(),
     }),
     posApiKeys: parseCsvSet(env.POS_API_KEYS || ""),
+    // Separate branch-bound credentials for the dormant hourly evidence sink.
+    // Empty by default: POST /captures fails closed with 503 until an operator
+    // separately approves and provisions per-branch tokens.
+    hourlyStockEvidenceBranchTokens: parseBranchTokenMap(
+      env.HOURLY_STOCK_EVIDENCE_BRANCH_TOKENS || "",
+    ),
     syncV2AllowedDatasets: parseCsvSet(env.SYNC_V2_ALLOWED_DATASETS || "", { lowercase: true }),
     syncV2AllowedBranches: parseCsvSet(env.SYNC_V2_ALLOWED_BRANCHES || ""),
     syncV2MaxBatchRecords: parseIntWithFallback(env.SYNC_V2_MAX_BATCH_RECORDS, 100),

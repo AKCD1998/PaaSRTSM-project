@@ -35,6 +35,7 @@ const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
+const { createHourlyStockEvidenceRouter } = require("./routes/hourly-stock-evidence");
 const { createReviewQueueRouter } = require("./routes/review-queue");
 const { createMovementAnalyticsRouter } = require("./routes/movement-analytics");
 const { createStockRecommendationsRouter } = require("./routes/stock-recommendations");
@@ -291,6 +292,15 @@ function createApp(overrides = {}) {
       requireAuthMiddleware,
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
+    }),
+  );
+  app.use(
+    "/api/hourly-stock-evidence",
+    createHourlyStockEvidenceRouter({
+      config,
+      db,
+      requireAuthMiddleware,
+      requireRoleMiddleware: requireRole,
     }),
   );
   app.use(
