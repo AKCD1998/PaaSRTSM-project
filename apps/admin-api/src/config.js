@@ -234,6 +234,8 @@ function loadConfig(env = process.env) {
     featureTransferDeltaApply: parseBool(env.FEATURE_TRANSFER_DELTA_APPLY, false),
     transferDeltaBranches: parseCsvSet(env.TRANSFER_DELTA_BRANCHES || ""),
     featureTransferDeltaHardTombstones: parseBool(env.FEATURE_TRANSFER_DELTA_HARD_TOMBSTONES, false),
+    featureTransferDeltaEvidenceApi: parseBool(env.FEATURE_TRANSFER_DELTA_EVIDENCE_API, false),
+    transferDeltaEvidenceToken: env.TRANSFER_DELTA_EVIDENCE_TOKEN || "",
     crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
     crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",
     erpProductCatalogInternalToken: env.ERP_PRODUCT_CATALOG_INTERNAL_TOKEN || "",

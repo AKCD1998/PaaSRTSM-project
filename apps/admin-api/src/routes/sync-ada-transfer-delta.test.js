@@ -17,6 +17,7 @@ const {
   readCapability,
   rebaselineTransferDelta,
 } = require("../services/transferDelta");
+const { readTransferDeltaEvidence } = require("../services/transferDeltaEvidence");
 
 const databaseUrl = process.env.TRANSFER_DELTA_TEST_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
@@ -84,6 +85,10 @@ test.before(async () => {
   const deltaMigration = fs.readFileSync(path.join(root, "migrations", "073_add_transfer_delta_delivery.sql"), "utf8");
   await pool.query(deltaMigration);
   await pool.query(deltaMigration); // idempotent rerun proof
+  await pool.query(`CREATE TABLE IF NOT EXISTS public.schema_migrations (
+    filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`);
+  await pool.query(`INSERT INTO public.schema_migrations(filename)
+    VALUES ('migrations/073_add_transfer_delta_delivery.sql') ON CONFLICT DO NOTHING`);
 });
 
 test.after(async () => { if (pool) await pool.end(); });
@@ -142,6 +147,23 @@ integration("migration constraints and capability expose durable token plus stat
   assert.equal(capability.checkpointToken, seeded.checkpointToken);
   assert.equal(capability.stateHash, "a".repeat(64));
   assert.equal(capability.hardTombstones, "disabled");
+});
+
+integration("read-only evidence summarizes rebaseline without exposing checkpoint material", async () => {
+  await seedCheckpoint();
+  const evidence = await readTransferDeltaEvidence(pool, "004");
+  assert.equal(evidence.migration073Recorded, true);
+  assert.deepEqual(evidence.tables, { checkpoints: true, requests: true, tombstoneAudit: true });
+  assert.equal(evidence.checkpoint.rowCount, 1);
+  assert.equal(evidence.checkpoint.sequence, 1);
+  assert.equal(evidence.checkpoint.hasToken, true);
+  assert.equal(evidence.checkpoint.hasStateHash, true);
+  assert.equal(evidence.requests.rowCount, 1);
+  assert.equal(evidence.requests.latest.operation, "rebaseline");
+  assert.equal(evidence.requests.latest.status, "applied");
+  assert.equal(evidence.tombstoneAuditRows, 0);
+  assert.equal(JSON.stringify(evidence).includes("checkpointToken"), false);
+  assert.equal(JSON.stringify(evidence).includes("stateHash"), false);
 });
 
 integration("whole-document replacement is set-based, removes stale lines, and matches Full projection", async () => {
