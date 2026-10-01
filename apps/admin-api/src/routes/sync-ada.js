@@ -2,6 +2,12 @@
 
 const express = require("express");
 const { acquireIngestionDbClient } = require("../utils/db-acquire");
+const {
+  applyTransferDelta,
+  isActiveTransferBranch,
+  readCapability: readTransferDeltaCapability,
+  rebaselineTransferDelta,
+} = require("../services/transferDelta");
 
 function normalizeText(value) {
   return String(value == null ? "" : value).trim();
@@ -2932,6 +2938,72 @@ function createAdaSyncRouter(deps) {
       rawPayload: getRawPayload(record),
     };
   }
+
+  router.get("/transfers/delta-capabilities", async (req, res, next) => {
+    try {
+      const branchCode = normalizeBranchCode(req.query.branchCode);
+      if (!branchCode) return res.status(400).json({ message: "branchCode is required." });
+      const capability = await readTransferDeltaCapability(
+        db,
+        config,
+        branchCode,
+        normalizeText(req.query.contractVersion),
+      );
+      return res.json(capability);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post("/transfers/delta", async (req, res, next) => {
+    const branchCode = normalizeBranchCode(req.body?.branchCode);
+    const enabled = config.featureTransferDeltaApply === true
+      && config.transferDeltaBranches instanceof Set
+      && branchCode
+      && config.transferDeltaBranches.has(branchCode)
+      && isActiveTransferBranch(branchCode);
+    if (!enabled) return res.status(404).json({ message: "Transfer Delta is not enabled for this branch." });
+
+    const { error, headers, lines } = parseTransferPayload(req.body);
+    if (error) return res.status(400).json({ message: error });
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/transfers/delta");
+    if (!client) return;
+    try {
+      const result = await applyTransferDelta(client, req.body, headers, lines, {
+        allowHardTombstones: config.featureTransferDeltaHardTombstones === true,
+      });
+      return res.json(result);
+    } catch (deltaApplyError) {
+      if (deltaApplyError.status) {
+        return res.status(deltaApplyError.status).json({
+          message: deltaApplyError.message,
+          code: deltaApplyError.code,
+        });
+      }
+      return next(deltaApplyError);
+    } finally {
+      client.release();
+    }
+  });
+
+  router.post("/transfers/delta-rebaseline", async (req, res, next) => {
+    const branchCode = normalizeBranchCode(req.body?.branchCode);
+    const enabled = config.featureTransferDeltaApply === true
+      && config.transferDeltaBranches instanceof Set
+      && branchCode && config.transferDeltaBranches.has(branchCode)
+      && isActiveTransferBranch(branchCode);
+    if (!enabled) return res.status(404).json({ message: "Transfer Delta is not enabled for this branch." });
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:/transfers/delta-rebaseline");
+    if (!client) return;
+    try {
+      return res.json(await rebaselineTransferDelta(client, req.body));
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ message:error.message, code:error.code });
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
 
   router.post("/transfers", async (req, res, next) => {
     const { error, headers, lines } = parseTransferPayload(req.body);
