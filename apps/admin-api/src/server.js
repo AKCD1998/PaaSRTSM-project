@@ -59,6 +59,7 @@ const { startStockRecommendationSchedule } = require("./services/stockRecommenda
 const { startFocusLinePackageCleanupSchedule } = require("./services/focusLineChatPackages");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 const { createInternalProductCatalogRouter } = require("./routes/internal-product-catalog");
+const { createTransferDeltaEvidenceRouter } = require("./routes/transfer-delta-evidence");
 
 function appendVaryHeader(res, value) {
   const existing = String(res.getHeader("Vary") || "")
@@ -174,6 +175,10 @@ function createApp(overrides = {}) {
   app.use(
     "/internal/product-catalog",
     createInternalProductCatalogRouter({ config, db }),
+  );
+  app.use(
+    "/internal/transfer-delta-evidence",
+    createTransferDeltaEvidenceRouter({ config, db }),
   );
 
   app.use("/admin/health", createHealthRouter());
