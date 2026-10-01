@@ -208,9 +208,9 @@ test("configuration is fail-closed and accepts only active per-branch token entr
   assert.equal(config.hourlyStockEvidenceBranchTokens.get("005"), "token:with:colons");
 });
 
-test("migration 072 is additive, transactional and excludes inactive branch 002", () => {
+test("migration 074 is additive, transactional and excludes inactive branch 002", () => {
   const sql = fs.readFileSync(
-    path.join(__dirname, "..", "migrations", "072_add_hourly_dual_stock_evidence.sql"),
+    path.join(__dirname, "..", "migrations", "074_add_hourly_dual_stock_evidence.sql"),
     "utf8",
   );
   assert.match(sql, /^BEGIN;/);

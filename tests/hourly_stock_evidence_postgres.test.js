@@ -18,7 +18,7 @@ const databaseUrl = process.env.HOURLY_EVIDENCE_TEST_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 2 }) : null;
 const migrationSql = fs.readFileSync(
-  path.join(__dirname, "..", "migrations", "072_add_hourly_dual_stock_evidence.sql"),
+  path.join(__dirname, "..", "migrations", "074_add_hourly_dual_stock_evidence.sql"),
   "utf8",
 );
 
