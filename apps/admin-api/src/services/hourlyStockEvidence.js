@@ -199,7 +199,12 @@ function classifyCollectionQuality({ slotEvidence, missingPlannedSlots, metrics,
   const reasons = [];
   if (!slotEvidence.morning || !slotEvidence.nextMorning || missingPlannedSlots.length) reasons.push("missing-slots");
   if (slots.some((slot) => slot.captureCount !== 1)) reasons.push("duplicate-captures");
+  if (slots.some((slot) => !Number.isFinite(slot.slotDelaySeconds)
+      || !Number.isFinite(slot.ingestionDelaySeconds))) reasons.push("invalid-timing");
   if (slots.some((slot) => slot.slotDelaySeconds < 0)) reasons.push("early-captures");
+  // Negative delivery delay means branch/server clocks cannot establish the
+  // capture order. Preserve evidence and metrics, but do not qualify it.
+  if (slots.some((slot) => slot.ingestionDelaySeconds < 0)) reasons.push("clock-skew");
   const policyReady = Number.isSafeInteger(maxSlotDelaySeconds) && maxSlotDelaySeconds >= 0 && maxSlotDelaySeconds <= 3600;
   if (!policyReady) reasons.push("lateness-policy-pending");
   else if (slots.some((slot) => slot.slotDelaySeconds > maxSlotDelaySeconds)) reasons.push("late-captures");

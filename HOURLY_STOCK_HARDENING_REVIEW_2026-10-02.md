@@ -171,3 +171,58 @@ Final review follow-ups:
 - The rebased PaaS branch will require a lease-protected update against the
   independently verified prior remote SHA 2bf848c. Any newer remote work must
   stop publication for reconciliation; it must not be overwritten.
+
+
+## Self re-review / collection-policy addendum — 10:58 ICT
+
+Human direction: re-review the code, close lateness/retention criteria and check
+the Transfer Delta release gate; proceed within the safe scope.
+
+Published SC/PaaS heads remain 9fd5799/40d2445 with green CI, OPEN/Draft.
+Re-review found that collection quality could qualify negative ingestion delay
+(clock skew) or non-finite timing. Local service/test follow-up now marks them
+nonqualifying, while preserving evidence and drift metrics. This follow-up is
+uncommitted/unpushed; earlier CI does NOT cover it.
+
+Current local tests: Agent 227/227; focused Backend 20/20; full Backend 692 =
+505 pass +187 environment skips +0 fail; guarded PostgreSQL 18 1/1 without skip.
+The exact disposable DB sc_hourly_evidence_test_20261002_rereview was dropped,
+cluster stopped, port 55439 closed; existing PostgreSQL service unchanged.
+
+Policy choice was requested: capture lateness 300 vs600 seconds (300 recommended),
+retention 30 vs60 days (30 recommended). Until the human submits a choice,
+these numbers remain proposals. Choosing retention does not authorize cleanup.
+Source accuracy/drift/TTL/live-delivery SLO remain separate questions.
+
+Transfer gate is NOT closed: fresh central sequence1/counts1/1/0/latest rebaseline
+matches sanitized SERVER004 state. Bootstrap does not prove a Delta apply.
+Preserve two consecutive clean natural windows, at least one real non-zero
+Delta with ack/checkpoint/projection consistency; 3–4 October are earliest
+candidates. No noop-only closure, Manual Sync or main merge during acceptance.
+
+Policy reference (SC candidate):
+docs/workstreams/HOURLY_EVIDENCE_COLLECTION_POLICY_2026_10_02.md.
+Ledger CLAIM-X-298; Gantt updated incrementally. No independent-agent approval
+is claimed and no Git publication/production/config/Task change occurred here.
+
+## Human policy approval / follow-up publication — 11:59 ICT
+
+Human decision: "ยืนยันใช้ **5 นาที / 30 วัน** และให้นาย commit/push patch ใหม่เข้า Draft PR แล้วรอ CI ได้".
+
+Approved future pilot values: HOURLY_STOCK_EVIDENCE_MAX_SLOT_DELAY_SECONDS=300
+and HOURLY_STOCK_EVIDENCE_RETENTION_DAYS=30. Capture delay 300 seconds is
+inclusive; late/non-finite timing or negative delivery delay cannot qualify.
+Delayed positive delivery retains actual capture time and historical metrics;
+this is not a live-stock freshness SLO. Retention is based on capturedAt, with
+strictly-before cutoff deletion; the exact boundary remains retained.
+
+The old pending-choice and uncommitted statements above record earlier states.
+This follow-up is now authorized for commit/push to existing Draft PR #26 and
+fresh CI, with the SC documentation in Draft #61. Preserve Draft status.
+No merge/deploy, migration execution, cleanup enabling, token/flag/Task change,
+production write, Manual Sync or branch activation is authorized here.
+Main migration ceiling is 073 and candidate remains 074 with no schema change.
+Two qualifying natural Transfer 004 windows including a non-zero Delta and
+cohort/ACL/Task rollout ownership still gate the later Hourly release.
+Seven windows/three movement days, source-drift thresholds and Reservation TTL
+remain separate unapproved choices.

@@ -252,7 +252,7 @@ test("morning persistence checks central branch/full/terminal receipt and rolls 
 });
 
 test("qualification requires complete unique timely cohort and explicit lateness policy, not a stock pass threshold", () => {
-  const slot = { captureCount: 1, slotDelaySeconds: 5 };
+  const slot = { captureCount: 1, slotDelaySeconds: 5, ingestionDelaySeconds: 1 };
   const evidence = { morning: slot, intraday: Array.from({ length: 11 }, () => slot), nextMorning: slot };
   const args = { slotEvidence: evidence, missingPlannedSlots: [], metrics: { eligibleProducts: 2 }, maxSlotDelaySeconds: 10 };
   assert.equal(classifyCollectionQuality(args).qualifying, true);
@@ -261,6 +261,44 @@ test("qualification requires complete unique timely cohort and explicit lateness
   assert.equal(classifyCollectionQuality({ ...args, maxSlotDelaySeconds: 1 }).qualifying, false);
   assert.equal(classifyCollectionQuality({ ...args, metrics: { eligibleProducts: 1, missingEstimatedValue: 1 } }).qualifying, false);
   assert.equal(classifyCollectionQuality({ ...args, slotEvidence: { ...evidence, morning: { ...slot, captureCount: 2 } } }).qualifying, false);
+});
+
+test("capture lateness boundary is inclusive and clock skew/invalid timing never qualifies", () => {
+  const slot = { captureCount: 1, slotDelaySeconds: 300, ingestionDelaySeconds: 2 };
+  const args = { slotEvidence: { morning: slot, intraday: Array.from({ length: 11 }, () => slot), nextMorning: slot },
+    missingPlannedSlots: [], metrics: { eligibleProducts: 1 }, maxSlotDelaySeconds: 300 };
+  assert.equal(classifyCollectionQuality(args).qualifying, true);
+  const withMorning = (overrides) => classifyCollectionQuality({ ...args,
+    slotEvidence: { ...args.slotEvidence, morning: { ...slot, ...overrides } } });
+  assert.deepEqual(withMorning({ slotDelaySeconds: 300.001 }).reasons, ["late-captures"]);
+  assert.deepEqual(withMorning({ ingestionDelaySeconds: -0.001 }).reasons, ["clock-skew"]);
+  for (const value of [NaN, Infinity, undefined, null]) {
+    assert.equal(withMorning({ slotDelaySeconds: value }).qualifying, false);
+    assert.ok(withMorning({ slotDelaySeconds: value }).reasons.includes("invalid-timing"));
+    assert.ok(withMorning({ ingestionDelaySeconds: value }).reasons.includes("invalid-timing"));
+  }
+  // An offline upload is not a late source capture: replay retains its time.
+  assert.equal(withMorning({ ingestionDelaySeconds: 86400 }).qualifying, true);
+});
+
+test("summary preserves drift metrics but marks branch/server clock skew nonqualifying", async () => {
+  const slotRow = (role, slot, date) => {
+    const planned = new Date(date + "T" + slot + ":00+07:00").toISOString();
+    return { capture_role: role, planned_slot: slot, planned_for: planned,
+      captured_at: new Date(new Date(planned).getTime() + 5000).toISOString(),
+      received_at: new Date(new Date(planned).getTime() + 4000).toISOString(),
+      capture_count: 1, product_code: "P1", retail_on_hand: 20, latest_estimated_on_hand: 20 };
+  };
+  const rows = [slotRow("morning", "08:20", "2026-09-18"), slotRow("next_morning", "08:20", "2026-09-19"),
+    ...Array.from({ length: 11 }, (_, i) => slotRow("intraday", String(i + 9).padStart(2, "0") + ":00", "2026-09-18"))];
+  const db = createMockDb(); db.query = async () => ({ rows });
+  const candidate = createTestApp({ db, config: { hourlyStockEvidenceMaxSlotDelaySeconds: 300 } });
+  const response = await request(candidate.app).get("/api/hourly-stock-evidence/summary?branchCode=005&date=2026-09-18");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.dailyCompletenessStatus, "complete");
+  assert.equal(response.body.metrics.exactMatchCount, 1);
+  assert.equal(response.body.collectionQuality.qualifying, false);
+  assert.deepEqual(response.body.collectionQuality.reasons, ["clock-skew"]);
 });
 
 test("retention rejects expired replay instead of resurrecting pruned evidence", async () => {
