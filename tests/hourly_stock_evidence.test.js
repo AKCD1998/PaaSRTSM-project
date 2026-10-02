@@ -9,6 +9,7 @@ const path = require("node:path");
 
 const {
   computeNextMorningMetrics,
+  classifyCollectionQuality,
   parseCapturePayload,
   payloadIdentity,
 } = require("../apps/admin-api/src/services/hourlyStockEvidence");
@@ -16,6 +17,7 @@ const {
   createHourlyStockEvidenceRouter,
 } = require("../apps/admin-api/src/routes/hourly-stock-evidence");
 const { loadConfig } = require("../apps/admin-api/src/config");
+const TOKEN = "branch-005-secret".repeat(3);
 
 function payload(overrides = {}) {
   const value = {
@@ -71,11 +73,11 @@ function createMockDb() {
   return { state, async connect() { return client; }, async query() { return { rows: [] }; } };
 }
 
-function createTestApp({ tokens = new Map([["005", "branch-005-secret"]]), db = createMockDb() } = {}) {
+function createTestApp({ tokens = new Map([["005", TOKEN]]), db = createMockDb(), config = {} } = {}) {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
   app.use("/api/hourly-stock-evidence", createHourlyStockEvidenceRouter({
-    config: { hourlyStockEvidenceBranchTokens: tokens },
+    config: { featureHourlyStockEvidence: true, hourlyStockEvidenceBranchTokens: tokens, ...config },
     db,
     requireAuthMiddleware: (_req, _res, next) => next(),
     requireRoleMiddleware: () => (_req, _res, next) => next(),
@@ -108,7 +110,7 @@ test("capture endpoint fails closed without branch tokens and rejects mismatched
   const response = await request(enabled.app)
     .post("/api/hourly-stock-evidence/captures")
     .set("x-branch-code", "004")
-    .set("x-hourly-evidence-token", "branch-005-secret")
+    .set("x-hourly-evidence-token", TOKEN)
     .send(payload());
   assert.equal(response.status, 401);
 });
@@ -118,7 +120,7 @@ test("duplicate retry is idempotent and never inserts product rows twice", async
   const send = () => request(candidate.app)
     .post("/api/hourly-stock-evidence/captures")
     .set("x-branch-code", "005")
-    .set("x-hourly-evidence-token", "branch-005-secret")
+    .set("x-hourly-evidence-token", TOKEN)
     .send(payload());
   const first = await send();
   const duplicate = await send();
@@ -202,10 +204,104 @@ test("19:00 makes comparison computable but daily completeness remains incomplet
 test("configuration is fail-closed and accepts only active per-branch token entries", () => {
   assert.equal(loadConfig({}).hourlyStockEvidenceBranchTokens.size, 0);
   const config = loadConfig({
-    HOURLY_STOCK_EVIDENCE_BRANCH_TOKENS: "005=token:with:colons;002=inactive;001=second",
+    HOURLY_STOCK_EVIDENCE_BRANCH_TOKENS: "005=" + "token:with:colons".repeat(3) + ";001=" + "second".repeat(8),
   });
   assert.deepEqual([...config.hourlyStockEvidenceBranchTokens.keys()], ["005", "001"]);
-  assert.equal(config.hourlyStockEvidenceBranchTokens.get("005"), "token:with:colons");
+  assert.equal(config.hourlyStockEvidenceBranchTokens.get("005"), "token:with:colons".repeat(3));
+});
+
+test("token policy rejects duplicate branches/shared/short/malformed credentials and flag remains OFF", async () => {
+  assert.equal(loadConfig({}).featureHourlyStockEvidence, false);
+  assert.equal(loadConfig({}).featureHourlyStockEvidenceRetention, false);
+  assert.equal(loadConfig({}).hourlyStockEvidenceMaxSlotDelaySeconds, null);
+  for (const entries of ["005=short", "005=" + TOKEN + ";004=" + TOKEN, "005=" + TOKEN + ";005=" + TOKEN, "002=" + TOKEN, "005=" + TOKEN + ";bad"]) {
+    assert.equal(loadConfig({ HOURLY_STOCK_EVIDENCE_BRANCH_TOKENS: entries }).hourlyStockEvidenceBranchTokens.size, 0);
+  }
+  const disabled = createTestApp({ config: { featureHourlyStockEvidence: false } });
+  assert.equal((await request(disabled.app).post("/api/hourly-stock-evidence/captures")
+    .set("x-branch-code", "005").set("x-hourly-evidence-token", TOKEN).send(payload())).status, 503);
+});
+
+test("early capture, evening recovery mislabeled morning, and receipt-less morning are rejected", () => {
+  assert.throws(() => parseCapturePayload(payload({ capturedAt: "2026-09-18T11:59:59.000Z" })), /precede/);
+  assert.throws(() => parseCapturePayload(payload({ observationKind: "morning_anchor", plannedSlot: "08:20",
+    clientMeta: { authoritativeSyncRunId: "9" } })), /before 09:00/);
+  assert.throws(() => parseCapturePayload(payload({ observationKind: "morning_anchor", plannedSlot: "08:20",
+    capturedAt: "2026-09-18T01:20:05.000Z" })), /receipt/);
+});
+
+test("morning persistence checks central branch/full/terminal receipt and rolls back invalid proof", async () => {
+  const { persistCapture } = require("../apps/admin-api/src/routes/hourly-stock-evidence");
+  const capture = parseCapturePayload(payload({ observationKind: "morning_anchor", plannedSlot: "08:20",
+    capturedAt: "2026-09-18T01:20:05.000Z", clientMeta: { authoritativeSyncRunId: "9" } }));
+  const calls = [];
+  const client = { query: async (sql, params) => {
+    calls.push(sql);
+    if (sql.includes("FROM ingest.sync_runs")) {
+      assert.deepEqual(params, ["9", "005", capture.capturedAt]);
+      assert.match(sql, /snapshot_mode = 'full'/);
+      assert.match(sql, /status = 'success'/);
+      assert.match(sql, /apply_status = 'applied'/);
+      return { rows: [] };
+    }
+    return { rows: [] };
+  }};
+  await assert.rejects(persistCapture(client, capture), (e) => e.status === 409);
+  assert.equal(calls.at(-1), "ROLLBACK");
+  assert.equal(calls.some((sql) => sql.startsWith("INSERT")), false);
+});
+
+test("qualification requires complete unique timely cohort and explicit lateness policy, not a stock pass threshold", () => {
+  const slot = { captureCount: 1, slotDelaySeconds: 5 };
+  const evidence = { morning: slot, intraday: Array.from({ length: 11 }, () => slot), nextMorning: slot };
+  const args = { slotEvidence: evidence, missingPlannedSlots: [], metrics: { eligibleProducts: 2 }, maxSlotDelaySeconds: 10 };
+  assert.equal(classifyCollectionQuality(args).qualifying, true);
+  assert.deepEqual(classifyCollectionQuality({ ...args, maxSlotDelaySeconds: null }).reasons, ["lateness-policy-pending"]);
+  assert.equal(classifyCollectionQuality({ ...args, missingPlannedSlots: ["10:00"] }).qualifying, false);
+  assert.equal(classifyCollectionQuality({ ...args, maxSlotDelaySeconds: 1 }).qualifying, false);
+  assert.equal(classifyCollectionQuality({ ...args, metrics: { eligibleProducts: 1, missingEstimatedValue: 1 } }).qualifying, false);
+  assert.equal(classifyCollectionQuality({ ...args, slotEvidence: { ...evidence, morning: { ...slot, captureCount: 2 } } }).qualifying, false);
+});
+
+test("retention rejects expired replay instead of resurrecting pruned evidence", async () => {
+  const candidate = createTestApp({ config: { featureHourlyStockEvidenceRetention: true, hourlyStockEvidenceRetentionDays: 3 } });
+  const response = await request(candidate.app).post("/api/hourly-stock-evidence/captures")
+    .set("x-branch-code", "005").set("x-hourly-evidence-token", TOKEN).send(payload({ capturedAt: "2020-09-18T12:01:02.000Z" }));
+  assert.equal(response.status, 410);
+  assert.equal(response.headers["cache-control"], "no-store");
+  assert.equal(candidate.db.state.runs.size, 0);
+});
+
+test("complete hourly slots do not qualify with a missing/null cohort or duplicate anchor", async () => {
+  const slotRow = (role, slot, date, retail, estimated) => {
+    const planned = new Date(date + "T" + slot + ":00+07:00").toISOString();
+    return { capture_role: role, planned_slot: slot, planned_for: planned,
+      captured_at: new Date(new Date(planned).getTime() + 5000).toISOString(),
+      received_at: new Date(new Date(planned).getTime() + 6000).toISOString(),
+      capture_count: 1, product_code: "P1", retail_on_hand: retail, latest_estimated_on_hand: estimated };
+  };
+  const rows = [slotRow("morning", "08:20", "2026-09-18", 20, 20),
+    slotRow("next_morning", "08:20", "2026-09-19", 18, 18),
+    ...Array.from({ length: 11 }, (_, i) => slotRow("intraday", String(i + 9).padStart(2, "0") + ":00", "2026-09-18", 20, i === 10 ? 18 : 20))];
+  rows[4].product_code = "P2";
+  rows[5].latest_estimated_on_hand = null;
+  const db = createMockDb();
+  db.query = async () => ({ rows });
+  const candidate = createTestApp({ db, config: { hourlyStockEvidenceMaxSlotDelaySeconds: 10 } });
+  const get = () => request(candidate.app).get("/api/hourly-stock-evidence/summary?branchCode=005&date=2026-09-18");
+  const incomplete = await get();
+  assert.equal(incomplete.body.dailyCompletenessStatus, "complete");
+  assert.equal(incomplete.body.metrics.exactMatchCount, 1);
+  assert.equal(incomplete.body.collectionQuality.qualifying, false);
+  assert.deepEqual(incomplete.body.collectionQuality.reasons, ["incomplete-cohort"]);
+  rows[4].product_code = "P1";
+  rows[5].latest_estimated_on_hand = 20;
+  assert.equal((await get()).body.collectionQuality.qualifying, true);
+  rows[0].capture_count = 2;
+  const duplicate = await get();
+  assert.equal(duplicate.body.collectionQuality.qualifying, false);
+  assert.deepEqual(duplicate.body.collectionQuality.reasons, ["duplicate-captures"]);
+  assert.equal("passed" in duplicate.body.metrics, false);
 });
 
 test("migration 074 is additive, transactional and excludes inactive branch 002", () => {

@@ -142,10 +142,12 @@ function parseBranchTokenMap(value) {
     const entry = rawEntry.trim();
     if (!entry) continue;
     const separatorIndex = entry.indexOf("=");
-    if (separatorIndex <= 0 || separatorIndex === entry.length - 1) continue;
+    if (separatorIndex <= 0 || separatorIndex === entry.length - 1) return new Map();
     const branchCode = entry.slice(0, separatorIndex).trim();
     const token = entry.slice(separatorIndex + 1).trim();
-    if (/^(000|001|003|004|005)$/.test(branchCode) && token) map.set(branchCode, token);
+    if (!/^(000|001|003|004|005)$/.test(branchCode) || token.length < 32
+        || map.has(branchCode) || [...map.values()].includes(token)) return new Map();
+    map.set(branchCode, token);
   }
   return map;
 }
@@ -250,6 +252,13 @@ function loadConfig(env = process.env) {
     hourlyStockEvidenceBranchTokens: parseBranchTokenMap(
       env.HOURLY_STOCK_EVIDENCE_BRANCH_TOKENS || "",
     ),
+    featureHourlyStockEvidence: parseBool(env.FEATURE_HOURLY_STOCK_EVIDENCE, false),
+    featureHourlyStockEvidenceRetention: parseBool(env.FEATURE_HOURLY_STOCK_EVIDENCE_RETENTION, false),
+    hourlyStockEvidenceRetentionDays: /^\d+$/.test(String(env.HOURLY_STOCK_EVIDENCE_RETENTION_DAYS ?? "30"))
+      ? Number(env.HOURLY_STOCK_EVIDENCE_RETENTION_DAYS ?? "30") : NaN,
+    // Until lateness policy is approved, summaries cannot qualify a window.
+    hourlyStockEvidenceMaxSlotDelaySeconds: /^\d+$/.test(String(env.HOURLY_STOCK_EVIDENCE_MAX_SLOT_DELAY_SECONDS || ""))
+      ? Number(env.HOURLY_STOCK_EVIDENCE_MAX_SLOT_DELAY_SECONDS) : null,
     syncV2AllowedDatasets: parseCsvSet(env.SYNC_V2_ALLOWED_DATASETS || "", { lowercase: true }),
     syncV2AllowedBranches: parseCsvSet(env.SYNC_V2_ALLOWED_BRANCHES || ""),
     syncV2MaxBatchRecords: parseIntWithFallback(env.SYNC_V2_MAX_BATCH_RECORDS, 100),

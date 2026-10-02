@@ -35,6 +35,8 @@ function payloadIdentity(payload) {
       retailOnHand: record.retailOnHand,
       latestEstimatedOnHand: record.latestEstimatedOnHand,
     })),
+    ...(payload.observationKind === "morning_anchor"
+      ? { authoritativeSyncRunId: String(payload.clientMeta?.authoritativeSyncRunId) } : {}),
   };
   return sha256(canonicalJson(identity));
 }
@@ -60,7 +62,7 @@ function finiteNumber(value, fieldName, { nullable = false } = {}) {
 function parseClientMeta(value) {
   if (value == null) return {};
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("clientMeta must be an object.");
-  const allowed = new Set(["agentVersion", "queryDurationMs", "sqlConnectionAttempts", "sqlConnectionRetryCount"]);
+  const allowed = new Set(["agentVersion", "queryDurationMs", "sqlConnectionAttempts", "sqlConnectionRetryCount", "authoritativeSyncRunId"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`clientMeta.${key} is not allowed.`);
   }
@@ -74,7 +76,12 @@ function parseClientMeta(value) {
     }
     integers[key] = value[key];
   }
-  return { ...(agentVersion == null ? {} : { agentVersion }), ...integers };
+  const authoritativeSyncRunId = value.authoritativeSyncRunId == null ? null : String(value.authoritativeSyncRunId);
+  if (authoritativeSyncRunId != null && !/^[1-9][0-9]{0,17}$/.test(authoritativeSyncRunId)) {
+    throw new Error("clientMeta.authoritativeSyncRunId is invalid.");
+  }
+  return { ...(agentVersion == null ? {} : { agentVersion }), ...integers,
+    ...(authoritativeSyncRunId == null ? {} : { authoritativeSyncRunId }) };
 }
 
 function parseCapturePayload(body) {
@@ -94,6 +101,10 @@ function parseCapturePayload(body) {
   const capturedAt = parseIsoTimestamp(body.capturedAt, "capturedAt");
   const bangkokDate = new Date(new Date(capturedAt).getTime() + (7 * 60 * 60 * 1000)).toISOString().slice(0, 10);
   const plannedFor = new Date(`${bangkokDate}T${plannedSlot}:00+07:00`).toISOString();
+  if (capturedAt < plannedFor) throw new Error("Capture cannot precede its planned slot.");
+  if (observationKind === "morning_anchor" && new Date(capturedAt).getTime() >= new Date(plannedFor).getTime() + 40 * 60_000) {
+    throw new Error("Morning anchor must be captured before 09:00 Bangkok time.");
+  }
   const sourceEventAt = parseIsoTimestamp(body.sourceEventAt, "sourceEventAt", { nullable: true });
   if (sourceEventAt && sourceEventAt > capturedAt) throw new Error("sourceEventAt cannot be after capturedAt.");
   if (!Array.isArray(body.records) || body.records.length < 1 || body.records.length > MAX_RECORDS) {
@@ -128,6 +139,9 @@ function parseCapturePayload(body) {
     records,
     clientMeta: parseClientMeta(body.clientMeta),
   };
+  if (observationKind === "morning_anchor" && !parsed.clientMeta.authoritativeSyncRunId) {
+    throw new Error("Morning anchor requires an authoritative Full Sync receipt.");
+  }
   parsed.payloadSha256 = payloadIdentity(parsed);
   if (body.idempotencyKey !== parsed.payloadSha256) throw new Error("idempotencyKey does not match payload identity.");
   parsed.idempotencyKey = parsed.payloadSha256;
@@ -180,6 +194,20 @@ function computeNextMorningMetrics({ morningAnchorRows = [], closingRows = [], n
   return metrics;
 }
 
+function classifyCollectionQuality({ slotEvidence, missingPlannedSlots, metrics, maxSlotDelaySeconds }) {
+  const slots = [slotEvidence.morning, ...slotEvidence.intraday, slotEvidence.nextMorning].filter(Boolean);
+  const reasons = [];
+  if (!slotEvidence.morning || !slotEvidence.nextMorning || missingPlannedSlots.length) reasons.push("missing-slots");
+  if (slots.some((slot) => slot.captureCount !== 1)) reasons.push("duplicate-captures");
+  if (slots.some((slot) => slot.slotDelaySeconds < 0)) reasons.push("early-captures");
+  const policyReady = Number.isSafeInteger(maxSlotDelaySeconds) && maxSlotDelaySeconds >= 0 && maxSlotDelaySeconds <= 3600;
+  if (!policyReady) reasons.push("lateness-policy-pending");
+  else if (slots.some((slot) => slot.slotDelaySeconds > maxSlotDelaySeconds)) reasons.push("late-captures");
+  if (!metrics || metrics.eligibleProducts === 0 || metrics.missingMorningAnchor || metrics.missingClosing
+      || metrics.missingNextMorning || metrics.missingEstimatedValue) reasons.push("incomplete-cohort");
+  return { qualifying: reasons.length === 0, reasons, maxSlotDelaySeconds: policyReady ? maxSlotDelaySeconds : null };
+}
+
 module.exports = {
   ACTIVE_BRANCHES,
   CONTRACT_VERSION,
@@ -188,6 +216,7 @@ module.exports = {
   MAX_RECORDS,
   canonicalJson,
   computeNextMorningMetrics,
+  classifyCollectionQuality,
   parseCapturePayload,
   payloadIdentity,
 };

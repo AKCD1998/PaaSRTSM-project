@@ -15,6 +15,7 @@ const {
 } = require("../apps/admin-api/src/routes/hourly-stock-evidence");
 
 const databaseUrl = process.env.HOURLY_EVIDENCE_TEST_DATABASE_URL;
+const { pruneHourlyEvidence } = require("../apps/admin-api/src/services/hourlyEvidenceRetention");
 const integration = databaseUrl ? test : test.skip;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 2 }) : null;
 const migrationSql = fs.readFileSync(
@@ -90,11 +91,17 @@ integration("REAL POSTGRES: migration, constraints, null UNNEST, idempotency, ro
   );
   t.after(async () => {
     await pool.query("DROP SCHEMA IF EXISTS evidence CASCADE");
+    await pool.query("DROP SCHEMA IF EXISTS ingest CASCADE");
     await pool.end();
   });
   await pool.query("DROP SCHEMA IF EXISTS evidence CASCADE");
   await pool.query(migrationSql);
   await pool.query(migrationSql);
+  // Minimal authoritative run receipt fixtures, only inside the guarded,
+  // newly-created disposable DB. Never bootstrap production with this stub.
+  await pool.query("CREATE SCHEMA ingest");
+  await pool.query("CREATE TABLE ingest.sync_runs (sync_run_id bigint PRIMARY KEY, branch_code text, status text, snapshot_mode text, ingestion_mode text, apply_status text, finished_at timestamptz)");
+  await pool.query("INSERT INTO ingest.sync_runs VALUES (1,'005','success','full','hybrid_v2','applied','2026-09-18T01:22:00Z'), (2,'005','success','full','v1','not_applicable','2026-09-19T01:22:00Z'), (3,'004','success','full','hybrid_v2','pending','2026-09-18T01:22:00Z')");
 
   const constraints = await pool.query(
     `SELECT conname
@@ -158,6 +165,7 @@ integration("REAL POSTGRES: migration, constraints, null UNNEST, idempotency, ro
       observationKind: "morning_anchor",
       plannedSlot: "08:20",
       capturedAt: "2026-09-18T01:20:05.000Z",
+      clientMeta: { authoritativeSyncRunId: "1" },
       records: [
         { productCode: "IC-003550", retailOnHand: 222, latestEstimatedOnHand: 222 },
         { productCode: "IC-005003", retailOnHand: 100, latestEstimatedOnHand: 100 },
@@ -167,6 +175,7 @@ integration("REAL POSTGRES: migration, constraints, null UNNEST, idempotency, ro
       observationKind: "morning_anchor",
       plannedSlot: "08:20",
       capturedAt: "2026-09-19T01:20:05.000Z",
+      clientMeta: { authoritativeSyncRunId: "2" },
       records: [
         { productCode: "IC-003550", retailOnHand: 221, latestEstimatedOnHand: 221 },
         { productCode: "IC-005003", retailOnHand: 99, latestEstimatedOnHand: 99 },
@@ -190,4 +199,39 @@ integration("REAL POSTGRES: migration, constraints, null UNNEST, idempotency, ro
   assert.equal(summary.body.missingPlannedSlots.length, 10);
   assert.equal(summary.body.metrics.eligibleProducts, 1);
   assert.equal(summary.body.metrics.missingEstimatedValue, 1);
+  assert.equal(summary.body.collectionQuality.qualifying, false);
+  assert.ok(summary.body.collectionQuality.reasons.includes("lateness-policy-pending"));
+
+  const invalidReceipt = capture({ observationKind: "morning_anchor", plannedSlot: "08:20",
+    capturedAt: "2026-09-18T01:20:06.000Z", clientMeta: { authoritativeSyncRunId: "3" } });
+  const receiptClient = await pool.connect();
+  try { await assert.rejects(persistCapture(receiptClient, invalidReceipt), (error) => error.status === 409); }
+  finally { receiptClient.release(); }
+  assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_runs")).rows[0].count, 3);
+
+  const recent = capture({ capturedAt: "2026-10-02T12:00:01.000Z" });
+  const retentionClient = await pool.connect();
+  try {
+    await persistCapture(retentionClient, recent);
+    assert.equal((await pruneHourlyEvidence(retentionClient)).status, "disabled");
+    const policy = { enabled: true, retentionDays: 3, batchSize: 1, now: "2026-10-02T13:00:00.000Z" };
+    const dryRun = await pruneHourlyEvidence(retentionClient, policy);
+    assert.equal(dryRun.eligibleRuns, 3);
+    assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_runs")).rows[0].count, 4);
+    const pruned = await pruneHourlyEvidence(retentionClient, { ...policy, execute: true });
+    assert.equal(pruned.deletedRuns, 1);
+    assert.equal(pruned.deletedRows, 2);
+    // Failure after deleting children rolls back both tables.
+    const failing = { query: async (sql, params) => {
+      if (sql.startsWith("DELETE FROM evidence.hourly_stock_capture_runs")) throw new Error("retention-rollback-probe");
+      return retentionClient.query(sql, params);
+    }};
+    const before = await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_rows");
+    await assert.rejects(pruneHourlyEvidence(failing, { ...policy, execute: true }), /rollback-probe/);
+    assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_rows")).rows[0].count, before.rows[0].count);
+    await pruneHourlyEvidence(retentionClient, { ...policy, batchSize: 100, execute: true });
+    assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_runs")).rows[0].count, 1);
+    assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_rows")).rows[0].count, 2);
+    assert.equal((await pruneHourlyEvidence(retentionClient, { ...policy, execute: true })).deletedRuns, 0);
+  } finally { retentionClient.release(); }
 });

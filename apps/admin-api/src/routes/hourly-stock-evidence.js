@@ -6,6 +6,7 @@ const { acquireIngestionDbClient } = require("../utils/db-acquire");
 const {
   ACTIVE_BRANCHES,
   computeNextMorningMetrics,
+  classifyCollectionQuality,
   parseCapturePayload,
 } = require("../services/hourlyStockEvidence");
 
@@ -17,6 +18,7 @@ function timingSafeEqualStrings(left, right) {
 }
 
 function authenticateBranch(config, req, branchCode) {
+  if (config.featureHourlyStockEvidence !== true) return { status: 503, message: "Hourly evidence ingestion is disabled." };
   const tokens = config.hourlyStockEvidenceBranchTokens;
   if (!(tokens instanceof Map) || tokens.size === 0) return { status: 503, message: "Hourly evidence ingestion is not configured." };
   const expected = tokens.get(branchCode);
@@ -31,6 +33,21 @@ function authenticateBranch(config, req, branchCode) {
 async function persistCapture(client, capture) {
   await client.query("BEGIN");
   try {
+    if (capture.observationKind === "morning_anchor") {
+      const receipt = await client.query(
+        `SELECT sync_run_id FROM ingest.sync_runs
+          WHERE sync_run_id = $1 AND branch_code = $2
+            AND status = 'success' AND snapshot_mode = 'full'
+            AND (ingestion_mode = 'v1' OR apply_status = 'applied')
+            AND finished_at >= $3::timestamptz
+            AND (finished_at AT TIME ZONE 'Asia/Bangkok')::date =
+                ($3::timestamptz AT TIME ZONE 'Asia/Bangkok')::date`,
+        [capture.clientMeta.authoritativeSyncRunId, capture.branchCode, capture.capturedAt],
+      );
+      if (receipt.rows.length !== 1) {
+        throw Object.assign(new Error("Authoritative Full Sync receipt is not successful for this branch/date."), { status: 409 });
+      }
+    }
     const inserted = await client.query(
       `INSERT INTO evidence.hourly_stock_capture_runs (
          idempotency_key, contract_version, branch_code, observation_kind,
@@ -107,6 +124,7 @@ function parseDate(value) {
 
 function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, requireRoleMiddleware }) {
   const router = express.Router();
+  router.use((_req, res, next) => { res.set("Cache-Control", "no-store"); next(); });
 
   router.post("/captures", async (req, res, next) => {
     let capture;
@@ -117,6 +135,15 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
     }
     const authError = authenticateBranch(config, req, capture.branchCode);
     if (authError) return res.status(authError.status).json({ message: authError.message });
+    if (config.featureHourlyStockEvidenceRetention === true) {
+      const days = config.hourlyStockEvidenceRetentionDays;
+      if (!Number.isSafeInteger(days) || days < 3 || days > 365) {
+        return res.status(503).json({ message: "Hourly evidence retention policy is invalid." });
+      }
+      if (new Date(capture.capturedAt).getTime() < Date.now() - days * 86400_000) {
+        return res.status(410).json({ message: "Capture is outside the retained evidence window." });
+      }
+    }
 
     const client = await acquireIngestionDbClient(db, res, "hourly-stock-evidence:/captures");
     if (!client) return undefined;
@@ -124,6 +151,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
       const stored = await persistCapture(client, capture);
       return res.status(stored.duplicate ? 200 : 201).json({
         accepted: capture.records.length,
+        branchCode: capture.branchCode,
         duplicate: stored.duplicate,
         captureId: stored.captureId,
         plannedFor: capture.plannedFor,
@@ -153,16 +181,16 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const result = await db.query(
           `WITH selected AS (
              SELECT 'morning' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, 1::bigint AS capture_count
+                    captured_at, planned_for, received_at, COUNT(*) OVER () AS capture_count
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'morning_anchor'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date
-              ORDER BY captured_at DESC LIMIT 1
+              ORDER BY captured_at ASC, capture_id ASC LIMIT 1
            ), intraday_ranked AS (
              SELECT 'intraday' AS capture_role, capture_id, planned_slot,
                     captured_at, planned_for, received_at,
                     COUNT(*) OVER (PARTITION BY planned_slot) AS capture_count,
-                    ROW_NUMBER() OVER (PARTITION BY planned_slot ORDER BY captured_at DESC) AS slot_rank
+                    ROW_NUMBER() OVER (PARTITION BY planned_slot ORDER BY captured_at ASC, capture_id ASC) AS slot_rank
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'intraday'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date
@@ -171,11 +199,11 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
                FROM intraday_ranked WHERE slot_rank = 1
            ), next_morning AS (
              SELECT 'next_morning' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, 1::bigint AS capture_count
+                    captured_at, planned_for, received_at, COUNT(*) OVER () AS capture_count
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'morning_anchor'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = ($2::date + 1)
-              ORDER BY captured_at DESC LIMIT 1
+              ORDER BY captured_at ASC, capture_id ASC LIMIT 1
            ), captures AS (
              SELECT * FROM selected UNION ALL SELECT * FROM intraday_slots UNION ALL SELECT * FROM next_morning
            )
@@ -190,9 +218,12 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         );
         const grouped = { morning: [], closing: [], next_morning: [] };
         const slotEvidence = { morning: null, intraday: [], nextMorning: null };
+        const cohortBySlot = new Map();
         const seenCaptures = new Set();
         for (const row of result.rows) {
           const captureKey = `${row.capture_role}:${row.planned_slot}`;
+          if (!cohortBySlot.has(captureKey)) cohortBySlot.set(captureKey, new Map());
+          cohortBySlot.get(captureKey).set(row.product_code, row.latest_estimated_on_hand);
           if (!seenCaptures.has(captureKey)) {
             seenCaptures.add(captureKey);
             const evidence = {
@@ -225,6 +256,24 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const capturedSlotSet = new Set(capturedPlannedSlots);
         const missingPlannedSlots = expectedPlannedSlots.filter((slot) => !capturedSlotSet.has(slot));
         const comparisonStatus = missingSlots.length === 0 ? "compared" : "incomplete";
+        const metrics = comparisonStatus === "compared" ? computeNextMorningMetrics({
+          morningAnchorRows: grouped.morning, closingRows: grouped.closing, nextMorningRows: grouped.next_morning,
+        }) : null;
+        const expectedCohort = cohortBySlot.get("morning:08:20") ?? new Map();
+        for (const slot of slotEvidence.intraday) {
+          const cohort = cohortBySlot.get("intraday:" + slot.plannedSlot);
+          slot.cohortMismatchCount = [...new Set([...expectedCohort.keys(), ...cohort.keys()])]
+            .filter((code) => !cohort.has(code) || !expectedCohort.has(code)).length;
+          slot.missingEstimatedValueCount = [...cohort.values()].filter((value) => value == null).length;
+        }
+        const collectionQuality = classifyCollectionQuality({
+          slotEvidence, missingPlannedSlots, metrics,
+          maxSlotDelaySeconds: config.hourlyStockEvidenceMaxSlotDelaySeconds,
+        });
+        if (slotEvidence.intraday.some((slot) => slot.cohortMismatchCount || slot.missingEstimatedValueCount)) {
+          if (!collectionQuality.reasons.includes("incomplete-cohort")) collectionQuality.reasons.push("incomplete-cohort");
+          collectionQuality.qualifying = false;
+        }
         return res.json({
           branchCode,
           date,
@@ -235,11 +284,8 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
           capturedPlannedSlots,
           missingPlannedSlots,
           slotEvidence,
-          metrics: comparisonStatus === "compared" ? computeNextMorningMetrics({
-            morningAnchorRows: grouped.morning,
-            closingRows: grouped.closing,
-            nextMorningRows: grouped.next_morning,
-          }) : null,
+          collectionQuality,
+          metrics,
         });
       } catch (error) {
         return next(error);
