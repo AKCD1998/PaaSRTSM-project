@@ -261,3 +261,131 @@ integration("explicit hard tombstone requires the separate gate and writes audit
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_lines")).rows[0].n, 0);
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_delta_tombstone_audit")).rows[0].n, 1);
 });
+
+const authenticatedConfig = {
+  posApiKeys: new Set(["synthetic-pos-key"]), featureTransferDeltaApply: true,
+  featureTransferDeltaHardTombstones: false, transferDeltaBranches: new Set(["004", "002"]),
+};
+
+test("POS authentication and inactive collector guards reject before acquiring a DB client", async () => {
+  const db = { connect: async () => { throw new Error("must not connect"); } };
+  const instance = app(authenticatedConfig, db);
+  for (const key of [null, "invalid-synthetic-key"]) {
+    let requestBuilder = request(instance).post("/api/sync/ada/transfers/delta");
+    if (key) requestBuilder = requestBuilder.set("x-api-key", key);
+    await requestBuilder.send({ branchCode: "004" }).expect(401);
+  }
+  await request(instance).post("/api/sync/ada/transfers/delta")
+    .set("x-api-key", "synthetic-pos-key").send({ branchCode: "002" }).expect(404);
+});
+
+test("unrelated or inactive senders, duplicate headers and orphan lines remain rejected before SQL", async () => {
+  for (const [headers, lines, message] of [
+    [[{ ...header(), branchCode: "001", branchCodeTo: "005" }], [], "Transfer Delta cannot mix branch codes."],
+    [[{ ...header(), branchCode: "002", branchCodeTo: "004" }], [], "Transfer Delta cannot mix branch codes."],
+    [[header(), header()], [], "Transfer Delta contains a duplicate document header."],
+    [[header()], [{ ...line(1, "P1"), branchCode: "001" }], "Every Transfer Delta line requires its complete document header."],
+  ]) {
+    const body = applyBody(null, "a".repeat(64), "b".repeat(64), headers, lines);
+    await assert.rejects(applyTransferDelta({ query: async () => { throw new Error("must not query"); } },
+      body, body.headers, body.lines), (error) => error.status === 400 && error.message === message);
+  }
+});
+
+integration("authenticated Agent-shaped mixed incoming and outgoing payload preserves canonical keys and retry idempotency", async () => {
+  const checkpoint = await seedCheckpoint();
+  const sources = ["000", "001", "001", "001", "001", "004"];
+  const lineCounts = [4, 5, 5, 5, 5, 10];
+  // This is the Agent wire shape: canonical branchCode, branchTo and seqNo.
+  const headers = sources.map((branchCode, index) => ({ docNo: `MIX-${index}`, docType: "4",
+    branchCode, branchTo: branchCode === "004" ? "005" : "004", docDate: "2026-10-09" }));
+  const lines = headers.flatMap((record, index) => Array.from({ length: lineCounts[index] }, (_, offset) => ({
+    docNo: record.docNo, docType: record.docType, branchCode: record.branchCode,
+    seqNo: offset + 1, productCode: `SYNTHETIC-${offset}`, qty: 1,
+  })));
+  const body = applyBody(checkpoint.checkpointToken, "a".repeat(64), "b".repeat(64), headers, lines);
+  const instance = app(authenticatedConfig, pool);
+  const first = await request(instance).post("/api/sync/ada/transfers/delta")
+    .set("x-api-key", "synthetic-pos-key").send(body).expect(200);
+  assert.equal(first.body.acceptedHeaders, 6);
+  assert.equal(first.body.acceptedLines, 34);
+  assert.equal(first.body.checkpointSequence, 2);
+  const replay = await request(instance).post("/api/sync/ada/transfers/delta")
+    .set("x-api-key", "synthetic-pos-key").send(body).expect(200);
+  assert.equal(replay.body.replayed, true);
+  assert.equal(replay.body.checkpointToken, first.body.checkpointToken);
+  assert.deepEqual((await pool.query(`SELECT branch_code,count(*)::int AS n FROM ada.transfer_headers
+    GROUP BY branch_code ORDER BY branch_code`)).rows,
+  [{ branch_code: "000", n: 1 }, { branch_code: "001", n: 4 }, { branch_code: "004", n: 1 }]);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_lines")).rows[0].n, 34);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_delta_requests WHERE operation='apply'")).rows[0].n, 1);
+});
+
+integration("incoming Delta replaces the Full projection under the sender key and removes stale lines", async () => {
+  const incomingHeader = { ...header(), branchCode: "000", branchCodeTo: "004" };
+  const incomingLines = [1, 2].map((number) => ({ ...line(number, `P${number}`), branchCode: "000" }));
+  const instance = app(authenticatedConfig, pool);
+  await request(instance).post("/api/sync/ada/transfers").set("x-api-key", "synthetic-pos-key")
+    .send({ headers: [incomingHeader], lines: incomingLines }).expect(200);
+  const checkpoint = await seedCheckpoint();
+  const body = applyBody(checkpoint.checkpointToken, "a".repeat(64), "b".repeat(64), [incomingHeader],
+    [{ ...incomingLines[0], qty: 7 }]);
+  await request(instance).post("/api/sync/ada/transfers/delta").set("x-api-key", "synthetic-pos-key")
+    .send(body).expect(200);
+  assert.deepEqual((await pool.query(`SELECT h.branch_code,h.branch_code_to,l.line_no,l.qty::float8 AS qty
+    FROM ada.transfer_headers h JOIN ada.transfer_lines l USING(doc_no,doc_type,branch_code)`)).rows,
+  [{ branch_code: "000", branch_code_to: "004", line_no: 1, qty: 7 }]);
+});
+
+integration("spoofed incoming receiver cannot retarget an existing unrelated document and rolls back the whole Delta", async () => {
+  const instance = app(authenticatedConfig, pool);
+  const unrelatedHeader = { ...header(), branchCode: "000", branchCodeTo: "005" };
+  await request(instance).post("/api/sync/ada/transfers").set("x-api-key", "synthetic-pos-key")
+    .send({ headers: [unrelatedHeader], lines: [{ ...line(1, "P1"), branchCode: "000" }] }).expect(200);
+  const checkpoint = await seedCheckpoint();
+  const outgoing = { ...header(), docNo: "OUTGOING-BEFORE-CONFLICT" };
+  const body = applyBody(checkpoint.checkpointToken, "a".repeat(64), "b".repeat(64),
+    [outgoing, { ...unrelatedHeader, branchCodeTo: "004" }],
+    [{ ...line(1, "P1", 99), branchCode: "000" }]);
+  for (let retry = 0; retry < 2; retry += 1) {
+    const result = await request(instance).post("/api/sync/ada/transfers/delta")
+      .set("x-api-key", "synthetic-pos-key").send(body).expect(400);
+    assert.equal(result.body.message, "Transfer Delta cannot mix branch codes.");
+    assert.equal((await pool.query("SELECT checkpoint_sequence FROM ada.transfer_delta_checkpoints")).rows[0].checkpoint_sequence, "1");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_delta_requests WHERE operation='apply'")).rows[0].n, 0);
+    assert.deepEqual((await pool.query(`SELECT h.branch_code,h.branch_code_to,l.qty::float8 AS qty
+      FROM ada.transfer_headers h JOIN ada.transfer_lines l USING(doc_no,doc_type,branch_code)`)).rows,
+    [{ branch_code: "000", branch_code_to: "005", qty: 1 }]);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_headers")).rows[0].n, 1);
+  }
+});
+
+integration("atomic incoming UPSERT ownership guard rejects a concurrent unrelated insert", async () => {
+  const checkpoint = await seedCheckpoint();
+  const incoming = { ...header(), docNo: "RACE", branchCode: "000", branchCodeTo: "004" };
+  const body = applyBody(checkpoint.checkpointToken, "a".repeat(64), "b".repeat(64), [incoming], []);
+  const blocker = await pool.connect();
+  const delivery = await pool.connect();
+  let reachedInsert;
+  const reached = new Promise((resolve) => { reachedInsert = resolve; });
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query(`INSERT INTO ada.transfer_headers(doc_no,doc_type,branch_code,branch_code_to,source_synced_at)
+      VALUES ('RACE','4','000','005',now())`);
+    const outcome = applyTransferDelta({ query: (sql, params) => {
+      if (/INSERT INTO ada\.transfer_headers/.test(sql)) reachedInsert();
+      return delivery.query(sql, params);
+    } }, body, body.headers, body.lines).then(() => ({ ok: true }), (error) => ({ error }));
+    await Promise.race([reached, outcome.then(() => { throw new Error("Delta did not reach the incoming UPSERT"); })]);
+    await blocker.query("COMMIT");
+    const result = await outcome;
+    assert.equal(result.error?.status, 400);
+    assert.equal(result.error?.message, "Transfer Delta cannot mix branch codes.");
+    assert.equal((await pool.query("SELECT branch_code_to FROM ada.transfer_headers WHERE doc_no='RACE'")).rows[0].branch_code_to, "005");
+    assert.equal((await pool.query("SELECT checkpoint_sequence FROM ada.transfer_delta_checkpoints")).rows[0].checkpoint_sequence, "1");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM ada.transfer_delta_requests WHERE operation='apply'")).rows[0].n, 0);
+  } finally {
+    await blocker.query("ROLLBACK");
+    blocker.release(); delivery.release();
+  }
+});
