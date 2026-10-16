@@ -92,7 +92,8 @@ function validateEnvelope(body, headers, lines) {
 
   const headerKeys = new Set();
   for (const header of headers) {
-    if (normalizeText(header.branchCode) !== branchCode) {
+    if (!isActiveTransferBranch(normalizeText(header.branchCode))
+      || (normalizeText(header.branchCode) !== branchCode && normalizeText(header.branchCodeTo) !== branchCode)) {
       throw deltaError("Transfer Delta cannot mix branch codes.");
     }
     const key = JSON.stringify([normalizeText(header.branchCode), normalizeText(header.docType), normalizeText(header.docNo)]);
@@ -159,7 +160,13 @@ function lineWrite(body, record) {
 
 async function replaceDocument(client, body, header, documentLines) {
   const h = headerWrite(body, header);
-  await client.query(
+  const incoming = h.branchCode !== normalizeText(body.branchCode);
+  // POS authentication is the same trusted ingestion boundary as Full. Keep
+  // the canonical sender key, but never retarget another receiver's existing
+  // document from an incoming collector, including an insert/update race.
+  const ownershipGuard = incoming
+    ? " WHERE ada.transfer_headers.branch_code_to = $22 RETURNING doc_no" : "";
+  const result = await client.query(
     `INSERT INTO ada.transfer_headers
       (doc_no, doc_type, doc_status, process_status, branch_code, branch_code_to,
        warehouse_code, warehouse_code_to, doc_date, doc_time, approved_at, processed_at,
@@ -174,11 +181,16 @@ async function replaceDocument(client, body, header, documentLines) {
        created_by=EXCLUDED.created_by, approved_by=EXCLUDED.approved_by, remark=EXCLUDED.remark,
        reference_doc_no=EXCLUDED.reference_doc_no, reference_doc_type=EXCLUDED.reference_doc_type,
        source_system=EXCLUDED.source_system, source_table=EXCLUDED.source_table,
-       source_synced_at=EXCLUDED.source_synced_at, raw_payload=EXCLUDED.raw_payload, updated_at=now()`,
+       source_synced_at=EXCLUDED.source_synced_at, raw_payload=EXCLUDED.raw_payload, updated_at=now()${ownershipGuard}`,
     [h.docNo,h.docType,h.docStatus,h.processStatus,h.branchCode,h.branchCodeTo,h.warehouseCode,h.warehouseCodeTo,
       h.docDate,h.docTime,h.approvedAt,h.processedAt,h.createdBy,h.approvedBy,h.remark,h.referenceDocNo,
-      h.referenceDocType,h.sourceSystem,h.sourceTable,h.sourceSyncedAt,h.rawPayload],
+      h.referenceDocType,h.sourceSystem,h.sourceTable,h.sourceSyncedAt,h.rawPayload,
+      ...(incoming ? [normalizeText(body.branchCode)] : [])],
   );
+
+  if (incoming && result.rowCount !== 1) {
+    throw deltaError("Transfer Delta cannot mix branch codes.");
+  }
 
   // The payload contains the full current line set for this changed document.
   // Deleting only this document's previous lines inside the same transaction
