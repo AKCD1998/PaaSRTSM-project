@@ -79,6 +79,12 @@ record-update dates were October 17. These are current operational codes,
 not historical posting timestamps; the meaning of the codes and their exact
 effect cannot be certified from column names.
 
+At 11:33 the current stock-field pair still matched the next-morning captured
+pair for all 50 pilot products. The wholesale quantity was zero for all 50.
+Six products still had a gap between the two captured fields, so the current
+wholesale quantity does not explain those gaps. This is a current snapshot,
+not a reconstruction of wholesale stock at the previous closing capture.
+
 The existing account lacks VIEW DEFINITION for the database/stock object
 and VIEW SERVER STATE. Procedure/trigger visibility is restricted. An empty
 visible module/trigger result is therefore not proof that no writer exists.
