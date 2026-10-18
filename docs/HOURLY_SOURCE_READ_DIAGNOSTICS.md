@@ -38,6 +38,18 @@ snapshot options OFF. The active variant, consistent-read strategy and
 posting watermark remain unresolved. No operational timestamp or arithmetic
 match can make this diagnostic metadata qualifying.
 
+Further read-only B50 probes connect the six current SI components with
+8 candidate documents / 35 lines whose processing states and approval actor
+are blank and which have no matching primary stock-card row. A separate
+processed-state group has matching cards. These observations do not certify
+document lifecycle semantics or historical posting. The 17 October sales
+stock-card audit fields show an 18 October 07:46:22–07:46:30 write period;
+the supplied temporary writer also uses a business-date parameter for audit
+dates. Generic insert/update fields must not become `sourceEventAt` until
+their final-writer semantics and a posting cutoff are established. The user
+confirms opening the POS or starting its day in that morning period; this is
+operator context, not a replacement for posting evidence.
+
 See the paired Agent's
 [source formula review](https://github.com/AKCD1998/SC-StockDay-Ordering/blob/codex/hourly-source-provenance/docs/HOURLY_SOURCE_FORMULA_REVIEW.md)
 for evidence boundaries and gates before choosing a live-stock adapter. Keep
