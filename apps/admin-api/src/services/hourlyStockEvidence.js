@@ -152,6 +152,141 @@ function sign(value) {
   return value > 0 ? 1 : value < 0 ? -1 : 0;
 }
 
+// Gaps between two stored fields are observations, not a stock error verdict.
+function computeSameTimeFieldGaps(rows = []) {
+  const result = {
+    observedProducts: rows.length, comparedProducts: 0, equalCount: 0, gapCount: 0,
+    missingEstimatedValueCount: 0, absoluteGapSum: 0, absoluteGapMean: null, absoluteGapMax: null,
+  };
+  for (const row of rows) {
+    if (row.latestEstimatedOnHand == null) { result.missingEstimatedValueCount++; continue; }
+    const gap = Math.abs(row.latestEstimatedOnHand - row.retailOnHand);
+    result.comparedProducts++;
+    result.absoluteGapSum += gap;
+    result.absoluteGapMax = Math.max(result.absoluteGapMax ?? 0, gap);
+    if (gap === 0) result.equalCount++;
+    else result.gapCount++;
+  }
+  if (result.comparedProducts) result.absoluteGapMean = result.absoluteGapSum / result.comparedProducts;
+  return result;
+}
+
+function computeSameFieldChanges(beforeRows, afterRows, field) {
+  const before = new Map(beforeRows.map((row) => [row.productCode, row]));
+  const after = new Map(afterRows.map((row) => [row.productCode, row]));
+  const codes = new Set([...before.keys(), ...after.keys()]);
+  const result = {
+    comparedProducts: 0, unchangedCount: 0, increasedCount: 0, decreasedCount: 0,
+    missingObservationCount: 0, missingValueCount: 0, absoluteChangeSum: 0,
+  };
+  for (const code of codes) {
+    if (!before.has(code) || !after.has(code)) { result.missingObservationCount++; continue; }
+    const left = before.get(code)[field];
+    const right = after.get(code)[field];
+    if (left == null || right == null) { result.missingValueCount++; continue; }
+    const change = right - left;
+    result.comparedProducts++;
+    result.absoluteChangeSum += Math.abs(change);
+    if (change === 0) result.unchangedCount++;
+    else if (change > 0) result.increasedCount++;
+    else result.decreasedCount++;
+  }
+  return result;
+}
+
+function computeStockComparisons({ morningAnchorRows = [], closingRows = [], nextMorningRows = [] }) {
+  const maps = [morningAnchorRows, closingRows, nextMorningRows]
+    .map((rows) => new Map(rows.map((row) => [row.productCode, row])));
+  const codes = new Set(maps.flatMap((map) => [...map.keys()]));
+  const forwardMismatchGroups = {
+    comparedProducts: 0, mismatchCount: 0, missingObservationCount: 0, missingEstimatedValueCount: 0,
+    noClosingFieldGapWithLaterRetailChangeCount: 0,
+    persistentFieldGapAcrossThreeObservationsCount: 0,
+    otherOrMixedCount: 0, forwardMatchesWithClosingFieldGapCount: 0,
+  };
+  for (const code of codes) {
+    const [morning, closing, next] = maps.map((map) => map.get(code));
+    if (!morning || !closing || !next) { forwardMismatchGroups.missingObservationCount++; continue; }
+    if (morning.latestEstimatedOnHand == null || closing.latestEstimatedOnHand == null) {
+      forwardMismatchGroups.missingEstimatedValueCount++;
+      continue;
+    }
+    forwardMismatchGroups.comparedProducts++;
+    if (closing.latestEstimatedOnHand === next.retailOnHand) {
+      if (closing.latestEstimatedOnHand !== closing.retailOnHand) {
+        forwardMismatchGroups.forwardMatchesWithClosingFieldGapCount++;
+      }
+      continue;
+    }
+    forwardMismatchGroups.mismatchCount++;
+    if (closing.latestEstimatedOnHand === closing.retailOnHand) {
+      forwardMismatchGroups.noClosingFieldGapWithLaterRetailChangeCount++;
+    } else if (next.latestEstimatedOnHand != null
+        && morning.retailOnHand === closing.retailOnHand && closing.retailOnHand === next.retailOnHand
+        && morning.latestEstimatedOnHand === closing.latestEstimatedOnHand
+        && closing.latestEstimatedOnHand === next.latestEstimatedOnHand) {
+      forwardMismatchGroups.persistentFieldGapAcrossThreeObservationsCount++;
+    } else {
+      forwardMismatchGroups.otherOrMixedCount++;
+    }
+  }
+  const changes = (before, after) => ({
+    retailOnHand: computeSameFieldChanges(before, after, "retailOnHand"),
+    latestEstimatedOnHand: computeSameFieldChanges(before, after, "latestEstimatedOnHand"),
+  });
+  return {
+    sameTimeFieldGaps: {
+      morning: computeSameTimeFieldGaps(morningAnchorRows),
+      closing: computeSameTimeFieldGaps(closingRows),
+      nextMorning: computeSameTimeFieldGaps(nextMorningRows),
+    },
+    sameFieldChanges: {
+      morningToClosing: changes(morningAnchorRows, closingRows),
+      closingToNextMorning: changes(closingRows, nextMorningRows),
+    },
+    forwardMismatchGroups,
+  };
+}
+
+function sourceTimeDiagnostics({ capturedAt, sourceEventAt }) {
+  if (sourceEventAt == null) return { status: "unknown", reason: "source-time-missing", sourceAgeSeconds: null };
+  const captured = capturedAt == null ? NaN : new Date(capturedAt).getTime();
+  const source = new Date(sourceEventAt).getTime();
+  if (!Number.isFinite(captured) || !Number.isFinite(source) || source > captured) {
+    return { status: "invalid", reason: "invalid-source-time", sourceAgeSeconds: null };
+  }
+  // source_event_at is optional in v1. Its meaning is not proof that BOTH
+  // quantity fields include all movements up to this time. Never substitute
+  // SQL read time, product edit time, receipt time or a 300s slot-delay budget.
+  return {
+    status: "unknown", reason: "source-cutoff-not-verified",
+    sourceAgeSeconds: (captured - source) / 1000,
+  };
+}
+
+function classifySourceFreshness({ slotEvidence, missingPlannedSlots }) {
+  const slots = [slotEvidence.morning, ...slotEvidence.intraday, slotEvidence.nextMorning].filter(Boolean);
+  const diagnostics = slots.map(sourceTimeDiagnostics);
+  const reasons = [];
+  if (!slotEvidence.morning || !slotEvidence.nextMorning || missingPlannedSlots.length) reasons.push("missing-slots");
+  const missingSourceTimeCount = diagnostics.filter((value) => value.reason === "source-time-missing").length;
+  const invalidSourceTimeCount = diagnostics.filter((value) => value.status === "invalid").length;
+  if (missingSourceTimeCount) reasons.push("source-time-missing");
+  if (invalidSourceTimeCount) reasons.push("invalid-source-time");
+  reasons.push("source-cutoff-not-verified", "source-age-policy-pending");
+  const ages = diagnostics.map((value) => value.sourceAgeSeconds).filter((value) => value != null);
+  return {
+    status: invalidSourceTimeCount ? "invalid" : "unknown",
+    qualifying: false,
+    observedSlotCount: slots.length, missingSourceTimeCount, invalidSourceTimeCount,
+    minReportedSourceAgeSeconds: ages.length ? Math.min(...ages) : null,
+    maxReportedSourceAgeSeconds: ages.length ? Math.max(...ages) : null,
+    sourceCutoffVerified: false,
+    maxSourceAgeSeconds: null,
+    reasons,
+  };
+}
+
 function computeNextMorningMetrics({ morningAnchorRows = [], closingRows = [], nextMorningRows = [] }) {
   const maps = [morningAnchorRows, closingRows, nextMorningRows].map((rows) => new Map(rows.map((row) => [row.productCode, row])));
   const productCodes = new Set(maps.flatMap((map) => [...map.keys()]));
@@ -221,7 +356,11 @@ module.exports = {
   MAX_RECORDS,
   canonicalJson,
   computeNextMorningMetrics,
+  computeSameTimeFieldGaps,
+  computeStockComparisons,
   classifyCollectionQuality,
+  classifySourceFreshness,
   parseCapturePayload,
   payloadIdentity,
+  sourceTimeDiagnostics,
 };
