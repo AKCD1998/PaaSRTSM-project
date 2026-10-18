@@ -27,6 +27,19 @@ The existing JSONB `client_meta` column stores the optional diagnostics, so no
 migration is introduced. Receiver flags, credentials, cleanup, Full Sync,
 Transfer Delta and production configuration are unchanged. Deploy this
 backward-compatible backend support before using the paired Agent candidate.
-This PR does not authorize merge/deploy or a new pilot. Complete source getter,
-movement-view and posting semantics still require review before a live-stock
-adapter is chosen; keep Hourly OFF.
+This PR does not authorize merge/deploy or a new pilot. The supplied 2026-10-18
+metadata v3 now recovers the source formula structure: DayEnd is a cached
+signed movement sum, and its refresh time is not a completed business cutoff.
+The read-time getter uses a different movement basis and configuration
+variants. Current B50 aggregates explain the six residual stored gaps through
+the SI component, but do not establish their historical posting or validity.
+All supplied movement views use NOLOCK; the existing database has both
+snapshot options OFF. The active variant, consistent-read strategy and
+posting watermark remain unresolved. No operational timestamp or arithmetic
+match can make this diagnostic metadata qualifying.
+
+See the paired Agent's
+[source formula review](https://github.com/AKCD1998/SC-StockDay-Ordering/blob/codex/hourly-source-provenance/docs/HOURLY_SOURCE_FORMULA_REVIEW.md)
+for evidence boundaries and gates before choosing a live-stock adapter. Keep
+Hourly OFF; source definitions, database options, Full Sync and Delta stay
+unchanged.
