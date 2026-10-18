@@ -1,5 +1,6 @@
 "use strict";
 const { sourceReadDiagnostics } = require("../services/hourlyStockSourceRead");
+const { derivedObservationDiagnostics } = require("../services/hourlyDerivedObservation");
 
 const crypto = require("node:crypto");
 const express = require("express");
@@ -72,7 +73,8 @@ async function persistCapture(client, capture) {
         capture.sourceEventAt,
         capture.records.length,
         capture.payloadSha256,
-        JSON.stringify(capture.clientMeta),
+        JSON.stringify({ ...capture.clientMeta,
+          ...(capture.derivedObservation == null ? {} : { derivedObservation: capture.derivedObservation }) }),
       ],
     );
     if (inserted.rowCount === 0) {
@@ -212,7 +214,9 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
            ), captures AS (
              SELECT * FROM selected UNION ALL SELECT * FROM intraday_slots UNION ALL SELECT * FROM next_morning
            )
-           SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at, captures.source_event_at, captures.client_meta,
+           SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at, captures.source_event_at,
+                  CASE WHEN ROW_NUMBER() OVER (PARTITION BY captures.capture_id ORDER BY rows.product_code) = 1
+                    THEN captures.client_meta ELSE captures.client_meta - 'derivedObservation' END AS client_meta,
                   captures.planned_slot, captures.capture_count, rows.product_code,
                   rows.retail_on_hand::double precision AS retail_on_hand,
                   rows.latest_estimated_on_hand::double precision AS latest_estimated_on_hand
@@ -225,6 +229,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const slotEvidence = { morning: null, intraday: [], nextMorning: null };
         const cohortBySlot = new Map();
         const seenCaptures = new Set();
+        const derivedBySlot = new Map();
         for (const row of result.rows) {
           const captureKey = `${row.capture_role}:${row.planned_slot}`;
           if (!cohortBySlot.has(captureKey)) cohortBySlot.set(captureKey, new Map());
@@ -236,6 +241,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
           cohortBySlot.get(captureKey).set(row.product_code, observation);
           if (!seenCaptures.has(captureKey)) {
             seenCaptures.add(captureKey);
+            if (row.capture_role === "intraday") derivedBySlot.set(row.planned_slot, row.client_meta?.derivedObservation);
             const evidence = {
               plannedSlot: row.planned_slot,
               plannedFor: row.planned_for,
@@ -279,6 +285,8 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
             .filter((code) => !cohort.has(code) || !expectedCohort.has(code)).length;
           slot.missingEstimatedValueCount = [...cohort.values()].filter((value) => value.latestEstimatedOnHand == null).length;
           slot.sameTimeFieldGaps = computeSameTimeFieldGaps([...cohort.values()]);
+          slot.derivedObservationDiagnostics = derivedObservationDiagnostics(derivedBySlot.get(slot.plannedSlot),
+            [...cohort.values()], new Date(slot.capturedAt).toISOString());
         }
         const collectionQuality = classifyCollectionQuality({
           slotEvidence, missingPlannedSlots, metrics,

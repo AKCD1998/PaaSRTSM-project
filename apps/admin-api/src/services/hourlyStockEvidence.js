@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { parseSourceRead } = require("./hourlyStockSourceRead");
+const { parseDerivedObservation } = require("./hourlyDerivedObservation");
 
 const CONTRACT_VERSION = "hourly-dual-stock-evidence-v1";
 const DATASET_TAG = "hourly_dual_stock_evidence";
@@ -36,6 +37,7 @@ function payloadIdentity(payload) {
       retailOnHand: record.retailOnHand,
       latestEstimatedOnHand: record.latestEstimatedOnHand,
     })),
+    ...(payload.derivedObservation == null ? {} : { derivedObservation: payload.derivedObservation }),
     ...(payload.observationKind === "morning_anchor"
       ? { authoritativeSyncRunId: String(payload.clientMeta?.authoritativeSyncRunId) } : {}),
   };
@@ -145,6 +147,10 @@ function parseCapturePayload(body) {
   };
   if (observationKind === "morning_anchor" && !parsed.clientMeta.authoritativeSyncRunId) {
     throw new Error("Morning anchor requires an authoritative Full Sync receipt.");
+  }
+  if (body.derivedObservation != null) {
+    if (branchCode !== "004" || observationKind !== "intraday") throw new Error("Derived observations are intraday branch 004 only.");
+    parsed.derivedObservation = parseDerivedObservation(body.derivedObservation, records, capturedAt);
   }
   parsed.payloadSha256 = payloadIdentity(parsed);
   if (body.idempotencyKey !== parsed.payloadSha256) throw new Error("idempotencyKey does not match payload identity.");

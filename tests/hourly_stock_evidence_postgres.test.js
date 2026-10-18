@@ -234,4 +234,31 @@ integration("REAL POSTGRES: migration, constraints, null UNNEST, idempotency, ro
     assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM evidence.hourly_stock_capture_rows")).rows[0].count, 2);
     assert.equal((await pruneHourlyEvidence(retentionClient, { ...policy, execute: true })).deletedRuns, 0);
   } finally { retentionClient.release(); }
+
+  // Persist/replay a supplemental observation in the existing JSONB namespace,
+  // exercise the real summary projection, and leave canonical numeric columns intact.
+  const derivedCapture = capture({ branchCode: "004", records: [
+    { productCode: "SYNTHETIC-A", retailOnHand: 10, latestEstimatedOnHand: 10 },
+    { productCode: "SYNTHETIC-B", retailOnHand: 4, latestEstimatedOnHand: null }],
+    derivedObservation: { schemaVersion: "adapos-ordinary16-derived-v1", estimateBasis: "retail-plus-wholesale-plus-ordinary16",
+      sampleCount: 2, consistency: "unverified", qualifying: false, businessCutoffAt: null,
+      readStartedAt: "2026-09-18T12:00:00.000Z", readCompletedAt: "2026-09-18T12:00:00.500Z", records: [
+        { productCode: "SYNTHETIC-A", derivedOnHand: 8, reason: "observed-unverified" },
+        { productCode: "SYNTHETIC-B", derivedOnHand: null, reason: "changed-between-reads" }] } });
+  const derivedClient = await pool.connect();
+  try {
+    assert.equal((await persistCapture(derivedClient, derivedCapture)).duplicate, false);
+    assert.equal((await persistCapture(derivedClient, derivedCapture)).duplicate, true);
+    const stored = await derivedClient.query(`SELECT r.retail_on_hand::double precision AS retail, r.latest_estimated_on_hand::double precision AS estimate,
+      c.client_meta FROM evidence.hourly_stock_capture_runs c JOIN evidence.hourly_stock_capture_rows r USING(capture_id)
+      WHERE c.idempotency_key=$1 ORDER BY r.product_code`, [derivedCapture.idempotencyKey]);
+    assert.deepEqual(stored.rows.map(row => [row.retail, row.estimate]), [[10, 10], [4, null]]);
+    assert.deepEqual(stored.rows[0].client_meta.derivedObservation, derivedCapture.derivedObservation);
+    const derivedSummary = await request(createSummaryApp()).get("/api/hourly-stock-evidence/summary?branchCode=004&date=2026-09-18");
+    assert.equal(derivedSummary.status, 200);
+    assert.equal(derivedSummary.body.slotEvidence.intraday[0].derivedObservationDiagnostics.changedProducts, 1);
+    assert.equal(derivedSummary.body.slotEvidence.intraday[0].derivedObservationDiagnostics.availableProducts, 1);
+    assert.equal(derivedSummary.body.sourceFreshness.qualifying, false);
+    assert.equal(JSON.stringify(derivedSummary.body).includes("SYNTHETIC-A"), false);
+  } finally { derivedClient.release(); }
 });

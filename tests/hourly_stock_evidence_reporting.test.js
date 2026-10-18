@@ -136,6 +136,8 @@ function appFor(rows, { denied = false } = {}) {
   const db = {
     async query(sql, params) {
       assert.match(sql, /captures\.source_event_at/);
+      assert.match(sql, /PARTITION BY captures\.capture_id/);
+      assert.match(sql, /client_meta - 'derivedObservation'/);
       assert.doesNotMatch(sql, /\b(?:INSERT|UPDATE|DELETE|ALTER|DROP)\b/i);
       assert.deepEqual(params, ["004", "2026-10-17"]);
       return { rows };
@@ -170,6 +172,35 @@ test("summary is inspectable while receiver OFF and separates collection PASS fr
   assert.equal(body.slotEvidence.intraday[0].plannedSlot, "09:00");
   assert.equal(body.slotEvidence.intraday[10].sameTimeFieldGaps.gapCount, 3);
   assert.equal(JSON.stringify(body).includes('"productCode"'), false);
+});
+
+test("summary projects supplemental derived basis once per capture; legacy and morning comparisons stay unchanged", async () => {
+  const rows = summaryRows();
+  const selected = rows.filter(row => row.capture_role === "intraday" && row.planned_slot === "09:00");
+  // The SQL projection returns the product array once, not once per product.
+  selected[0].client_meta = { derivedObservation: {
+    schemaVersion: "adapos-ordinary16-derived-v1", estimateBasis: "retail-plus-wholesale-plus-ordinary16", sampleCount: 2,
+    consistency: "unverified", qualifying: false, businessCutoffAt: null, readStartedAt: selected[0].planned_for,
+    readCompletedAt: selected[0].planned_for,
+    records: selected.map((row, i) => ({ productCode: row.product_code, derivedOnHand: i ? null : 19,
+      reason: i ? "changed-between-reads" : "observed-unverified" })),
+  } };
+  let response = await request(appFor(rows)).get("/evidence/summary?branchCode=004&date=2026-10-17");
+  assert.equal(response.status, 200);
+  const diag = response.body.slotEvidence.intraday[0].derivedObservationDiagnostics;
+  assert.equal(diag.status, "changed");
+  assert.equal(diag.availableProducts, 1);
+  assert.equal(diag.changedProducts, 3);
+  assert.equal(diag.qualifying, false);
+  assert.equal(response.body.slotEvidence.intraday[1].derivedObservationDiagnostics.status, "missing");
+  assert.equal(response.body.metrics.exactMatchCount, 1);
+  assert.equal(response.body.sourceFreshness.qualifying, false);
+  assert.equal(JSON.stringify(response.body).includes('"productCode"'), false);
+  assert.equal(JSON.stringify(response.body).includes('"derivedOnHand"'), false);
+  selected[0].client_meta.derivedObservation.secret = "must-not-echo";
+  response = await request(appFor(rows)).get("/evidence/summary?branchCode=004&date=2026-10-17");
+  assert.equal(response.body.slotEvidence.intraday[0].derivedObservationDiagnostics.status, "invalid");
+  assert.equal(JSON.stringify(response.body).includes("must-not-echo"), false);
 });
 
 test("summary source timestamps survive query projection without being treated as verified provenance", async () => {

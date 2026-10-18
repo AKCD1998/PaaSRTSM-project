@@ -55,11 +55,11 @@ cache supports a 07:46:18–07:46:30 execution window, not per-document history.
 confirms opening the POS or starting its day in that morning period; this is
 operator context, not a replacement for posting evidence.
 
-The existing retail and stored-estimate contracts remain intact. A proposed
-additional derived Hourly estimate requires a separately reviewed source
-basis/contract and report separation from stored estimates. It must not be
-silently substituted into existing records or placed inside the aggregate-only
-sourceRead object. That future observation is not implemented by this draft.
+The existing retail and stored-estimate contracts remain intact. This draft
+also accepts a separate identity-bound derived observation, outside the
+aggregate-only sourceRead object. It stores validated records in a dedicated
+JSONB namespace and reports aggregate diagnostics under their own basis.
+See [the derived observation contract](HOURLY_DERIVED_OBSERVATION.md).
 
 See the paired Agent's
 [source formula review](https://github.com/AKCD1998/SC-StockDay-Ordering/blob/codex/hourly-source-provenance/docs/HOURLY_SOURCE_FORMULA_REVIEW.md)
