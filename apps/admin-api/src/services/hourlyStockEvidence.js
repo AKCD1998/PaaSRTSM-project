@@ -1,6 +1,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { parseSourceRead } = require("./hourlyStockSourceRead");
+const { parseDerivedObservation } = require("./hourlyDerivedObservation");
 
 const CONTRACT_VERSION = "hourly-dual-stock-evidence-v1";
 const DATASET_TAG = "hourly_dual_stock_evidence";
@@ -35,6 +37,7 @@ function payloadIdentity(payload) {
       retailOnHand: record.retailOnHand,
       latestEstimatedOnHand: record.latestEstimatedOnHand,
     })),
+    ...(payload.derivedObservation == null ? {} : { derivedObservation: payload.derivedObservation }),
     ...(payload.observationKind === "morning_anchor"
       ? { authoritativeSyncRunId: String(payload.clientMeta?.authoritativeSyncRunId) } : {}),
   };
@@ -59,10 +62,10 @@ function finiteNumber(value, fieldName, { nullable = false } = {}) {
   return value;
 }
 
-function parseClientMeta(value) {
+function parseClientMeta(value, recordCount, observationKind) {
   if (value == null) return {};
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("clientMeta must be an object.");
-  const allowed = new Set(["agentVersion", "queryDurationMs", "sqlConnectionAttempts", "sqlConnectionRetryCount", "authoritativeSyncRunId"]);
+  const allowed = new Set(["agentVersion", "queryDurationMs", "sqlConnectionAttempts", "sqlConnectionRetryCount", "authoritativeSyncRunId", "sourceRead"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`clientMeta.${key} is not allowed.`);
   }
@@ -80,7 +83,10 @@ function parseClientMeta(value) {
   if (authoritativeSyncRunId != null && !/^[1-9][0-9]{0,17}$/.test(authoritativeSyncRunId)) {
     throw new Error("clientMeta.authoritativeSyncRunId is invalid.");
   }
+  if (value.sourceRead != null && observationKind !== "intraday") throw new Error("sourceRead is intraday-only.");
+  const sourceRead = parseSourceRead(value.sourceRead, recordCount);
   return { ...(agentVersion == null ? {} : { agentVersion }), ...integers,
+    ...(sourceRead == null ? {} : { sourceRead }),
     ...(authoritativeSyncRunId == null ? {} : { authoritativeSyncRunId }) };
 }
 
@@ -137,10 +143,14 @@ function parseCapturePayload(body) {
     slotDelaySeconds: (new Date(capturedAt).getTime() - new Date(plannedFor).getTime()) / 1000,
     sourceEventAt,
     records,
-    clientMeta: parseClientMeta(body.clientMeta),
+    clientMeta: parseClientMeta(body.clientMeta, records.length, observationKind),
   };
   if (observationKind === "morning_anchor" && !parsed.clientMeta.authoritativeSyncRunId) {
     throw new Error("Morning anchor requires an authoritative Full Sync receipt.");
+  }
+  if (body.derivedObservation != null) {
+    if (branchCode !== "004" || observationKind !== "intraday") throw new Error("Derived observations are intraday branch 004 only.");
+    parsed.derivedObservation = parseDerivedObservation(body.derivedObservation, records, capturedAt);
   }
   parsed.payloadSha256 = payloadIdentity(parsed);
   if (body.idempotencyKey !== parsed.payloadSha256) throw new Error("idempotencyKey does not match payload identity.");
@@ -271,14 +281,16 @@ function classifySourceFreshness({ slotEvidence, missingPlannedSlots }) {
   if (!slotEvidence.morning || !slotEvidence.nextMorning || missingPlannedSlots.length) reasons.push("missing-slots");
   const missingSourceTimeCount = diagnostics.filter((value) => value.reason === "source-time-missing").length;
   const invalidSourceTimeCount = diagnostics.filter((value) => value.status === "invalid").length;
+  const invalidSourceReadCount = slots.filter((slot) => slot.sourceReadDiagnostics?.status === "invalid").length;
   if (missingSourceTimeCount) reasons.push("source-time-missing");
   if (invalidSourceTimeCount) reasons.push("invalid-source-time");
+  if (invalidSourceReadCount) reasons.push("invalid-source-read-metadata");
   reasons.push("source-cutoff-not-verified", "source-age-policy-pending");
   const ages = diagnostics.map((value) => value.sourceAgeSeconds).filter((value) => value != null);
   return {
-    status: invalidSourceTimeCount ? "invalid" : "unknown",
+    status: invalidSourceTimeCount || invalidSourceReadCount ? "invalid" : "unknown",
     qualifying: false,
-    observedSlotCount: slots.length, missingSourceTimeCount, invalidSourceTimeCount,
+    observedSlotCount: slots.length, missingSourceTimeCount, invalidSourceTimeCount, invalidSourceReadCount,
     minReportedSourceAgeSeconds: ages.length ? Math.min(...ages) : null,
     maxReportedSourceAgeSeconds: ages.length ? Math.max(...ages) : null,
     sourceCutoffVerified: false,

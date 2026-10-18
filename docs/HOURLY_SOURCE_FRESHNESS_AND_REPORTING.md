@@ -15,8 +15,10 @@ two stored stock fields.
 
 The admin-only GET /api/hourly-stock-evidence/summary remains available when
 the capture receiver is OFF. Its query is read-only and uses existing evidence
-tables. No migration, payload change, source query change, new environment
-variable, retention change, or Agent update is required.
+tables. The report-only comparison corrections need no migration or new
+environment variable. The paired draft now additionally implements an optional
+derived observation and a separate Agent intraday reader; see
+[the derived contract](HOURLY_DERIVED_OBSERVATION.md). Retention stays unchanged.
 
 Existing response fields, including metrics and collectionQuality.qualifying,
 retain their calculations and meanings. New fields make their scope explicit:
