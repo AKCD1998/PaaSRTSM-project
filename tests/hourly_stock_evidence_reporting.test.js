@@ -197,3 +197,24 @@ test("summary keeps admin authentication and incomplete/null/duplicate collectio
   assert.deepEqual(response.body.missingPlannedSlots, ["10:00"]);
   assert.ok(response.body.sourceFreshness.reasons.includes("missing-slots"));
 });
+
+test("summary projects source-read metadata while receiver OFF and withholds unsupported historical fields", async () => {
+  const rows = summaryRows();
+  const count = rows.filter((row) => row.capture_role === "intraday" && row.planned_slot === "09:00").length;
+  for (const row of rows.filter((row) => row.capture_role === "intraday" && row.planned_slot === "09:00")) {
+    row.client_meta = { sourceRead: { schemaVersion: "adapos-stored-stock-read-v1", estimateBasis: "stored-master-day-end",
+      productCount: count, missingEstimateProducts: 0, missingPendingProducts: 0, missingRefreshProducts: count,
+      invalidRefreshProducts: 0, nonMasterProducts: 0, nonzeroDayEndProducts: 0, nonzeroPendingNowProducts: 0,
+      formulaMatchedProducts: count, formulaMismatchProducts: 0, formulaUnknownProducts: 0,
+      readAt: row.planned_for, oldestRefreshAt: null, newestRefreshAt: null } };
+  }
+  let response = await request(appFor(rows)).get("/evidence/summary?branchCode=004&date=2026-10-17");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.slotEvidence.intraday[0].sourceReadDiagnostics.sourceRead.productCount, count);
+  assert.equal(response.body.sourceFreshness.qualifying, false);
+  assert.equal(response.body.collectionQuality.qualifying, true);
+  rows.find((row) => row.capture_role === "intraday" && row.planned_slot === "09:00").client_meta.sourceRead.untrusted = "withhold-me";
+  response = await request(appFor(rows)).get("/evidence/summary?branchCode=004&date=2026-10-17");
+  assert.equal(response.body.slotEvidence.intraday[0].sourceReadDiagnostics.status, "invalid");
+  assert.equal(JSON.stringify(response.body).includes("withhold-me"), false);
+});

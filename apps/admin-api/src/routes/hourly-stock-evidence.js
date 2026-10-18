@@ -1,4 +1,5 @@
 "use strict";
+const { sourceReadDiagnostics } = require("../services/hourlyStockSourceRead");
 
 const crypto = require("node:crypto");
 const express = require("express");
@@ -185,25 +186,25 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const result = await db.query(
           `WITH selected AS (
              SELECT 'morning' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, source_event_at, COUNT(*) OVER () AS capture_count
+                    captured_at, planned_for, received_at, source_event_at, client_meta, COUNT(*) OVER () AS capture_count
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'morning_anchor'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date
               ORDER BY captured_at ASC, capture_id ASC LIMIT 1
            ), intraday_ranked AS (
              SELECT 'intraday' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, source_event_at,
+                    captured_at, planned_for, received_at, source_event_at, client_meta,
                     COUNT(*) OVER (PARTITION BY planned_slot) AS capture_count,
                     ROW_NUMBER() OVER (PARTITION BY planned_slot ORDER BY captured_at ASC, capture_id ASC) AS slot_rank
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'intraday'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date
            ), intraday_slots AS (
-             SELECT capture_role, capture_id, planned_slot, captured_at, planned_for, received_at, source_event_at, capture_count
+             SELECT capture_role, capture_id, planned_slot, captured_at, planned_for, received_at, source_event_at, client_meta, capture_count
                FROM intraday_ranked WHERE slot_rank = 1
            ), next_morning AS (
              SELECT 'next_morning' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, source_event_at, COUNT(*) OVER () AS capture_count
+                    captured_at, planned_for, received_at, source_event_at, client_meta, COUNT(*) OVER () AS capture_count
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'morning_anchor'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = ($2::date + 1)
@@ -211,7 +212,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
            ), captures AS (
              SELECT * FROM selected UNION ALL SELECT * FROM intraday_slots UNION ALL SELECT * FROM next_morning
            )
-           SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at, captures.source_event_at,
+           SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at, captures.source_event_at, captures.client_meta,
                   captures.planned_slot, captures.capture_count, rows.product_code,
                   rows.retail_on_hand::double precision AS retail_on_hand,
                   rows.latest_estimated_on_hand::double precision AS latest_estimated_on_hand
@@ -242,6 +243,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
               receivedAt: row.received_at,
               sourceEventAt: row.source_event_at ?? null,
               sourceTime: sourceTimeDiagnostics({ capturedAt: row.captured_at, sourceEventAt: row.source_event_at }),
+              sourceReadDiagnostics: sourceReadDiagnostics(row.client_meta?.sourceRead, row.captured_at),
               slotDelaySeconds: (new Date(row.captured_at).getTime() - new Date(row.planned_for).getTime()) / 1000,
               ingestionDelaySeconds: (new Date(row.received_at).getTime() - new Date(row.captured_at).getTime()) / 1000,
               captureCount: Number(row.capture_count),
