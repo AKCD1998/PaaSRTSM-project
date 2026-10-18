@@ -31,12 +31,15 @@ This PR does not authorize merge/deploy or a new pilot. The supplied 2026-10-18
 metadata v3 now recovers the source formula structure: DayEnd is a cached
 signed movement sum, and its refresh time is not a completed business cutoff.
 The read-time getter uses a different movement basis and configuration
-variants. Current B50 aggregates explain the six residual stored gaps through
-the SI component, but do not establish their historical posting or validity.
-All supplied movement views use NOLOCK; the existing database has both
-snapshot options OFF. The active variant, consistent-read strategy and
-posting watermark remain unresolved. No operational timestamp or arithmetic
-match can make this diagnostic metadata qualifying.
+variants. The supplied 15:15 active-contract lookup confirms the ordinary
+16-view getter/full-refresh setting and exact SI eligibility. Independent
+15:18 SELECTs reconcile 8 eligible documents / 35 lines with the current SI
+view and six nonzero cached components. The active getter differs from the
+stored estimate for 11 of B50 at 15:19. These observations do not establish
+historical posting, document validity or snapshot consistency. All supplied
+movement views use NOLOCK; the existing database has both snapshot options
+OFF. Read consistency and a business posting watermark remain unresolved.
+No operational timestamp or arithmetic match can make metadata qualifying.
 
 Further read-only B50 probes connect the six current SI components with
 8 candidate documents / 35 lines whose processing states and approval actor
@@ -44,11 +47,19 @@ are blank and which have no matching primary stock-card row. A separate
 processed-state group has matching cards. These observations do not certify
 document lifecycle semantics or historical posting. The 17 October sales
 stock-card audit fields show an 18 October 07:46:22–07:46:30 write period;
-the supplied temporary writer also uses a business-date parameter for audit
-dates. Generic insert/update fields must not become `sourceEventAt` until
-their final-writer semantics and a posting cutoff are established. The user
+both the supplied temporary writer and complete primary stock-card writer
+assign audit dates/clocks from caller parameters. Generic insert/update
+fields therefore do not establish a database commit time or complete posting
+cutoff and must not become `sourceEventAt`. The explicit-local-time procedure
+cache supports a 07:46:18–07:46:30 execution window, not per-document history. The user
 confirms opening the POS or starting its day in that morning period; this is
 operator context, not a replacement for posting evidence.
+
+The existing retail and stored-estimate contracts remain intact. A proposed
+additional derived Hourly estimate requires a separately reviewed source
+basis/contract and report separation from stored estimates. It must not be
+silently substituted into existing records or placed inside the aggregate-only
+sourceRead object. That future observation is not implemented by this draft.
 
 See the paired Agent's
 [source formula review](https://github.com/AKCD1998/SC-StockDay-Ordering/blob/codex/hourly-source-provenance/docs/HOURLY_SOURCE_FORMULA_REVIEW.md)
