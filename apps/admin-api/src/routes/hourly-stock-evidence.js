@@ -6,8 +6,12 @@ const { acquireIngestionDbClient } = require("../utils/db-acquire");
 const {
   ACTIVE_BRANCHES,
   computeNextMorningMetrics,
+  computeSameTimeFieldGaps,
+  computeStockComparisons,
   classifyCollectionQuality,
+  classifySourceFreshness,
   parseCapturePayload,
+  sourceTimeDiagnostics,
 } = require("../services/hourlyStockEvidence");
 
 function timingSafeEqualStrings(left, right) {
@@ -181,25 +185,25 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const result = await db.query(
           `WITH selected AS (
              SELECT 'morning' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, COUNT(*) OVER () AS capture_count
+                    captured_at, planned_for, received_at, source_event_at, COUNT(*) OVER () AS capture_count
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'morning_anchor'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date
               ORDER BY captured_at ASC, capture_id ASC LIMIT 1
            ), intraday_ranked AS (
              SELECT 'intraday' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at,
+                    captured_at, planned_for, received_at, source_event_at,
                     COUNT(*) OVER (PARTITION BY planned_slot) AS capture_count,
                     ROW_NUMBER() OVER (PARTITION BY planned_slot ORDER BY captured_at ASC, capture_id ASC) AS slot_rank
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'intraday'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date
            ), intraday_slots AS (
-             SELECT capture_role, capture_id, planned_slot, captured_at, planned_for, received_at, capture_count
+             SELECT capture_role, capture_id, planned_slot, captured_at, planned_for, received_at, source_event_at, capture_count
                FROM intraday_ranked WHERE slot_rank = 1
            ), next_morning AS (
              SELECT 'next_morning' AS capture_role, capture_id, planned_slot,
-                    captured_at, planned_for, received_at, COUNT(*) OVER () AS capture_count
+                    captured_at, planned_for, received_at, source_event_at, COUNT(*) OVER () AS capture_count
                FROM evidence.hourly_stock_capture_runs
               WHERE branch_code = $1 AND observation_kind = 'morning_anchor'
                 AND (captured_at AT TIME ZONE 'Asia/Bangkok')::date = ($2::date + 1)
@@ -207,7 +211,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
            ), captures AS (
              SELECT * FROM selected UNION ALL SELECT * FROM intraday_slots UNION ALL SELECT * FROM next_morning
            )
-           SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at,
+           SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at, captures.source_event_at,
                   captures.planned_slot, captures.capture_count, rows.product_code,
                   rows.retail_on_hand::double precision AS retail_on_hand,
                   rows.latest_estimated_on_hand::double precision AS latest_estimated_on_hand
@@ -223,7 +227,12 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         for (const row of result.rows) {
           const captureKey = `${row.capture_role}:${row.planned_slot}`;
           if (!cohortBySlot.has(captureKey)) cohortBySlot.set(captureKey, new Map());
-          cohortBySlot.get(captureKey).set(row.product_code, row.latest_estimated_on_hand);
+          const observation = {
+            productCode: row.product_code,
+            retailOnHand: Number(row.retail_on_hand),
+            latestEstimatedOnHand: row.latest_estimated_on_hand == null ? null : Number(row.latest_estimated_on_hand),
+          };
+          cohortBySlot.get(captureKey).set(row.product_code, observation);
           if (!seenCaptures.has(captureKey)) {
             seenCaptures.add(captureKey);
             const evidence = {
@@ -231,6 +240,8 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
               plannedFor: row.planned_for,
               capturedAt: row.captured_at,
               receivedAt: row.received_at,
+              sourceEventAt: row.source_event_at ?? null,
+              sourceTime: sourceTimeDiagnostics({ capturedAt: row.captured_at, sourceEventAt: row.source_event_at }),
               slotDelaySeconds: (new Date(row.captured_at).getTime() - new Date(row.planned_for).getTime()) / 1000,
               ingestionDelaySeconds: (new Date(row.received_at).getTime() - new Date(row.captured_at).getTime()) / 1000,
               captureCount: Number(row.capture_count),
@@ -244,12 +255,9 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
             ? "closing"
             : row.capture_role;
           if (!(metricRole in grouped)) continue;
-          grouped[metricRole].push({
-            productCode: row.product_code,
-            retailOnHand: Number(row.retail_on_hand),
-            latestEstimatedOnHand: row.latest_estimated_on_hand == null ? null : Number(row.latest_estimated_on_hand),
-          });
+          grouped[metricRole].push(observation);
         }
+        slotEvidence.intraday.sort((left, right) => left.plannedSlot.localeCompare(right.plannedSlot));
         const missingSlots = Object.entries(grouped).filter(([, rows]) => rows.length === 0).map(([role]) => role);
         const expectedPlannedSlots = Array.from({ length: 11 }, (_, index) => `${String(index + 9).padStart(2, "0")}:00`);
         const capturedPlannedSlots = slotEvidence.intraday.map((slot) => slot.plannedSlot).sort();
@@ -259,12 +267,16 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const metrics = comparisonStatus === "compared" ? computeNextMorningMetrics({
           morningAnchorRows: grouped.morning, closingRows: grouped.closing, nextMorningRows: grouped.next_morning,
         }) : null;
+        const stockComparisons = computeStockComparisons({
+          morningAnchorRows: grouped.morning, closingRows: grouped.closing, nextMorningRows: grouped.next_morning,
+        });
         const expectedCohort = cohortBySlot.get("morning:08:20") ?? new Map();
         for (const slot of slotEvidence.intraday) {
           const cohort = cohortBySlot.get("intraday:" + slot.plannedSlot);
           slot.cohortMismatchCount = [...new Set([...expectedCohort.keys(), ...cohort.keys()])]
             .filter((code) => !cohort.has(code) || !expectedCohort.has(code)).length;
-          slot.missingEstimatedValueCount = [...cohort.values()].filter((value) => value == null).length;
+          slot.missingEstimatedValueCount = [...cohort.values()].filter((value) => value.latestEstimatedOnHand == null).length;
+          slot.sameTimeFieldGaps = computeSameTimeFieldGaps([...cohort.values()]);
         }
         const collectionQuality = classifyCollectionQuality({
           slotEvidence, missingPlannedSlots, metrics,
@@ -274,6 +286,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
           if (!collectionQuality.reasons.includes("incomplete-cohort")) collectionQuality.reasons.push("incomplete-cohort");
           collectionQuality.qualifying = false;
         }
+        const sourceFreshness = classifySourceFreshness({ slotEvidence, missingPlannedSlots });
         return res.json({
           branchCode,
           date,
@@ -284,7 +297,19 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
           capturedPlannedSlots,
           missingPlannedSlots,
           slotEvidence,
-          collectionQuality,
+          collectionQuality: { ...collectionQuality, scope: "capture-and-delivery-only" },
+          sourceFreshness,
+          stockAccuracyAssessment: {
+            status: "not-assessed",
+            reasons: ["source-freshness-unverified", "business-drift-policy-pending"],
+          },
+          comparisonSemantics: {
+            basis: "cross-field-cross-time",
+            leftObservation: "19:00", leftField: "latestEstimatedOnHand",
+            rightObservation: "next-morning-08:20", rightField: "retailOnHand",
+            stockAccuracyEstablished: false,
+          },
+          stockComparisons,
           metrics,
         });
       } catch (error) {
