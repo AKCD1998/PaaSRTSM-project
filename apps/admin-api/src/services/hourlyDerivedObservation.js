@@ -1,11 +1,12 @@
 "use strict";
+const { HOURLY_COMPLETE_COHORT_MAX_RECORDS, HOURLY_COMPLETE_COHORT_MAX_WINDOW_MS } = require("./hourlyCohortCoverage");
 // Intraday-only supplemental evidence. Never substitutes the canonical pair.
 
 const DERIVED_VERSION = "adapos-ordinary16-derived-v1";
 const DERIVED_BASIS = "retail-plus-wholesale-plus-ordinary16";
 const REASONS = new Set(["observed-unverified", "changed-between-reads", "invalid-source-component", "non-master-stock-code", "outside-branch-movement"]);
 function invalid() { throw new Error("Invalid intraday derived observation."); }
-function parseDerivedObservation(value, records, capturedAt) {
+function parseDerivedObservation(value, records, capturedAt, { completeCohort = false } = {}) {
   if (value == null) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) invalid();
   const keys = ["schemaVersion", "estimateBasis", "sampleCount", "consistency", "qualifying", "businessCutoffAt", "readStartedAt", "readCompletedAt", "records"];
@@ -17,9 +18,9 @@ function parseDerivedObservation(value, records, capturedAt) {
         || new Date(value[key]).toISOString() !== value[key]) invalid();
   }
   const duration = Date.parse(value.readCompletedAt) - Date.parse(value.readStartedAt);
-  if (duration < 0 || duration > 10_000 || !Number.isFinite(Date.parse(capturedAt))) invalid();
+  if (duration < 0 || duration > (completeCohort ? HOURLY_COMPLETE_COHORT_MAX_WINDOW_MS : 10_000) || !Number.isFinite(Date.parse(capturedAt))) invalid();
   const expected = new Set(records.map(row => row.productCode));
-  if (!Array.isArray(value.records) || !expected.size || expected.size > 500 || value.records.length !== expected.size) invalid();
+  if (!Array.isArray(value.records) || !expected.size || expected.size > (completeCohort ? HOURLY_COMPLETE_COHORT_MAX_RECORDS : 500) || value.records.length !== expected.size) invalid();
   const seen = new Set();
   const parsedRows = value.records.map(row => {
     if (!row || typeof row !== "object" || Object.keys(row).length !== 3
@@ -34,11 +35,11 @@ function parseDerivedObservation(value, records, capturedAt) {
   return { ...value, records: parsedRows };
 }
 
-function derivedObservationDiagnostics(value, records, capturedAt) {
+function derivedObservationDiagnostics(value, records, capturedAt, options = {}) {
   const base = { estimateBasis: DERIVED_BASIS, consistency: "unverified", qualifying: false, businessCutoffAt: null };
   if (value == null) return { ...base, status: "missing", reason: "derived-observation-missing" };
   let parsed;
-  try { parsed = parseDerivedObservation(value, records, capturedAt); }
+  try { parsed = parseDerivedObservation(value, records, capturedAt, options); }
   catch { return { ...base, status: "invalid", reason: "invalid-derived-observation" }; }
   const available = parsed.records.filter(row => row.reason === "observed-unverified");
   const changed = parsed.records.filter(row => row.reason === "changed-between-reads").length;
