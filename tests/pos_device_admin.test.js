@@ -36,5 +36,11 @@ test("admins receive the reviewed inventory and verified restricted installer", 
   assert.equal(response.body.installer.version, "1.3.1");
   assert.equal(response.body.installer.downloadUrl, "https://github.com/AKCD1998/SCCRMonPOS/releases/download/pos-1.3.1/SCCRMonPOS-Setup-1.3.1.exe");
   assert.equal(response.body.installer.sha256, "515663cc8b058959d28644f880201dd3316c52b797dd3692352b9b238e7331da");
+  assert.equal(response.body.installer.publishedAt, "2026-10-21T11:49:10Z");
+  assert.ok(response.body.installer.highlights.length > 0);
+  assert.deepEqual(response.body.previousReleases.map(release => release.version), ["1.3.0", "1.2.0", "1.1.0"]);
+  assert.ok(response.body.previousReleases.every(release => release.publishedAt && release.highlights.length > 0));
+  assert.ok(response.body.previousReleases.find(release => release.version === "1.3.0").downloadUrl.endsWith("SCCRMonPOS-Setup-1.3.0.exe"));
+  assert.ok(response.body.previousReleases.filter(release => ["1.2.0", "1.1.0"].includes(release.version)).every(release => release.downloadUrl === null));
   assert.ok(response.body.devices.every(d => !d.adaPaths));
 });

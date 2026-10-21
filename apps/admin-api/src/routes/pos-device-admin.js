@@ -16,6 +16,7 @@ function createPosDeviceAdminRouter({ config, policy = devicePolicy }) {
       tailnet: policy.tailnet,
       auditedAt: policy.auditedAt,
       installer: policy.installer,
+      previousReleases: policy.previousReleases || [],
       devices: policy.devices.map(({ nodeId, hostname, ipv4, status, reason, adaVersion }) => ({
         nodeId, hostname, ipv4, status, reason, adaVersion: adaVersion || null,
       })),

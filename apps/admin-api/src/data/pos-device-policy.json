@@ -10,9 +10,38 @@
     "downloadUrl": "https://github.com/AKCD1998/SCCRMonPOS/releases/download/pos-1.3.1/SCCRMonPOS-Setup-1.3.1.exe",
     "sha256": "515663cc8b058959d28644f880201dd3316c52b797dd3692352b9b238e7331da",
     "size": 2146759,
+    "publishedAt": "2026-10-21T11:49:10Z",
+    "highlights": [
+      "ดูประวัติการซื้อแยกสมาชิก พร้อมสินค้า ราคา จำนวน และสาขา",
+      "เก็บยอดชำระจริงแยกจากยอดคิดแต้ม และยืนยันบิล 0 แต้มได้",
+      "ป้องกันบิลซ้ำและข้อมูลค้างเมื่อสลับสมาชิก"
+    ],
     "legacyVersion": "1.2.0",
     "legacyRestricted": false
   },
+  "previousReleases": [
+    {
+      "version": "1.3.0",
+      "publishedAt": "2026-10-21T11:25:16Z",
+      "highlights": ["ตรวจสิทธิ์เครื่องบริษัทผ่าน Tailscale และ AdaSoftware ก่อนติดตั้งและระหว่างใช้งาน"],
+      "downloadUrl": "https://github.com/AKCD1998/SCCRMonPOS/releases/download/pos-1.3.0/SCCRMonPOS-Setup-1.3.0.exe",
+      "sha256": "b5b16fb4102eec1582e8001d04a828ac26674e584a659705c4f4d11b9e9b6605"
+    },
+    {
+      "version": "1.2.0",
+      "publishedAt": "2026-10-21T10:24:38Z",
+      "highlights": ["แสดงโปรโมชั่นสะสมแต้มจากส่วนกลางและตัวอย่างแต้มบนหน้าบิล"],
+      "downloadUrl": null,
+      "downloadNote": "รุ่นนี้ยังไม่มีระบบตรวจสิทธิ์เครื่องบริษัท จึงไม่เปิดดาวน์โหลดจากหน้านี้"
+    },
+    {
+      "version": "1.1.0",
+      "publishedAt": "2026-10-21T09:40:23Z",
+      "highlights": ["สมัครสมาชิกผ่าน QR บนจอที่สอง และแจ้งเตือนเมื่อมีรุ่นใหม่ให้เลือกอัปเดต"],
+      "downloadUrl": null,
+      "downloadNote": "รุ่นนี้ยังไม่มีระบบตรวจสิทธิ์เครื่องบริษัท จึงไม่เปิดดาวน์โหลดจากหน้านี้"
+    }
+  ],
   "devices": [
     {
       "nodeId": "n3AqXUmdkF11CNTRL", "hostname": "SERVER004", "ipv4": "100.113.59.42", "status": "approved",

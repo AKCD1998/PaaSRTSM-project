@@ -16,6 +16,15 @@ The 1.3.1 installer has been published and downloaded anonymously to verify its
 SHA-256 against the built artifact. The inventory contains that verified URL,
 hash, and byte size. Original public 1.2.0 binaries have no device guard.
 
+The installer metadata includes its GitHub `publishedAt` timestamp and a short
+Thai change summary. `previousReleases` is a newest-first archive, separate from
+the recommended installer. StockDay presents the current installer with the
+largest download button and shows publication dates in Asia/Bangkok time.
+Version 1.3.0 has a smaller installer link; versions 1.2.0 and 1.1.0 appear as
+historical notes without download links because they lack the device guard.
+Update these reviewed records when publishing a new recommended release; this
+endpoint does not automatically discover GitHub releases.
+
 Desktop enforcement is in the SCCRMonPOS candidate's DeviceAccessGuard and
 installer. The desktop resource contains only approved identities; compare its
 approved node IDs/IPs/hostnames/Ada paths to this inventory before a release.
