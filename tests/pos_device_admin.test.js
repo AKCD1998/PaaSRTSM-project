@@ -33,8 +33,8 @@ test("admins receive the reviewed inventory and verified restricted installer", 
   assert.equal(response.headers["cache-control"], "private, no-store");
   assert.equal(response.body.devices.filter(d => d.status === "approved").length, 5);
   assert.equal(response.body.installer.legacyRestricted, false);
-  assert.equal(response.body.installer.version, "1.3.0");
-  assert.equal(response.body.installer.downloadUrl, "https://github.com/AKCD1998/SCCRMonPOS/releases/download/pos-1.3.0/SCCRMonPOS-Setup-1.3.0.exe");
-  assert.equal(response.body.installer.sha256, "b5b16fb4102eec1582e8001d04a828ac26674e584a659705c4f4d11b9e9b6605");
+  assert.equal(response.body.installer.version, "1.3.1");
+  assert.equal(response.body.installer.downloadUrl, "https://github.com/AKCD1998/SCCRMonPOS/releases/download/pos-1.3.1/SCCRMonPOS-Setup-1.3.1.exe");
+  assert.equal(response.body.installer.sha256, "515663cc8b058959d28644f880201dd3316c52b797dd3692352b9b238e7331da");
   assert.ok(response.body.devices.every(d => !d.adaPaths));
 });

@@ -12,7 +12,7 @@ this does not establish that AdaSoftware is absent.
 
 StockDay's CR → แอดมิน submenu is visible only to admin accounts. The panel
 displays the dated inventory and does not claim to probe live online status.
-The 1.3.0 installer has been published and downloaded anonymously to verify its
+The 1.3.1 installer has been published and downloaded anonymously to verify its
 SHA-256 against the built artifact. The inventory contains that verified URL,
 hash, and byte size. Original public 1.2.0 binaries have no device guard.
 
