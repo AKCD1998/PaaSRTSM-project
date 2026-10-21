@@ -16,6 +16,7 @@ const {
   requireMobileRole,
 } = require("./auth/middleware");
 const { createHealthRouter } = require("./routes/health");
+const { createCrmWebRouter } = require("./routes/crm-web");
 const { createAuthRouter } = require("./routes/auth");
 const { createMeRouter } = require("./routes/me");
 const { createCipdataRouter } = require("./routes/cipdata");
@@ -183,6 +184,7 @@ function createApp(overrides = {}) {
   );
 
   app.use("/admin/health", createHealthRouter());
+  app.use("/sccrm", createCrmWebRouter());
   app.use(
     "/admin/auth",
     createAuthRouter({
