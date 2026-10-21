@@ -11,6 +11,13 @@ become duplicate slot captures. Existing evidence tables store coverage in
 client_meta and canonical rows normally; there is no multipart state, cleanup
 job, Full Sync path change or Transfer Delta change.
 
+Complete-mode derived observation metadata permits a collection window up to
+300,000 ms, matching sequential PR68 source batches with explicit 60-second
+batch deadlines. The Agent records warnings above 3 seconds and checks CPU
+and quiet conditions before and after each batch. Legacy observations keep
+their existing 10-second maximum. The collection bound does not alter the live
+300-second slot-delay setting or establish any business freshness threshold.
+
 For web-all captures, new ingestion validates the union of present and
 unavailable identities against public.skus. An absent source row is not a zero
 quantity and never becomes a canonical stock row. Reports expose aggregate
@@ -48,12 +55,19 @@ parser and all other route limits remain unchanged.
 
 ## Verification and remaining limits
 
-The isolated PostgreSQL integration covers 50 through 10,000 products,
+The isolated PostgreSQL integration covers 50 through 10,000 products, including
+the 21 October catalog size of 7,050,
 13 x 7,042 = 91,546 stored rows, duplicate requests, incomplete sources, changed
 catalogs, successful Full receipt/APPLIED gates, private membership auth and OFF
 gates. Local cross-repository runs generate payloads with the actual updated
 Agent builders. Every database URL is a fresh loopback-only test database;
 test connections do not inherit production credentials.
+
+On 21 October, the full isolated backend run passed 630 tests, failed none and
+skipped 104 optional tests. Its owned loopback-only test cluster was stopped.
+All 296 paired Agent tests passed. Full-size field SQL measurement is still
+pending; central catalog membership and missing branch-current records do not
+prove live POS availability or stock correctness.
 
 Synthetic success does not establish source SQL load, committed POS posting,
 atomic NOLOCK snapshots/ABA safety, clock synchronization or a business

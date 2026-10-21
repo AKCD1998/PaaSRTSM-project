@@ -36,6 +36,16 @@ test("complete cohort parser is bounded, identity-bound, branch004-only, and kee
   const unsafe = structuredClone(full);unsafe.derivedObservation.records[0] = { ...unsafe.derivedObservation.records[0], reason: "changed-between-reads", derivedOnHand: 0 };
   assert.throws(() => parseCapturePayload(unsafe), /derived/);
 });
+
+test("complete collection permits the approved five-minute window while legacy derived reads retain ten seconds",()=>{
+  const body=capture(7050);body.cohortCoverage.observationWindowMs=240000;
+  body.derivedObservation.readStartedAt=new Date(Date.parse(body.capturedAt)-240000).toISOString();
+  body.idempotencyKey=payloadIdentity(body);assert.equal(parseCapturePayload(body).records.length,7050);
+  const tooLong=structuredClone(body);tooLong.cohortCoverage.observationWindowMs=300001;tooLong.idempotencyKey=payloadIdentity(tooLong);
+  assert.throws(()=>parseCapturePayload(tooLong));
+  const legacy=capture(50,{complete:false});legacy.derivedObservation={...body.derivedObservation,records:body.derivedObservation.records.slice(0,50)};
+  legacy.idempotencyKey=payloadIdentity(legacy);assert.throws(()=>parseCapturePayload(legacy));
+});
 const databaseUrl = process.env.HOURLY_EVIDENCE_TEST_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
 integration("REAL POSTGRES: complete cohort scale, one-slot reporting, catalog coverage, replay and OFF gates", async t => {
@@ -77,7 +87,7 @@ integration("REAL POSTGRES: complete cohort scale, one-slot reporting, catalog c
     config.featureHourlyStockEvidence=true;config.featureHourlyStockEvidenceCompleteCohort=true;
   });
   await t.test("sizes through the whole web and 10000 records persist exactly one capture each", async () => {
-    for (const count of [50,100,200,500,501,1000,2000,5000,6827,7042,10000]) {
+    for (const count of [50,100,200,500,501,1000,2000,5000,6827,7042,7050,10000]) {
       await db.query("TRUNCATE evidence.hourly_stock_capture_rows,evidence.hourly_stock_capture_runs RESTART IDENTITY");
       const response = await send(capture(count));assert.equal(response.status, 201);assert.equal(response.body.accepted, count);
       const stored = await db.query("SELECT (SELECT COUNT(*) FROM evidence.hourly_stock_capture_runs)::integer AS captures,(SELECT COUNT(*) FROM evidence.hourly_stock_capture_rows)::integer AS products");
