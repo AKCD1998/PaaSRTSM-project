@@ -12,7 +12,7 @@ client_meta and canonical rows normally; there is no multipart state, cleanup
 job, Full Sync path change or Transfer Delta change.
 
 Complete-mode derived observation metadata permits a collection window up to
-300,000 ms, matching sequential PR68 source batches with explicit 60-second
+900,000 ms, matching sequential source batches with explicit 60-second
 batch deadlines. The Agent records warnings above 3 seconds and checks CPU
 and quiet conditions before and after each batch. Legacy observations keep
 their existing 10-second maximum. The collection bound does not alter the live
@@ -65,9 +65,15 @@ test connections do not inherit production credentials.
 
 On 21 October, the full isolated backend run passed 630 tests, failed none and
 skipped 104 optional tests. Its owned loopback-only test cluster was stopped.
-All 296 paired Agent tests passed. Full-size field SQL measurement is still
-pending; central catalog membership and missing branch-current records do not
-prove live POS availability or stock correctness.
+The owner-run PR68 field test subsequently accounted for all 7,050 website
+entries in 36 batches of 200, with 6,835 observed, 215 unavailable and four
+shared-stock derived values suppressed. A separate metadata diagnosis found
+6,835 POS active=1, 213 present with another active flag, and two missing.
+The paired Agent change prepares an explicit private manifest from the website
+intersection with POS active=1, keeping excluded identities and reasons local.
+The backend's explicit-cohort and web-all wire semantics remain unchanged.
+Neither that historical field run nor the database tests validate a later
+shared-unit source-reader change or independently prove stock correctness.
 
 Synthetic success does not establish source SQL load, committed POS posting,
 atomic NOLOCK snapshots/ABA safety, clock synchronization or a business

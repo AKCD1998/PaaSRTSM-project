@@ -37,11 +37,11 @@ test("complete cohort parser is bounded, identity-bound, branch004-only, and kee
   assert.throws(() => parseCapturePayload(unsafe), /derived/);
 });
 
-test("complete collection permits the approved five-minute window while legacy derived reads retain ten seconds",()=>{
-  const body=capture(7050);body.cohortCoverage.observationWindowMs=240000;
-  body.derivedObservation.readStartedAt=new Date(Date.parse(body.capturedAt)-240000).toISOString();
+test("complete collection permits the approved fifteen-minute window while legacy derived reads retain ten seconds",()=>{
+  const body=capture(7050);body.cohortCoverage.observationWindowMs=900000;
+  body.derivedObservation.readStartedAt=new Date(Date.parse(body.capturedAt)-900000).toISOString();
   body.idempotencyKey=payloadIdentity(body);assert.equal(parseCapturePayload(body).records.length,7050);
-  const tooLong=structuredClone(body);tooLong.cohortCoverage.observationWindowMs=300001;tooLong.idempotencyKey=payloadIdentity(tooLong);
+  const tooLong=structuredClone(body);tooLong.cohortCoverage.observationWindowMs=900001;tooLong.idempotencyKey=payloadIdentity(tooLong);
   assert.throws(()=>parseCapturePayload(tooLong));
   const legacy=capture(50,{complete:false});legacy.derivedObservation={...body.derivedObservation,records:body.derivedObservation.records.slice(0,50)};
   legacy.idempotencyKey=payloadIdentity(legacy);assert.throws(()=>parseCapturePayload(legacy));
