@@ -22,8 +22,30 @@ the recommended installer. StockDay presents the current installer with the
 largest download button and shows publication dates in Asia/Bangkok time.
 Version 1.3.0 has a smaller installer link; versions 1.2.0 and 1.1.0 appear as
 historical notes without download links because they lack the device guard.
-Update these reviewed records when publishing a new recommended release; this
-endpoint does not automatically discover GitHub releases.
+The route now refreshes the RSA-SHA256-signed
+`AKCD1998/SCCRMonPOS/master/releases/web-catalog.json` at runtime. The pinned
+public key matches the desktop's existing update public key. No private key,
+GitHub token, webhook, scheduler or database migration is required on Render.
+Only the fixed public source is fetched; signatures, schema, installer origins,
+hashes and device-access markers are checked before replacing the current data.
+The catalog explicitly selects a recommended release, preserving intentional
+rollbacks instead of choosing the largest version number.
+
+The process caches verified data for 60 seconds, shares concurrent refreshes,
+aborts remote requests after four seconds, bounds response size to 256 KiB and
+backs off failures for 30 seconds. Failed refreshes keep the process's last
+verified catalog. On a cold start with no remote catalog available, the bundled
+reviewed 1.3.1 snapshot above is used. `releaseSync.state` distinguishes verified,
+stale and bundled-fallback data; the panel shows this state without hiding the
+download button. The last verified in-memory cache does not survive a restart.
+
+The frontend refreshes once per minute while visible and when focused, retains
+the displayed page during refresh, and cleans up polling when unmounted. After
+this one-time integration, normal desktop publication updates the website
+without redeploying either web repository. The desktop publisher builds Setup,
+checks its GitHub digest, signs the catalog and commits both desktop and website
+announcements. Its release notes supply the website's plain-text highlights.
+See SCCRMonPOS `releases/README.md` for publishing and recovery instructions.
 
 Desktop enforcement is in the SCCRMonPOS candidate's DeviceAccessGuard and
 installer. The desktop resource contains only approved identities; compare its
@@ -36,5 +58,6 @@ the actual current deploy configuration, migration ceiling, and live
 existing migrations. Follow AGENTS.md and never run its Windows migration runner
 against a Linux-style production ledger.
 
-Verification: `node --test tests/pos_device_admin.test.js` (3 passing auth tests)
-and `node --check apps/admin-api/src/server.js`.
+Verification: `node --test tests/pos_device_admin.test.js tests/pos_release_catalog.test.js`
+covers admin authorization, signature and asset validation, automatic promotion,
+rollback, concurrent refresh, timeout, cache and fallback behavior.

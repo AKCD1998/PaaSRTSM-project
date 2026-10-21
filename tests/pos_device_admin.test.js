@@ -8,10 +8,11 @@ const request = require("supertest");
 const { signSessionToken } = require("../apps/admin-api/src/auth/session");
 const { createPosDeviceAdminRouter } = require("../apps/admin-api/src/routes/pos-device-admin");
 const config = { cookieName: "test-pos-session", authJwtSecret: "synthetic-pos-admin-test-secret", sessionTtlHours: 1 };
-function app() {
+const policy = require("../apps/admin-api/src/data/pos-device-policy.json");
+function app(catalog = { get: async () => ({ installer: policy.installer, previousReleases: policy.previousReleases }) }) {
   const result = express();
   result.use(cookies());
-  result.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config }));
+  result.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config, catalog }));
   return result;
 }
 function session(role) {
@@ -21,6 +22,18 @@ test("anonymous requests cannot enumerate POS devices", async () => {
   const response = await request(app()).get("/api/admin/pos-devices");
   assert.equal(response.status, 401);
   assert.equal(response.body.devices, undefined);
+});
+
+test("release refresh runs only after admin authorization and can change the recommended version without a deploy", async () => {
+  let calls = 0;
+  const catalog = { get: async () => { calls++; return { installer: { version: "9.0.0" }, previousReleases: [], releaseSync: { state: "verified" } }; } };
+  await request(app(catalog)).get("/api/admin/pos-devices");
+  await request(app(catalog)).get("/api/admin/pos-devices").set("Cookie", session("staff"));
+  assert.equal(calls, 0);
+  const response = await request(app(catalog)).get("/api/admin/pos-devices").set("Cookie", session("admin"));
+  assert.equal(response.body.installer.version, "9.0.0");
+  assert.equal(response.body.releaseSync.state, "verified");
+  assert.equal(calls, 1);
 });
 test("staff accounts cannot enumerate POS devices even with a session", async () => {
   const response = await request(app()).get("/api/admin/pos-devices").set("Cookie", session("staff"));
