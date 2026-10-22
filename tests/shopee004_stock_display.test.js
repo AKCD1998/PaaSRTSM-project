@@ -77,6 +77,7 @@ test('legacy and POS-only requests make zero bridge calls; new route chains read
   for(const query of ['','?stockView=hourly004']) {const r=await request(app).get('/branch-stock'+query).expect(200);assert.equal(r.body.records[0].qtyBranch004,4);}
   assert.equal(f.state.calls.length,0);
   const r=await request(app).get('/branch-stock?stockView=hourly004-shopee').expect(200);
+  assert.equal(r.headers['cache-control'],'no-store');
   assert.equal(r.body.records[0].qtyBranch004,-1);assert.equal(f.state.calls.length,1);
 });
 test('Excel export uses the same availability and preserves unknown as text instead of zero; other branches unchanged',async()=>{

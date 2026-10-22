@@ -1886,6 +1886,7 @@ function createBranchStockRouter(deps) {
 
       const records = rowsResult.rows.map(mapBranchStockRow);
       const display = await stockDisplay(req.query.stockView, records, rowsResult.rows);
+      if (req.query.stockView === STOCK_VIEW_SHOPEE) res.set("Cache-Control", "no-store");
       return res.json({
         ...display,
         pagination: {
@@ -2329,6 +2330,7 @@ function createBranchStockRouter(deps) {
       const display = (isAllBranches || branchCode === "004")
         ? await stockDisplay(req.query.stockView, baseRows, rowsResult.rows) : { records: baseRows };
       const rows = display.records;
+      if (req.query.stockView === STOCK_VIEW_SHOPEE) res.set("Cache-Control", "no-store");
       const dateStamp = new Date().toISOString().slice(0, 10);
       let buffer, fileName;
       if (isAllBranches) {
