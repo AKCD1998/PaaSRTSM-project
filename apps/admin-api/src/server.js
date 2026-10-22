@@ -29,6 +29,7 @@ const { createSearchRouter } = require("./routes/search");
 const { createLoyaltyRouter } = require("./routes/loyalty");
 const { createMembersRouter } = require("./routes/members");
 const { createPosDeviceAdminRouter } = require("./routes/pos-device-admin");
+const { createSccrmMemberDirectoryRouter } = require("./routes/sccrm-member-directory");
 const { createOrderingRouter } = require("./routes/ordering");
 const { createStockRequestsRouter } = require("./routes/stock-requests");
 const { createStockRequestDraftsRouter } = require("./routes/stock-request-drafts");
@@ -186,6 +187,7 @@ function createApp(overrides = {}) {
 
   app.use("/admin/health", createHealthRouter());
   app.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config }));
+  app.use("/api/admin/sccrm-members", createSccrmMemberDirectoryRouter({ config }));
   app.use("/sccrm", createCrmWebRouter());
   app.use(
     "/admin/auth",

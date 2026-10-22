@@ -1,0 +1,47 @@
+"use strict";
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const express = require('express');
+const cookies = require('cookie-parser');
+const request = require('supertest');
+const { signSessionToken } = require('../apps/admin-api/src/auth/session');
+const { createSccrmMemberDirectoryRouter } = require('../apps/admin-api/src/routes/sccrm-member-directory');
+const config = { cookieName: 'test-members', authJwtSecret: 'synthetic-member-session-test-secret', sessionTtlHours: 1, crmMirrorBaseUrl: 'https://crm.example', crmMirrorInternalToken: 'synthetic-internal-test-token' };
+const id = '11111111-1111-4111-8111-111111111111';
+function app(fetchImpl, extra = {}) { const app = express(); app.use(cookies()); app.use('/api/admin/sccrm-members', createSccrmMemberDirectoryRouter({ config, fetchImpl, ...extra })); return app; }
+function session(role) { return `${config.cookieName}=${signSessionToken({ sub: 'synthetic', role }, config)}`; }
+function get(app, path = '', role = 'admin') { const q = request(app).get('/api/admin/sccrm-members' + path); return role ? q.set('Cookie', session(role)) : q; }
+test('only cookie-authenticated admins can reach the CRM reader', async () => {
+  let calls = 0; const a = app(async () => { calls++; return Response.json({ members: [] }); });
+  assert.equal((await get(a, '', null)).status, 401);
+  for (const role of ['staff', 'branch']) assert.equal((await get(a, '', role)).status, 403);
+  assert.equal(calls, 0);
+  const response = await get(a); assert.equal(response.status, 200); assert.equal(calls, 1);
+  assert.equal(response.headers['cache-control'], 'private, no-store');
+});
+test('the server supplies its own internal credential and forwards only bounded, encoded queries', async () => {
+  const a = app(async (url, options) => {
+    assert.equal(url.origin, 'https://crm.example'); assert.equal(url.pathname, '/internal/crm/member-directory');
+    assert.equal(url.searchParams.get('search'), 'a&b'); assert.equal(url.searchParams.has('url'), false);
+    assert.equal(options.headers['x-internal-token'], config.crmMirrorInternalToken); assert.equal(options.redirect, 'error');
+    assert.equal(options.headers.Cookie, undefined);
+    return Response.json({ members: [], total: 0 });
+  });
+  const response = await get(a, '?search=a%26b&url=https://evil.example');
+  assert.equal(response.status, 200); assert.ok(!JSON.stringify(response.body).includes(config.crmMirrorInternalToken));
+});
+test('history URLs retain the requested member and invalid queries never call upstream', async () => {
+  let calls = 0;
+  const a = app(async url => { calls++; assert.equal(url.pathname, `/internal/crm/member-directory/${id}/purchase-history`); return Response.json({ memberId: id, purchases: [] }); });
+  for (const path of ['/invalid/purchase-history', '?limit=101', '?search[a]=x', '?page=-1']) assert.equal((await get(a, path)).status, 400);
+  assert.equal(calls, 0); assert.equal((await get(a, `/${id}/purchase-history`)).body.memberId, id);
+});
+test('missing members, outages and upstream credential errors never expose internal errors', async () => {
+  assert.equal((await get(app(async () => new Response('', { status: 404 })), `/${id}/purchase-history`)).status, 404);
+  for (const status of [401, 403, 500]) {
+    const response = await get(app(async () => Response.json({ error: config.crmMirrorInternalToken }, { status })));
+    assert.equal(response.status, 503); assert.ok(!JSON.stringify(response.body).includes(config.crmMirrorInternalToken));
+  }
+  const response = await get(app((_url, { signal }) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(Error('timeout')))), { timeoutMs: 10 }));
+  assert.equal(response.status, 503);
+});
