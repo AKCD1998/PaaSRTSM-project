@@ -10,6 +10,18 @@ read-only Tailscale/SMB audit: five approved Windows devices, six pending device
 and one denied developer computer. Unreadable or offline devices remain pending;
 this does not establish that AdaSoftware is absent.
 
+The 22 October 2026 incremental audit adds POS2 (`100.93.254.58`, exact Tailscale
+node `nEdQXowQ4t11CNTRL`) after a private Windows credential prompt established
+read access to its C/D shares. AdaPosFront 4.6006.0032 and AdaSmart 4.6006.0024
+were checked as PE executables with file-version metadata. This brings the
+inventory to six approved devices; earlier pending/denied decisions are retained
+without claiming they were re-audited. No password is in the inventory or helper
+report. No share permissions or POS databases were changed. POS2 requires native
+installer 1.3.4 containing this identity; the inventory alone cannot change an
+installed application's compiled allowlist. Existing clients remain optional to
+update, and the global minimum stays 1.3.0. SQL connectivity on POS2 is a separate
+post-install check, not established by SMB readability.
+
 StockDay's CR → แอดมิน submenu is visible only to admin accounts. The panel
 displays the dated inventory and does not claim to probe live online status.
 The 1.3.1 installer has been published and downloaded anonymously to verify its

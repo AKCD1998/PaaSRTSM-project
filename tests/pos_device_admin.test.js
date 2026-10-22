@@ -44,7 +44,13 @@ test("admins receive the reviewed inventory and verified restricted installer", 
   const response = await request(app()).get("/api/admin/pos-devices").set("Cookie", session("admin"));
   assert.equal(response.status, 200);
   assert.equal(response.headers["cache-control"], "private, no-store");
-  assert.equal(response.body.devices.filter(d => d.status === "approved").length, 5);
+  assert.equal(response.body.devices.filter(d => d.status === "approved").length, 6);
+  const pos2 = response.body.devices.find(d => d.nodeId === "nEdQXowQ4t11CNTRL");
+  assert.equal(pos2.hostname, "POS2");
+  assert.equal(pos2.ipv4, "100.93.254.58");
+  assert.equal(pos2.status, "approved");
+  assert.equal(pos2.adaVersion, "4.6006.0032");
+  assert.equal(response.body.devices.find(d => d.hostname === "ScProductDev").status, "denied");
   assert.equal(response.body.installer.legacyRestricted, false);
   assert.equal(response.body.installer.version, "1.3.1");
   assert.equal(response.body.installer.downloadUrl, "https://github.com/AKCD1998/SCCRMonPOS/releases/download/pos-1.3.1/SCCRMonPOS-Setup-1.3.1.exe");
