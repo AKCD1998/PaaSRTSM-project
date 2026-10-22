@@ -254,6 +254,8 @@ function loadConfig(env = process.env) {
     ),
     featureHourlyStockEvidence: parseBool(env.FEATURE_HOURLY_STOCK_EVIDENCE, false),
     featureHourlyStockEvidenceCompleteCohort: parseBool(env.FEATURE_HOURLY_STOCK_EVIDENCE_COMPLETE_COHORT, false),
+    featureShopee004StockAvailability: parseBool(env.FEATURE_SHOPEE004_STOCK_AVAILABILITY, false),
+    shopee004StockProjectionToken: String(env.SHOPEE004_STOCK_PROJECTION_TOKEN || ""),
     featureHourlyStockEvidenceRetention: parseBool(env.FEATURE_HOURLY_STOCK_EVIDENCE_RETENTION, false),
     hourlyStockEvidenceRetentionDays: /^\d+$/.test(String(env.HOURLY_STOCK_EVIDENCE_RETENTION_DAYS ?? "30"))
       ? Number(env.HOURLY_STOCK_EVIDENCE_RETENTION_DAYS ?? "30") : NaN,
