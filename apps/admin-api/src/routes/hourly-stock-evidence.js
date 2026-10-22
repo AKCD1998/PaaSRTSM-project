@@ -1,6 +1,7 @@
 "use strict";
 const { sourceReadDiagnostics } = require("../services/hourlyStockSourceRead");
 const { derivedObservationDiagnostics } = require("../services/hourlyDerivedObservation");
+const { cohortCoverageDiagnostics } = require("../services/hourlyCohortCoverage");
 
 const crypto = require("node:crypto");
 const express = require("express");
@@ -23,8 +24,8 @@ function timingSafeEqualStrings(left, right) {
   return crypto.timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-function authenticateBranch(config, req, branchCode) {
-  if (config.featureHourlyStockEvidence !== true) return { status: 503, message: "Hourly evidence ingestion is disabled." };
+function authenticateBranch(config, req, branchCode, requireReceiver = true) {
+  if (requireReceiver && config.featureHourlyStockEvidence !== true) return { status: 503, message: "Hourly evidence ingestion is disabled." };
   const tokens = config.hourlyStockEvidenceBranchTokens;
   if (!(tokens instanceof Map) || tokens.size === 0) return { status: 503, message: "Hourly evidence ingestion is not configured." };
   const expected = tokens.get(branchCode);
@@ -74,7 +75,8 @@ async function persistCapture(client, capture) {
         capture.records.length,
         capture.payloadSha256,
         JSON.stringify({ ...capture.clientMeta,
-          ...(capture.derivedObservation == null ? {} : { derivedObservation: capture.derivedObservation }) }),
+          ...(capture.derivedObservation == null ? {} : { derivedObservation: capture.derivedObservation }),
+          ...(capture.cohortCoverage == null ? {} : { cohortCoverage: capture.cohortCoverage }) }),
       ],
     );
     if (inserted.rowCount === 0) {
@@ -96,6 +98,19 @@ async function persistCapture(client, capture) {
       return { duplicate: true, captureId: String(row.capture_id), receivedAt: row.received_at };
     }
 
+    // A previously committed capture must still acknowledge exact retries
+    // after catalog changes. Only new captures need current membership.
+    if (capture.cohortCoverage?.scope === "web-all") {
+      const codes = [...capture.records.map(row => row.productCode), ...capture.cohortCoverage.missingProductCodes];
+      const coverage = await client.query(`SELECT COUNT(DISTINCT company_code)::integer AS total,
+        COUNT(DISTINCT company_code) FILTER (WHERE company_code = ANY($1::text[]))::integer AS matched,
+        COUNT(*) FILTER (WHERE company_code IS NULL OR BTRIM(company_code) = '')::integer AS missing_codes
+        FROM public.skus`, [codes]);
+      const row = coverage.rows[0];
+      if (!row || Number(row.total) !== codes.length || Number(row.matched) !== codes.length || Number(row.missing_codes) !== 0) {
+        throw Object.assign(new Error("Hourly cohort does not match the current web catalog."), { status: 409 });
+      }
+    }
     const captureId = inserted.rows[0].capture_id;
     await client.query(
       `INSERT INTO evidence.hourly_stock_capture_rows (
@@ -133,6 +148,25 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
   const router = express.Router();
   router.use((_req, res, next) => { res.set("Cache-Control", "no-store"); next(); });
 
+  // Private catalog preparation can run while ingestion stays OFF. This reads
+  // only web membership; it neither reads branch stock nor creates a capture.
+  router.get("/cohort", async (req, res, next) => {
+    const branchCode = String(req.query.branchCode || "");
+    if (config.featureHourlyStockEvidenceCompleteCohort !== true) return res.status(503).json({ message: "Complete Hourly cohorts are disabled." });
+    if (branchCode !== "004") return res.status(400).json({ message: "Complete Hourly cohorts support branch 004 only." });
+    const authError = authenticateBranch(config, req, branchCode, false);
+    if (authError) return res.status(authError.status).json({ message: authError.message });
+    try {
+      const result = await db.query("SELECT company_code FROM public.skus ORDER BY company_code LIMIT 10001");
+      const codes = result.rows.map(row => row.company_code);
+      if (!codes.length || codes.length > 10000 || new Set(codes).size !== codes.length
+          || codes.some(code => typeof code !== "string" || !code || code.trim() !== code || code.length > 80)) {
+        return res.status(409).json({ message: "Web catalog cannot form a bounded unique Hourly cohort." });
+      }
+      return res.json({ schemaVersion: "hourly-approved-cohort-v1", scope: "web-all", productCodes: codes });
+    } catch (error) { return next(error); }
+  });
+
   router.post("/captures", async (req, res, next) => {
     let capture;
     try {
@@ -142,6 +176,9 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
     }
     const authError = authenticateBranch(config, req, capture.branchCode);
     if (authError) return res.status(authError.status).json({ message: authError.message });
+    if (capture.cohortCoverage != null && config.featureHourlyStockEvidenceCompleteCohort !== true) {
+      return res.status(503).json({ message: "Complete Hourly cohorts are disabled." });
+    }
     if (config.featureHourlyStockEvidenceRetention === true) {
       const days = config.hourlyStockEvidenceRetentionDays;
       if (!Number.isSafeInteger(days) || days < 3 || days > 365) {
@@ -216,7 +253,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
            )
            SELECT captures.capture_role, captures.captured_at, captures.planned_for, captures.received_at, captures.source_event_at,
                   CASE WHEN ROW_NUMBER() OVER (PARTITION BY captures.capture_id ORDER BY rows.product_code) = 1
-                    THEN captures.client_meta ELSE captures.client_meta - 'derivedObservation' END AS client_meta,
+                    THEN captures.client_meta ELSE captures.client_meta - 'derivedObservation' - 'cohortCoverage' - 'sourceRead' END AS client_meta,
                   captures.planned_slot, captures.capture_count, rows.product_code,
                   rows.retail_on_hand::double precision AS retail_on_hand,
                   rows.latest_estimated_on_hand::double precision AS latest_estimated_on_hand
@@ -230,6 +267,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         const cohortBySlot = new Map();
         const seenCaptures = new Set();
         const derivedBySlot = new Map();
+        const coverageBySlot = new Map();
         for (const row of result.rows) {
           const captureKey = `${row.capture_role}:${row.planned_slot}`;
           if (!cohortBySlot.has(captureKey)) cohortBySlot.set(captureKey, new Map());
@@ -242,6 +280,7 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
           if (!seenCaptures.has(captureKey)) {
             seenCaptures.add(captureKey);
             if (row.capture_role === "intraday") derivedBySlot.set(row.planned_slot, row.client_meta?.derivedObservation);
+            coverageBySlot.set(captureKey, row.client_meta?.cohortCoverage);
             const evidence = {
               plannedSlot: row.planned_slot,
               plannedFor: row.planned_for,
@@ -286,7 +325,13 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
           slot.missingEstimatedValueCount = [...cohort.values()].filter((value) => value.latestEstimatedOnHand == null).length;
           slot.sameTimeFieldGaps = computeSameTimeFieldGaps([...cohort.values()]);
           slot.derivedObservationDiagnostics = derivedObservationDiagnostics(derivedBySlot.get(slot.plannedSlot),
-            [...cohort.values()], new Date(slot.capturedAt).toISOString());
+            [...cohort.values()], new Date(slot.capturedAt).toISOString(), { completeCohort: coverageBySlot.get("intraday:" + slot.plannedSlot) != null });
+        }
+        for (const [key, slot, kind] of [["morning:08:20", slotEvidence.morning, "morning_anchor"],
+          ["next_morning:08:20", slotEvidence.nextMorning, "morning_anchor"],
+          ...slotEvidence.intraday.map(slot => ["intraday:" + slot.plannedSlot, slot, "intraday"])]) {
+          if (slot && coverageBySlot.get(key) != null) slot.cohortCoverage = cohortCoverageDiagnostics(coverageBySlot.get(key),
+            [...(cohortBySlot.get(key) ?? new Map()).values()], kind);
         }
         const collectionQuality = classifyCollectionQuality({
           slotEvidence, missingPlannedSlots, metrics,
@@ -294,6 +339,17 @@ function createHourlyStockEvidenceRouter({ config, db, requireAuthMiddleware, re
         });
         if (slotEvidence.intraday.some((slot) => slot.cohortMismatchCount || slot.missingEstimatedValueCount)) {
           if (!collectionQuality.reasons.includes("incomplete-cohort")) collectionQuality.reasons.push("incomplete-cohort");
+          collectionQuality.qualifying = false;
+        }
+        const allSlots = [slotEvidence.morning, ...slotEvidence.intraday, slotEvidence.nextMorning].filter(Boolean);
+        const markedCohorts = [...coverageBySlot.values()].filter(Boolean);
+        if (markedCohorts.length && (markedCohorts.length !== allSlots.length
+            || new Set(markedCohorts.map(value => value.cohortSha256)).size !== 1)) {
+          collectionQuality.reasons.push("cohort-changed-between-slots");
+          collectionQuality.qualifying = false;
+        }
+        if (allSlots.some(slot => slot.cohortCoverage && slot.cohortCoverage.status !== "complete")) {
+          collectionQuality.reasons.push("incomplete-source-coverage");
           collectionQuality.qualifying = false;
         }
         const sourceFreshness = classifySourceFreshness({ slotEvidence, missingPlannedSlots });
