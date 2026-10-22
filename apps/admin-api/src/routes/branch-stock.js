@@ -7,6 +7,7 @@ const XLSX = require("xlsx");
 const { auditLog } = require("../audit");
 const { auditBase } = require("../utils/audit-payload");
 const { acquireIngestionDbClient } = require("../utils/db-acquire");
+const { createHourly004StockDisplay, STOCK_VIEW } = require("../services/hourly004StockDisplay");
 
 const docsDir = path.resolve(__dirname, "../../../../docs");
 const BRANCH_EXPORT_CONFIG = {
@@ -1575,6 +1576,7 @@ async function upsertProductCategoryState(client, row, req, sourceArgs) {
 function createBranchStockRouter(deps) {
   const { config, db, requireAuthMiddleware, requireRoleMiddleware, requireCsrfMiddleware } = deps;
   const router = express.Router();
+  const projectHourly004 = createHourly004StockDisplay({ db, config, now: deps.now });
 
   router.post("/branch-stock/sync", async (req, res, next) => {
     const apiKeyError = parseRequiredApiKey(config, req);
@@ -1832,7 +1834,8 @@ function createBranchStockRouter(deps) {
             bs.qty_branch_004,
             bs.qty_branch_005,
             bs.qty_total_all_branches,
-            bs.synced_at
+            bs.synced_at,
+            bs.synced_at_branch_004 AS full_sync_at_004
           FROM ada.branch_stock_snapshots bs
           LEFT JOIN ada.products p
             ON p.product_code = bs.product_code
@@ -1874,8 +1877,11 @@ function createBranchStockRouter(deps) {
             [limit, offset],
           );
 
+      const records = rowsResult.rows.map(mapBranchStockRow);
+      const display = req.query.stockView === STOCK_VIEW
+        ? await projectHourly004(records, rowsResult.rows) : { records };
       return res.json({
-        records: rowsResult.rows.map(mapBranchStockRow),
+        ...display,
         pagination: {
           limit,
           offset,
@@ -2285,7 +2291,8 @@ function createBranchStockRouter(deps) {
             bs.qty_branch_004,
             bs.qty_branch_005,
             bs.qty_total_all_branches,
-            bs.synced_at
+            bs.synced_at,
+            bs.synced_at_branch_004 AS full_sync_at_004
           FROM ada.branch_stock_snapshots bs
           LEFT JOIN ada.products p
             ON p.product_code = bs.product_code
@@ -2312,7 +2319,10 @@ function createBranchStockRouter(deps) {
         [search],
       );
 
-      const rows = rowsResult.rows.map(mapBranchStockRow);
+      const baseRows = rowsResult.rows.map(mapBranchStockRow);
+      const display = req.query.stockView === STOCK_VIEW && (isAllBranches || branchCode === "004")
+        ? await projectHourly004(baseRows, rowsResult.rows) : { records: baseRows };
+      const rows = display.records;
       const dateStamp = new Date().toISOString().slice(0, 10);
       let buffer, fileName;
       if (isAllBranches) {
@@ -2321,6 +2331,18 @@ function createBranchStockRouter(deps) {
       } else {
         buffer = buildBranchStockExportWorkbook(rows, branchCode);
         fileName = `branch-stock-${branchCode}-${dateStamp}.xlsx`;
+      }
+      if (display.hourlyStock004) {
+        const workbook = XLSX.read(buffer, { type: "buffer" });
+        const sources = rows.map(row => ({
+          "รหัสสินค้า": row.productCode, "แหล่งยอด 004": row.stock004.basis,
+          "ยอด Full Sync 004": row.fullSyncQtyBranch004,
+          "อ่าน Hourly เมื่อ": row.stock004.capturedAt || "",
+          "Full Sync เมื่อ": row.stock004.fullSyncAt || "",
+          "เหตุที่ใช้ Full Sync": row.stock004.reason || "",
+        }));
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(sources), "ที่มาสต็อก004");
+        buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
       }
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
       res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
