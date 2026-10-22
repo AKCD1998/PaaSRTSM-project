@@ -171,6 +171,8 @@ function createApp(overrides = {}) {
   // parsed, so the app-wide express.json() below is a no-op for these requests.
   app.use("/api/sync/ada", express.json({ limit: "10mb" }));
   app.use("/api/admin/focus-products/line-packages", express.json({ limit: "8mb" }));
+  // Only Hourly complete-cohort evidence gets the larger bounded parser.
+  app.use("/api/hourly-stock-evidence", express.json({ limit: "4mb" }));
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: false, limit: "1mb" }));
   app.use(cookieParser());

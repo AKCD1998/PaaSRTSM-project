@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { parseSourceRead } = require("./hourlyStockSourceRead");
 const { parseDerivedObservation } = require("./hourlyDerivedObservation");
+const { parseCohortCoverage, HOURLY_COMPLETE_COHORT_MAX_RECORDS, HOURLY_COMPLETE_COHORT_MAX_BODY_BYTES } = require("./hourlyCohortCoverage");
 
 const CONTRACT_VERSION = "hourly-dual-stock-evidence-v1";
 const DATASET_TAG = "hourly_dual_stock_evidence";
@@ -38,6 +39,7 @@ function payloadIdentity(payload) {
       latestEstimatedOnHand: record.latestEstimatedOnHand,
     })),
     ...(payload.derivedObservation == null ? {} : { derivedObservation: payload.derivedObservation }),
+    ...(payload.cohortCoverage == null ? {} : { cohortCoverage: payload.cohortCoverage }),
     ...(payload.observationKind === "morning_anchor"
       ? { authoritativeSyncRunId: String(payload.clientMeta?.authoritativeSyncRunId) } : {}),
   };
@@ -92,7 +94,8 @@ function parseClientMeta(value, recordCount, observationKind) {
 
 function parseCapturePayload(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Payload must be an object.");
-  if (Buffer.byteLength(JSON.stringify(body), "utf8") > MAX_BODY_BYTES) throw new Error("Payload exceeds 256 KiB.");
+  const completeCohort = body.cohortCoverage != null;
+  if (Buffer.byteLength(JSON.stringify(body), "utf8") > (completeCohort ? HOURLY_COMPLETE_COHORT_MAX_BODY_BYTES : MAX_BODY_BYTES)) throw new Error("Payload exceeds its size bound.");
   if (body.contractVersion !== CONTRACT_VERSION || body.datasetTag !== DATASET_TAG) {
     throw new Error("Unsupported hourly evidence contract.");
   }
@@ -113,7 +116,8 @@ function parseCapturePayload(body) {
   }
   const sourceEventAt = parseIsoTimestamp(body.sourceEventAt, "sourceEventAt", { nullable: true });
   if (sourceEventAt && sourceEventAt > capturedAt) throw new Error("sourceEventAt cannot be after capturedAt.");
-  if (!Array.isArray(body.records) || body.records.length < 1 || body.records.length > MAX_RECORDS) {
+  if (completeCohort && branchCode !== "004") throw new Error("Complete cohorts are limited to branch 004.");
+  if (!Array.isArray(body.records) || body.records.length < 1 || body.records.length > (completeCohort ? HOURLY_COMPLETE_COHORT_MAX_RECORDS : MAX_RECORDS)) {
     throw new Error(`records must contain 1-${MAX_RECORDS} rows.`);
   }
   const seen = new Set();
@@ -148,9 +152,10 @@ function parseCapturePayload(body) {
   if (observationKind === "morning_anchor" && !parsed.clientMeta.authoritativeSyncRunId) {
     throw new Error("Morning anchor requires an authoritative Full Sync receipt.");
   }
+  if (completeCohort) parsed.cohortCoverage = parseCohortCoverage(body.cohortCoverage, records, observationKind);
   if (body.derivedObservation != null) {
     if (branchCode !== "004" || observationKind !== "intraday") throw new Error("Derived observations are intraday branch 004 only.");
-    parsed.derivedObservation = parseDerivedObservation(body.derivedObservation, records, capturedAt);
+    parsed.derivedObservation = parseDerivedObservation(body.derivedObservation, records, capturedAt, { completeCohort });
   }
   parsed.payloadSha256 = payloadIdentity(parsed);
   if (body.idempotencyKey !== parsed.payloadSha256) throw new Error("idempotencyKey does not match payload identity.");

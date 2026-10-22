@@ -1,4 +1,5 @@
 "use strict";
+const { HOURLY_COMPLETE_COHORT_MAX_RECORDS } = require("./hourlyCohortCoverage");
 
 const VERSION = "adapos-stored-stock-read-v1";
 const COUNTERS = ["productCount", "missingEstimateProducts", "missingPendingProducts", "missingRefreshProducts",
@@ -16,7 +17,7 @@ function parseSourceRead(value, recordCount) {
   }
   const parsed = { schemaVersion: VERSION, estimateBasis: value.estimateBasis };
   for (const key of COUNTERS) {
-    if (!Number.isSafeInteger(value[key]) || value[key] < 0 || value[key] > 500) throw new Error("sourceRead has an invalid counter.");
+    if (!Number.isSafeInteger(value[key]) || value[key] < 0 || value[key] > Math.min(recordCount, HOURLY_COMPLETE_COHORT_MAX_RECORDS)) throw new Error("sourceRead has an invalid counter.");
     parsed[key] = value[key];
   }
   const count = parsed.productCount;
