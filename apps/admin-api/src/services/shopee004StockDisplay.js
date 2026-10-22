@@ -67,6 +67,7 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
     return { ...display, records, shopeeStock004: { status: projection ? (unknownProducts ? "partial" : "available") : failure,
       branchCode: "004", applied: Boolean(projection), asOf: projection?.asOf || null,
       lastEmailIngestedAt: projection?.lastEmailIngestedAt || null, cutoverAt: projection?.cutoverAt || null,
+      sourceLabelReviewOrders: Number.isSafeInteger(projection?.sourceLabelReviewOrders) ? projection.sourceLabelReviewOrders : null,
       pageUnknownProducts: unknownProducts, emailCoverage: "email-orders-only", physicalStockWrites: false,
       businessFreshnessQualified: false, atomicSnapshotVerified: false } };
   };

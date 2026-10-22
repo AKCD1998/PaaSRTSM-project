@@ -5,7 +5,7 @@ const {createBranchStockRouter}=require('../apps/admin-api/src/routes/branch-sto
 const stamp='2026-10-22T12:00:00.000Z';
 function fixture() {
   const state={calls:[],payload:{schemaVersion:'shopee004-commitments-v1',branchCode:'004',mode:'live',status:'available',
-    asOf:stamp,lastEmailIngestedAt:stamp,cutoverAt:'2026-10-22T11:00:00Z',emailCoverage:'email-orders-only',posPostingPolicy:'not-recorded-in-pos',pendingOrders:0,reviewOrders:0,
+    asOf:stamp,lastEmailIngestedAt:stamp,cutoverAt:'2026-10-22T11:00:00Z',emailCoverage:'email-orders-only',posPostingPolicy:'not-recorded-in-pos',pendingOrders:0,reviewOrders:0,sourceLabelReviewOrders:1,
     records:[{productCode:'P1',unit:'ซอง',reservedQuantity:3,shippedUnpostedQuantity:2}]}};
   const config={featureShopee004StockAvailability:true,shopee004StockProjectionToken:'synthetic-'.repeat(5)};
   const fetchImpl=async(url,options)=>{state.calls.push({url,options});return new Response(JSON.stringify(state.payload),{status:200});};
@@ -18,6 +18,7 @@ test('subtracts reserved plus shipped-unposted exactly once from the POS basis; 
   assert.equal(r.records[0].qtyBranch004,-1);assert.equal(r.records[0].qtyTotalAllBranches,6);assert.equal(r.records[0].qtyBranch001,7);
   assert.equal(r.records[0].posQtyBranch004,4);assert.equal(r.records[0].stock004.basis,'hourly-and-shopee');
   assert.deepEqual(f.display,original);assert.equal(f.state.calls[0].url,PROJECTION_URL);
+  assert.equal(r.shopeeStock004.sourceLabelReviewOrders,1);
   assert.equal(f.state.calls[0].options.redirect,'error');assert.equal(r.shopeeStock004.businessFreshnessQualified,false);
 });
 test('flag off does not make a bridge request and keeps existing Hourly response quantities',async()=>{
