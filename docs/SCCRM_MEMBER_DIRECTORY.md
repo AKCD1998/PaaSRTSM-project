@@ -15,9 +15,10 @@ Upstream credential/SQL errors are not returned to the browser.
 Deploy the SC-official-website internal readers before the shared API and the
 StockDay UI. Existing CRM mirror configuration was verified present and points
 at the original website. No environment changes or database migrations are
-required. On 2026-10-22, remote main migration ceiling was 074; the production
-ledger contained every current migration, so this feature adds no pre-deploy
-schema effect. Recheck against current main/ledger before merging.
+required. The initial read-only audit matched migration 074. Concurrent main later added
+075 (the independently deployed bounded hourly-cohort CHECK constraint). Its
+deploy and ledger must finish before releasing this feature; no migration is
+introduced by this PR. Recheck current main/ledger immediately before merging.
 
 Verification: authenticated router tests cover role denial, fixed upstream
 origin, input encoding/limits, timeouts and sanitized errors. Local full suite:
