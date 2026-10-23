@@ -8,6 +8,7 @@ const { auditLog } = require("../audit");
 const { auditBase } = require("../utils/audit-payload");
 const { acquireIngestionDbClient } = require("../utils/db-acquire");
 const { createHourly004StockDisplay, STOCK_VIEW } = require("../services/hourly004StockDisplay");
+const { createShopee004StockDisplay, STOCK_VIEW_SHOPEE } = require("../services/shopee004StockDisplay");
 
 const docsDir = path.resolve(__dirname, "../../../../docs");
 const BRANCH_EXPORT_CONFIG = {
@@ -643,7 +644,7 @@ function buildBranchStockExportWorkbook(rows, branchCode) {
       row.productNameThai || "",
       row.barcode || "",
       row.unit || "",
-      Number(row[branchConfig.qtyKey] || 0),
+      row[branchConfig.qtyKey] === null ? "ไม่ทราบ" : Number(row[branchConfig.qtyKey] || 0),
       row.category || "",
       "",
       "",
@@ -683,7 +684,7 @@ function buildBranchSheet(rows, branchCode) {
       row.productNameThai || "",
       row.barcode || "",
       row.unit || "",
-      Number(row[branchConfig.qtyKey] || 0),
+      row[branchConfig.qtyKey] === null ? "ไม่ทราบ" : Number(row[branchConfig.qtyKey] || 0),
       row.category || "",
       "",
       "",
@@ -724,9 +725,9 @@ function buildAllBranchesExportWorkbook(rows) {
       Number(row.qtyBranch000 || 0),
       Number(row.qtyBranch001 || 0),
       Number(row.qtyBranch003 || 0),
-      Number(row.qtyBranch004 || 0),
+      row.qtyBranch004 === null ? "ไม่ทราบ" : Number(row.qtyBranch004 || 0),
       Number(row.qtyBranch005 || 0),
-      Number(row.qtyTotalAllBranches || 0),
+      row.qtyTotalAllBranches === null ? "ไม่ทราบ" : Number(row.qtyTotalAllBranches || 0),
       row.syncedAt || "",
     ]),
   ];
@@ -1577,6 +1578,12 @@ function createBranchStockRouter(deps) {
   const { config, db, requireAuthMiddleware, requireRoleMiddleware, requireCsrfMiddleware } = deps;
   const router = express.Router();
   const projectHourly004 = createHourly004StockDisplay({ db, config, now: deps.now });
+  const projectShopee004 = createShopee004StockDisplay({ config, now: deps.now, fetchImpl: deps.shopeeStockFetch });
+  async function stockDisplay(view, records, sourceRows) {
+    if (![STOCK_VIEW, STOCK_VIEW_SHOPEE].includes(view)) return { records };
+    const hourly = await projectHourly004(records, sourceRows);
+    return view === STOCK_VIEW_SHOPEE ? projectShopee004(hourly) : hourly;
+  }
 
   router.post("/branch-stock/sync", async (req, res, next) => {
     const apiKeyError = parseRequiredApiKey(config, req);
@@ -1878,8 +1885,8 @@ function createBranchStockRouter(deps) {
           );
 
       const records = rowsResult.rows.map(mapBranchStockRow);
-      const display = req.query.stockView === STOCK_VIEW
-        ? await projectHourly004(records, rowsResult.rows) : { records };
+      const display = await stockDisplay(req.query.stockView, records, rowsResult.rows);
+      if (req.query.stockView === STOCK_VIEW_SHOPEE) res.set("Cache-Control", "no-store");
       return res.json({
         ...display,
         pagination: {
@@ -2320,9 +2327,10 @@ function createBranchStockRouter(deps) {
       );
 
       const baseRows = rowsResult.rows.map(mapBranchStockRow);
-      const display = req.query.stockView === STOCK_VIEW && (isAllBranches || branchCode === "004")
-        ? await projectHourly004(baseRows, rowsResult.rows) : { records: baseRows };
+      const display = (isAllBranches || branchCode === "004")
+        ? await stockDisplay(req.query.stockView, baseRows, rowsResult.rows) : { records: baseRows };
       const rows = display.records;
+      if (req.query.stockView === STOCK_VIEW_SHOPEE) res.set("Cache-Control", "no-store");
       const dateStamp = new Date().toISOString().slice(0, 10);
       let buffer, fileName;
       if (isAllBranches) {
@@ -2340,6 +2348,12 @@ function createBranchStockRouter(deps) {
           "อ่าน Hourly เมื่อ": row.stock004.capturedAt || "",
           "Full Sync เมื่อ": row.stock004.fullSyncAt || "",
           "เหตุที่ใช้ Full Sync": row.stock004.reason || "",
+          ...(row.stock004.shopee ? {
+            "ยอด POS 004": row.posQtyBranch004 ?? "",
+            "จอง Shopee": row.stock004.shopee.reservedQuantity ?? "",
+            "ส่งแล้วไม่ลง POS": row.stock004.shopee.shippedUnpostedQuantity ?? "",
+            "บัญชีจองเมื่อ": row.stock004.shopee.asOf || "",
+          } : {}),
         }));
         XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(sources), "ที่มาสต็อก004");
         buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
