@@ -303,7 +303,7 @@ function createApp(overrides = {}) {
       requireCsrfMiddleware: requireCsrf,
     }),
   );
-  app.use('/api',createShopee004StockExceptionsRouter({config,
+  app.use(createShopee004StockExceptionsRouter({config,
     requireAuthMiddleware,requireRoleMiddleware:requireRole,requireCsrfMiddleware:requireCsrf}));
   app.use(
     "/api/hourly-stock-evidence",

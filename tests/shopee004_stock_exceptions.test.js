@@ -15,6 +15,20 @@ function fixture({enabled=true,token=true,fetchImpl,role='admin',auth=true}={}){
  return {app,calls,config};
 }
 const base='/admin/shopee004';
+test('production app mounts the web exception contract at its authenticated root path',async()=>{
+ const {createApp}=require('../apps/admin-api/src/server');
+ const {loadConfig}=require('../apps/admin-api/src/config');
+ const {signSessionToken}=require('../apps/admin-api/src/auth/session');
+ const config=loadConfig({NODE_ENV:'test',AUTH_JWT_SECRET:'synthetic-mount-test-secret'});
+ const {app}=createApp({config,db:{query:async()=>{throw Error('UNEXPECTED_DATABASE_ACCESS');}},videoStorageProvider:{providerName:'local'},videoJobRunner:{}});
+ assert.equal((await request(app).get(base+'/stock-exceptions')).status,401);
+ const cookie=`${config.cookieName}=${signSessionToken({sub:'synthetic-admin',role:'admin'},config)}`;
+ for(const path of ['/stock-exceptions','/stock-reconciliation']){
+  const r=await request(app).get(base+path).set('Cookie',cookie);
+  assert.equal(r.status,503);assert.equal(r.body.error.code,'STOCK_EXCEPTION_ADMIN_DISABLED');
+ }
+ assert.equal((await request(app).get('/api'+base+'/stock-exceptions').set('Cookie',cookie)).status,404);
+});
 const body=()=>({operationId:op,expectedRevision:'12:3:2026-10-23T10:00:00Z',listingId:'SYNTH_LIST',variationId:'SYNTH_VAR',components:[{productCode:'SYNTH-P1',quantityPerSale:1,unit:'box'}],evidenceRefs:['proof-1'],acknowledgeUnitEvidence:true});
 test('admin queue is read only, validates pagination and removes private provider/customer/order fields',async()=>{
  const f=fixture(),r=await request(f.app).get(base+'/stock-exceptions');assert.equal(r.status,200);assert.equal(r.headers['cache-control'],'no-store');
