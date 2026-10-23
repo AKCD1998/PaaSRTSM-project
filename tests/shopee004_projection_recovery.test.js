@@ -3,13 +3,13 @@ const test=require('node:test'),assert=require('node:assert/strict');
 const {createProjectionReader,createConfirmedReferenceCache}=require('../apps/admin-api/src/services/shopee004ProjectionRecovery');
 const {createShopee004StockDisplay}=require('../apps/admin-api/src/services/shopee004StockDisplay');
 const token='synthetic-projection-credential-not-real';
-function fixture(){
+function fixture({failureFactory=()=>new TypeError('PRIVATE_PROVIDER_DETAIL')}={}){
  let at=Date.parse('2026-10-23T10:00:00Z'),down=false,calls=0;
  const config={featureShopee004StockAvailability:true,shopee004StockProjectionToken:token};
  const payload={schemaVersion:'shopee004-commitments-v1',branchCode:'004',mode:'live',status:'available',asOf:new Date(at).toISOString(),cutoverAt:'2026-10-23T06:26:56Z',
    emailCoverage:'email-orders-only',posPostingPolicy:'not-recorded-in-pos',pendingOrders:0,reviewOrders:0,records:[{productCode:'SYNTH-P1',unit:'กล่อง',reservedQuantity:2,shippedUnpostedQuantity:1}]};
  const input={records:[{productCode:'SYNTH-P1',unit:'กล่อง',qtyBranch004:3,qtyBranch001:11,qtyTotalAllBranches:14,stock004:{basis:'hourly-calculated',capturedAt:new Date(at).toISOString()}}]};
- const now=()=>new Date(at),fetchImpl=async()=>{calls++;if(down)throw new TypeError('PRIVATE_PROVIDER_DETAIL');return new Response(JSON.stringify(payload));};
+ const now=()=>new Date(at),fetchImpl=async()=>{calls++;if(down)throw failureFactory();return new Response(JSON.stringify(payload));};
  const project=createShopee004StockDisplay({config,now,fetchImpl,projectionReader:createProjectionReader({fetchImpl,sleep:async()=>{}})});
  return {config,payload,input,project,down:()=>{down=true;},advance:ms=>{at+=ms;},calls:()=>calls};
 }
@@ -21,6 +21,23 @@ test('transport failure retains zero-valued successful reference with time but n
  assert.equal(row.stock004.lastConfirmed.reservedQuantity,2);assert.equal(r.shopeeStock004.pageReferenceProducts,1);assert.equal(r.shopeeStock004.issueClass,'temporary');
  assert.ok(!JSON.stringify(r).includes('PRIVATE_PROVIDER_DETAIL'));
 });
+test('native fetch timeout and abort codes retain the confirmed reference and remain temporary',async()=>{
+ for(const name of ['TimeoutError','AbortError']){
+  const f=fixture({failureFactory:()=>new DOMException('PRIVATE_PROVIDER_DETAIL',name)});
+  const ok=await f.project(f.input);assert.equal(ok.records[0].qtyBranch004,0);
+  f.down();f.advance(60000);const r=await f.project(f.input);
+  assert.equal(r.shopeeStock004.status,'projection-timeout');assert.equal(r.shopeeStock004.issueClass,'temporary');
+  assert.equal(r.records[0].qtyBranch004,null);assert.equal(r.records[0].qtyTotalAllBranches,null);
+  assert.equal(r.records[0].stock004.viewStatus,'reference');assert.equal(r.records[0].stock004.lastConfirmed.quantity,0);
+  assert.equal(f.calls(),3);assert.ok(!JSON.stringify(r).includes('PRIVATE_PROVIDER_DETAIL'));
+ }
+});
+
+test('native numeric timeout near the total deadline does not gain a fresh retry budget',async()=>{
+ let at=0,calls=0;const read=createProjectionReader({clock:()=>at,budgetMs:5000,sleep:async ms=>{at+=ms;},fetchImpl:async()=>{calls++;at=4900;throw new DOMException('PRIVATE_PROVIDER_DETAIL','TimeoutError');}});
+ await assert.rejects(read('https://fixture.invalid',['A'],token),{code:'PROJECTION_TIMEOUT',temporary:true});assert.equal(calls,1);
+});
+
 test('unit semantic conflict removes the previous reference for that product and is never retried',async()=>{
  const f=fixture();await f.project(f.input);f.payload.records[0].unit='ซอง';const r=await f.project(f.input);
  assert.equal(f.calls(),2);assert.equal(r.records[0].qtyBranch004,null);assert.equal(r.records[0].stock004.viewStatus,'unverified');assert.equal(r.records[0].stock004.lastConfirmed,undefined);
