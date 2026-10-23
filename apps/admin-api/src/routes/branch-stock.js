@@ -2360,7 +2360,7 @@ function createBranchStockRouter(deps) {
             "ส่งแล้วไม่ลง POS": row.stock004.shopee.shippedUnpostedQuantity ?? "",
             "บัญชีจองเมื่อ": row.stock004.shopee.asOf || "",
             "ออเดอร์ยังจับคู่ไม่ได้": row.stock004.shopee.unallocatedOrders ?? "",
-            "ยอดรวมออเดอร์ที่ยืนยันครบ": row.stock004.shopee.allOrdersAllocated === true ? "ครบ" : "ยังไม่ครบ",
+            "จับคู่สินค้าได้ครบทุกออเดอร์": row.stock004.shopee.allOrdersAllocated === true ? "ครบ" : "ยังไม่ครบ",
           } : {}),
         }));
         XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(sources), "ที่มาสต็อก004");

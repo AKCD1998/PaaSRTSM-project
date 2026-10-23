@@ -158,5 +158,5 @@ test('temporary known-commitment quantities stay explicitly qualified in Excel r
  const book=XLSX.read(r.body,{type:'buffer'}),rows=XLSX.utils.sheet_to_json(book.Sheets['Stock 004'],{header:1});
  assert.equal(rows[2][5],'-1 (ยังไม่รวมออเดอร์ค้างจับคู่)');
  const source=XLSX.utils.sheet_to_json(book.Sheets['ที่มาสต็อก004']);
- assert.equal(source[0]['ออเดอร์ยังจับคู่ไม่ได้'],1);assert.equal(source[0]['ยอดรวมออเดอร์ที่ยืนยันครบ'],'ยังไม่ครบ');
+ assert.equal(source[0]['ออเดอร์ยังจับคู่ไม่ได้'],1);assert.equal(source[0]['จับคู่สินค้าได้ครบทุกออเดอร์'],'ยังไม่ครบ');
 });
