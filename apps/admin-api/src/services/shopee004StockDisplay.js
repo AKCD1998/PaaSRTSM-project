@@ -40,13 +40,17 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
           asOf:safeTime(value.asOf),lastEmailIngestedAt:safeTime(value.lastEmailIngestedAt) };
       }
       const age = now().getTime() - Date.parse(value.asOf);
-      const scoped = value.availabilityContract === 'per-product-review-v1';
+      const v2=value.availabilityContract==='per-product-review-v2';
+      const scoped = v2 || value.availabilityContract === 'per-product-review-v1';
+      const unallocated=v2?safeCount(value.unallocatedOrders):0;
       const scopedReady = scoped && value.scopeValidated === true
         && safeCount(value.pendingOrders) !== null && safeCount(value.reviewOrders) !== null
+        && unallocated!==null && unallocated<=value.pendingOrders+value.reviewOrders
         && ['available','partial'].includes(value.status)
-        && value.status === (value.pendingOrders || value.reviewOrders ? 'partial' : 'available')
+        && value.status === (value.pendingOrders || value.reviewOrders || (v2&&value.pageReviewProducts) ? 'partial' : 'available')
         && Array.isArray(value.records)
-        && value.records.every(r => ['available','review_required'].includes(r.availabilityStatus))
+        && value.records.every(r => ['available','review_required',...(v2?['known-commitments-only']:[])].includes(r.availabilityStatus)
+          && (r.availabilityStatus==='review_required'||r.availabilityStatus===(unallocated?'known-commitments-only':'available')))
         && value.pageReviewProducts === value.records.filter(r => r.availabilityStatus === 'review_required').length
         && (value.status !== 'available' || value.pageReviewProducts === 0);
       const legacyReady = !scoped && value.availabilityContract == null && value.status === 'available'
@@ -59,10 +63,11 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
         || !Array.isArray(value.records) || value.records.length !== codes.length
         || new Set(value.records.map(r => r.productCode)).size !== codes.length
         || value.records.some(r => !requestedCodes.has(r.productCode)
-          || !Number.isSafeInteger(r.reservedQuantity) || r.reservedQuantity < 0
+          || (!(v2&&r.availabilityStatus==='review_required'&&r.reservedQuantity===null&&r.shippedUnpostedQuantity===null&&r.unit===null)
+          && (!Number.isSafeInteger(r.reservedQuantity) || r.reservedQuantity < 0
           || !Number.isSafeInteger(r.shippedUnpostedQuantity) || r.shippedUnpostedQuantity < 0
           || !Number.isSafeInteger(r.reservedQuantity + r.shippedUnpostedQuantity)
-          || ((r.reservedQuantity + r.shippedUnpostedQuantity) > 0 && (typeof r.unit !== "string" || !r.unit)))) {
+          || ((r.reservedQuantity + r.shippedUnpostedQuantity) > 0 && (typeof r.unit !== "string" || !r.unit)))))) {
         failure = value.mode === "paused" ? "reservation-paused-holds-retained"
           : diagnostic?.reviewOrders > 0 ? "shopee-orders-need-review"
             : diagnostic?.pendingOrders > 0 ? "shopee-orders-processing" : "projection-not-qualified";
@@ -74,7 +79,7 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
       // Fail closed for quantities, with only a bounded operational diagnosis.
     }
     const commitments = new Map(projection?.records.map(r => [r.productCode,r]) || []);
-    let unknownProducts = 0;
+    let unknownProducts = 0,estimatedProducts=0;
     const records = display.records.map(record => {
       const line = commitments.get(record.productCode);
       const demand = line ? line.reservedQuantity + line.shippedUnpostedQuantity : null;
@@ -82,18 +87,21 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
         : !Number.isFinite(record.qtyBranch004) ? "pos-stock-unavailable"
         : demand > 0 && normalizeUnit(record.unit) !== normalizeUnit(line.unit) ? "pos-reservation-unit-mismatch" : null;
       if (reason) unknownProducts++;
+      const estimated=!reason&&line?.availabilityStatus==='known-commitments-only';if(estimated)estimatedProducts++;
       const quantity = reason ? null : record.qtyBranch004 - demand;
       return { ...record, posQtyBranch004: record.qtyBranch004, qtyBranch004: quantity,
         qtyTotalAllBranches: reason ? null : record.qtyTotalAllBranches - demand,
-        stock004: { ...record.stock004, basis: reason ? "shopee-availability-unknown" : "hourly-and-shopee",
+        stock004: { ...record.stock004, basis: reason ? "shopee-availability-unknown" : estimated?'hourly-and-shopee-known-only':"hourly-and-shopee",
           posBasis: record.stock004?.basis || "full-sync", reason,
           shopee: { reservedQuantity: line?.reservedQuantity ?? null,
-            shippedUnpostedQuantity: line?.shippedUnpostedQuantity ?? null, asOf: projection?.asOf || null } } };
+            shippedUnpostedQuantity: line?.shippedUnpostedQuantity ?? null, asOf: projection?.asOf || null,
+            allOrdersAllocated:projection?!(projection.unallocatedOrders>0):false,unallocatedOrders:projection?.unallocatedOrders??null } } };
     });
-    return { ...display, records, shopeeStock004: { status: projection ? (unknownProducts || projection.status === 'partial' ? "partial" : "available") : failure,
+    return { ...display, records, shopeeStock004: { status: projection ? (projection.unallocatedOrders>0?'partial-known-commitments':unknownProducts || projection.status === 'partial' ? "partial" : "available") : failure,
       branchCode: "004", applied: Boolean(projection), asOf: projection?.asOf || diagnostic?.asOf || null,
       lastEmailIngestedAt: projection?.lastEmailIngestedAt || diagnostic?.lastEmailIngestedAt || null, cutoverAt: projection?.cutoverAt || null,
       reviewOrders:diagnostic?.reviewOrders ?? null,pendingOrders:diagnostic?.pendingOrders ?? null,
+      unallocatedOrders:projection?.unallocatedOrders??null,pageEstimatedProducts:estimatedProducts,
       sourceLabelReviewOrders: Number.isSafeInteger(projection?.sourceLabelReviewOrders) ? projection.sourceLabelReviewOrders : null,
       pageUnknownProducts: unknownProducts, emailCoverage: "email-orders-only", physicalStockWrites: false,
       businessFreshnessQualified: false, atomicSnapshotVerified: false } };

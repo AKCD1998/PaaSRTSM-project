@@ -100,6 +100,31 @@ for(const [name,change] of [
   f.state.payload.records[0].availabilityStatus='review_required';change(f.state.payload);
   assert.equal((await f.project(f.display)).records[0].qtyBranch004,null);
 });
+function scopedV2(f){
+ Object.assign(f.state.payload,{availabilityContract:'per-product-review-v2',scopeValidated:true,status:'partial',unallocatedOrders:1,reviewOrders:1,pageReviewProducts:0});
+ f.state.payload.records.forEach(r=>r.availabilityStatus='known-commitments-only');return f;
+}
+test('an unallocated order retains known deductions as an explicit temporary quantity without hiding every SKU',async()=>{
+ const f=scopedV2(fixture()),r=await f.project(f.display);
+ assert.equal(r.records[0].qtyBranch004,-1);assert.equal(r.records[0].qtyBranch001,7);
+ assert.equal(r.records[0].stock004.basis,'hourly-and-shopee-known-only');
+ assert.equal(r.records[0].stock004.shopee.allOrdersAllocated,false);assert.equal(r.shopeeStock004.unallocatedOrders,1);
+ assert.equal(r.shopeeStock004.status,'partial-known-commitments');assert.equal(r.shopeeStock004.pageUnknownProducts,0);
+ assert.equal(r.shopeeStock004.pageEstimatedProducts,1);
+});
+test('a bad product quantity remains null while other temporary quantities remain numeric and qualified as incomplete',async()=>{
+ const f=scopedV2(fixture());f.display.records.push({...f.display.records[0],productCode:'P2'});
+ f.state.payload.pageReviewProducts=1;f.state.payload.records.push({productCode:'P2',availabilityStatus:'review_required',reservedQuantity:null,shippedUnpostedQuantity:null,unit:null});
+ const r=await f.project(f.display);assert.equal(r.records[0].qtyBranch004,-1);assert.equal(r.records[1].qtyBranch004,null);
+ assert.equal(r.records[1].stock004.shopee.reservedQuantity,null);assert.equal(r.shopeeStock004.pageUnknownProducts,1);
+});
+for(const [name,change] of [
+ ['negative unallocated',v=>v.unallocatedOrders=-1],['noninteger unallocated',v=>v.unallocatedOrders='1'],
+ ['understated order count',v=>v.reviewOrders=0],['false complete qualification',v=>v.records[0].availabilityStatus='available'],
+ ['unqualified null quantity',v=>v.records[0].reservedQuantity=null],['unknown version',v=>v.availabilityContract='per-product-review-v999']
+])test('v2 '+name+' never presents an unqualified numeric balance',async()=>{
+ const f=scopedV2(fixture());change(f.state.payload);assert.equal((await f.project(f.display)).records[0].qtyBranch004,null);
+});
 function appFor(f) {
   const db={query:async sql=>{
     assert.match(sql,/^\s*SELECT/);
@@ -125,4 +150,13 @@ test('Excel export uses the same availability and preserves unknown as text inst
   const book=XLSX.read(r.body,{type:'buffer'});const rows=XLSX.utils.sheet_to_json(book.Sheets['Stock 004'],{header:1});
   assert.equal(rows[2][5],'ไม่ทราบ');assert.ok(book.SheetNames.includes('ที่มาสต็อก004'));
   f.state.calls=[];await request(app).get('/branch-stock/export.xlsx?branchCode=001&stockView=hourly004-shopee').expect(200);assert.equal(f.state.calls.length,0);
+});
+test('temporary known-commitment quantities stay explicitly qualified in Excel rather than looking final',async()=>{
+ const f=scopedV2(fixture());
+ const r=await request(appFor(f)).get('/branch-stock/export.xlsx?branchCode=004&stockView=hourly004-shopee')
+   .buffer(true).parse((res,done)=>{const chunks=[];res.on('data',d=>chunks.push(d));res.on('end',()=>done(null,Buffer.concat(chunks)));}).expect(200);
+ const book=XLSX.read(r.body,{type:'buffer'}),rows=XLSX.utils.sheet_to_json(book.Sheets['Stock 004'],{header:1});
+ assert.equal(rows[2][5],'-1 (ยังไม่รวมออเดอร์ค้างจับคู่)');
+ const source=XLSX.utils.sheet_to_json(book.Sheets['ที่มาสต็อก004']);
+ assert.equal(source[0]['ออเดอร์ยังจับคู่ไม่ได้'],1);assert.equal(source[0]['จับคู่สินค้าได้ครบทุกออเดอร์'],'ยังไม่ครบ');
 });

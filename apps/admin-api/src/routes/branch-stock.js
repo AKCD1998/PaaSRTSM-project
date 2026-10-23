@@ -644,7 +644,7 @@ function buildBranchStockExportWorkbook(rows, branchCode) {
       row.productNameThai || "",
       row.barcode || "",
       row.unit || "",
-      row[branchConfig.qtyKey] === null ? "ไม่ทราบ" : Number(row[branchConfig.qtyKey] || 0),
+      exportStockQuantity(row,branchConfig.qtyKey),
       row.category || "",
       "",
       "",
@@ -673,6 +673,12 @@ function buildBranchStockExportWorkbook(rows, branchCode) {
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 }
 
+function exportStockQuantity(row,key){
+  if(row[key]===null)return "ไม่ทราบ";
+  const value=Number(row[key]||0);
+  return row.stock004?.basis==='hourly-and-shopee-known-only'&&['qtyBranch004','qtyTotalAllBranches'].includes(key)
+    ?`${value} (ยังไม่รวมออเดอร์ค้างจับคู่)`:value;
+}
 function buildBranchSheet(rows, branchCode) {
   const branchConfig = BRANCH_EXPORT_CONFIG[branchCode];
   const sheetRows = [
@@ -684,7 +690,7 @@ function buildBranchSheet(rows, branchCode) {
       row.productNameThai || "",
       row.barcode || "",
       row.unit || "",
-      row[branchConfig.qtyKey] === null ? "ไม่ทราบ" : Number(row[branchConfig.qtyKey] || 0),
+      exportStockQuantity(row,branchConfig.qtyKey),
       row.category || "",
       "",
       "",
@@ -725,9 +731,9 @@ function buildAllBranchesExportWorkbook(rows) {
       Number(row.qtyBranch000 || 0),
       Number(row.qtyBranch001 || 0),
       Number(row.qtyBranch003 || 0),
-      row.qtyBranch004 === null ? "ไม่ทราบ" : Number(row.qtyBranch004 || 0),
+      exportStockQuantity(row,'qtyBranch004'),
       Number(row.qtyBranch005 || 0),
-      row.qtyTotalAllBranches === null ? "ไม่ทราบ" : Number(row.qtyTotalAllBranches || 0),
+      exportStockQuantity(row,'qtyTotalAllBranches'),
       row.syncedAt || "",
     ]),
   ];
@@ -2353,6 +2359,8 @@ function createBranchStockRouter(deps) {
             "จอง Shopee": row.stock004.shopee.reservedQuantity ?? "",
             "ส่งแล้วไม่ลง POS": row.stock004.shopee.shippedUnpostedQuantity ?? "",
             "บัญชีจองเมื่อ": row.stock004.shopee.asOf || "",
+            "ออเดอร์ยังจับคู่ไม่ได้": row.stock004.shopee.unallocatedOrders ?? "",
+            "จับคู่สินค้าได้ครบทุกออเดอร์": row.stock004.shopee.allOrdersAllocated === true ? "ครบ" : "ยังไม่ครบ",
           } : {}),
         }));
         XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(sources), "ที่มาสต็อก004");
