@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "policyVersion": "2026-10-22.1",
+  "policyVersion": "2026-10-23.1",
   "tailnet": "akcd1998.github",
-  "auditedAt": "2026-10-22T10:47:40Z",
+  "auditedAt": "2026-10-23T05:16:39Z",
   "minimumApplicationVersion": "1.3.0",
   "installer": {
     "version": "1.3.1",
@@ -77,6 +77,13 @@
       "nodeId": "nEdQXowQ4t11CNTRL", "hostname": "POS2", "ipv4": "100.93.254.58", "status": "approved",
       "reason": "ยืนยัน Tailscale node และไฟล์ AdaPosFront กับ AdaSmart ผ่าน SMB แบบอ่านอย่างเดียว วันที่ 22 ต.ค. 2026; ต้องใช้ตัวติดตั้ง 1.3.4 ขึ้นไป",
       "adaVersion": "4.6006.0032",
+      "adaPaths": ["D:\\AdaSoft\\AdaPos4.0HpmFhn\\AdaPos\\AdaPosFront.exe", "D:\\AdaSoft\\AdaPos4.0HpmFhn\\AdaSmart\\AdaSmart.exe"]
+    },
+    {
+      "nodeId": "noJJCWPrL221CNTRL", "hostname": "POS002", "ipv4": "100.73.76.18", "status": "approved",
+      "reason": "ยืนยัน Tailscale node และไฟล์ AdaPosFront กับ AdaSmart ผ่าน SMB แบบอ่านอย่างเดียว วันที่ 23 ต.ค. 2026; ผูกสาขา 004 / POS002 และต้องใช้ตัวติดตั้ง 1.3.8 ขึ้นไป",
+      "adaVersion": "4.6006.0032",
+      "receiptBranchCode": "004", "receiptPosCode": "002",
       "adaPaths": ["D:\\AdaSoft\\AdaPos4.0HpmFhn\\AdaPos\\AdaPosFront.exe", "D:\\AdaSoft\\AdaPos4.0HpmFhn\\AdaSmart\\AdaSmart.exe"]
     },
     {"nodeId": "n3UwrgdJvq11CNTRL", "hostname": "DESKTOP-T5APRP8", "ipv4": "100.69.240.36", "status": "pending", "reason": "หลักฐานเก่ามี AdaSmart แต่รอบนี้ยังอ่านไฟล์ติดตั้งเพื่อยืนยันซ้ำไม่ได้", "adaPaths": []},
