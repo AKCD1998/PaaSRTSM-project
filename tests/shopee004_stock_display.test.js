@@ -62,6 +62,44 @@ test('transport, invalid JSON, missing secret and oversize responses are safe fa
   }
   const f=fixture();f.config.shopee004StockProjectionToken='';assert.equal((await f.project(f.display)).records[0].qtyBranch004,null);
 });
+test('review, processing and timeout diagnostics are distinct while every unqualified quantity stays unknown',async()=>{
+  for(const [key,count,status] of [['reviewOrders',2,'shopee-orders-need-review'],['pendingOrders',1,'shopee-orders-processing']]){
+    const f=fixture();f.state.payload[key]=count;f.state.payload.status='review-or-processing-required';
+    f.state.payload.privateError='must-not-escape';const result=await f.project(f.display);
+    assert.equal(result.shopeeStock004.status,status);assert.equal(result.shopeeStock004[key],count);
+    assert.equal(result.shopeeStock004.asOf,stamp);assert.equal(result.records[0].posQtyBranch004,4);
+    assert.equal(result.records[0].qtyBranch004,null);assert.equal(result.records[0].qtyBranch001,7);
+    assert.ok(!JSON.stringify(result).includes('must-not-escape'));
+  }
+  const f=fixture();const r=await createShopee004StockDisplay({...f,fetchImpl:async()=>{throw Object.assign(Error('private'),{name:'TimeoutError'});}})(f.display);
+  assert.equal(r.shopeeStock004.status,'projection-timeout');assert.equal(r.records[0].qtyBranch004,null);
+});
+test('untrusted diagnostics cannot expose other branches, invalid counts or arbitrary upstream text',async()=>{
+  const f=fixture();f.state.payload.branchCode='001';f.state.payload.reviewOrders=3;
+  let result=await f.project(f.display);assert.equal(result.shopeeStock004.reviewOrders,null);
+  f.state.payload.branchCode='004';f.state.payload.reviewOrders=-1;
+  result=await f.project(f.display);assert.equal(result.shopeeStock004.reviewOrders,null);assert.equal(result.records[0].qtyBranch004,null);
+});
+test('verified per-product contract keeps unaffected products available while retaining reviewed POS reference',async()=>{
+  const f=fixture();f.display.records.push({...f.display.records[0],productCode:'P2'});
+  Object.assign(f.state.payload,{availabilityContract:'per-product-review-v1',scopeValidated:true,status:'partial',reviewOrders:1,pageReviewProducts:1});
+  f.state.payload.records[0].availabilityStatus='review_required';
+  f.state.payload.records.push({...f.state.payload.records[0],productCode:'P2',availabilityStatus:'available'});
+  const r=await f.project(f.display);
+  assert.equal(r.shopeeStock004.status,'partial');assert.equal(r.shopeeStock004.pageUnknownProducts,1);
+  assert.equal(r.records[0].qtyBranch004,null);assert.equal(r.records[0].posQtyBranch004,4);
+  assert.equal(r.records[0].stock004.reason,'shopee-product-needs-review');assert.equal(r.records[1].qtyBranch004,-1);
+  assert.ok(r.records.every(row=>row.qtyBranch001===7));
+});
+for(const [name,change] of [
+  ['unvalidated scope',v=>v.scopeValidated=false],['wrong count',v=>v.pageReviewProducts=0],
+  ['unknown version',v=>v.availabilityContract='guessed'],['missing qualification',v=>delete v.records[0].availabilityStatus],
+  ['incorrect available status',v=>v.status='available'],['negative queue',v=>v.pendingOrders=-1],
+]) test('per-product '+name+' cannot qualify any stock',async()=>{
+  const f=fixture();Object.assign(f.state.payload,{availabilityContract:'per-product-review-v1',scopeValidated:true,status:'partial',reviewOrders:1,pageReviewProducts:1});
+  f.state.payload.records[0].availabilityStatus='review_required';change(f.state.payload);
+  assert.equal((await f.project(f.display)).records[0].qtyBranch004,null);
+});
 function appFor(f) {
   const db={query:async sql=>{
     assert.match(sql,/^\s*SELECT/);
