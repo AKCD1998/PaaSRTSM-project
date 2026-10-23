@@ -23,6 +23,12 @@ test('admin queue is read only, validates pagination and removes private provide
 test('anonymous, non-admin and disabled flag cannot reach upstream',async()=>{
  for(const options of [{auth:false},{role:'user'},{enabled:false}]){const f=fixture(options),r=await request(f.app).get(base+'/stock-exceptions');assert.ok([401,403,503].includes(r.status));assert.equal(f.calls.length,0);}
 });
+test('a multi-product exception keeps its actual failed-item context; reference-only items cannot be approved',async()=>{
+ for(const context of ['current-issue','original-issue','reference-only']){
+  const f=fixture({fetchImpl:async()=>new Response(JSON.stringify({schemaVersion:'shopee004-exceptions-v1',branchCode:'004',asOf:'2026-10-23T10:00:00Z',status:'available',records:[{...item(),itemContext:context,itemIssueConfirmed:context!=='reference-only',unresolvedItemCount:context==='reference-only'?0:2,itemReasonCodes:['sale_unit_pos_mismatch']}],pagination:{hasMore:false,nextCursor:null}}))});
+  const r=await request(f.app).get(base+'/stock-exceptions');assert.equal(r.status,200);assert.equal(r.body.records[0].itemContext,context);assert.equal(r.body.records[0].canApproveMapping,context!=='reference-only');
+ }
+});
 test('one malformed exception is isolated and counted while valid records remain readable',async()=>{
  const f=fixture({fetchImpl:async()=>new Response(JSON.stringify({schemaVersion:'shopee004-exceptions-v1',branchCode:'004',asOf:'2026-10-23T10:00:00Z',status:'available',records:[item(),{...item(),exceptionId:'private-invalid-reference',productName:{unsafe:'data'}}],pagination:{hasMore:false,nextCursor:null}}))});
  const r=await request(f.app).get(base+'/stock-exceptions');assert.equal(r.status,200);assert.equal(r.body.records.length,1);assert.equal(r.body.unreadableRecords,1);assert.ok(!JSON.stringify(r.body).includes('private-invalid-reference'));

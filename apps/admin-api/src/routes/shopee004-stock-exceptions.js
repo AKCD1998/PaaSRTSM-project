@@ -19,7 +19,7 @@ function exceptionRecord(r){
   ||!count(r.affectedOrders)||typeof r.canApproveMapping!=='boolean'||typeof r.requiresLifecycleReview!=='boolean'
   ||!Array.isArray(r.evidence)||r.evidence.length>50||!Array.isArray(r.proposedMatches)||r.proposedMatches.length>50)throw Error();
  const proposedMatches=r.proposedMatches.map(p=>{
-  if(!identity(p.productCode)||!text(p.productName)||!text(p.unit,40)||!Number.isSafeInteger(p.quantityPerSale)||p.quantityPerSale<1||p.quantityPerSale>10000
+  if(!identity(p.productCode)||!text(p.productName)||!text(p.unit,40)||!p.unit.trim()||!Number.isSafeInteger(p.quantityPerSale)||p.quantityPerSale<1||p.quantityPerSale>10000
    ||!Array.isArray(p.evidenceRefs)||p.evidenceRefs.length>50||!p.evidenceRefs.every(ref))throw Error();
   return {productCode:p.productCode,productName:p.productName,unit:p.unit,quantityPerSale:p.quantityPerSale,evidenceRefs:p.evidenceRefs};
  });
@@ -27,6 +27,10 @@ function exceptionRecord(r){
   reasonCode:r.reasonCode,issueClass:r.issueClass,observedUnit:r.observedUnit||null,proposedMatches,evidence:r.evidence.map(evidence),affectedOrders:r.affectedOrders,
   canApproveMapping:r.canApproveMapping,requiresLifecycleReview:r.requiresLifecycleReview,ruleVersion:Number.isSafeInteger(r.ruleVersion)&&r.ruleVersion>0?r.ruleVersion:null,
   ruleId:uuid(r.ruleId)?r.ruleId:null};
+ if(r.itemContext!=null){if(!['current-issue','original-issue','reference-only'].includes(r.itemContext)||typeof r.itemIssueConfirmed!=='boolean'||!count(r.unresolvedItemCount)||!Array.isArray(r.itemReasonCodes)||r.itemReasonCodes.length>50||!r.itemReasonCodes.every(reason))throw Error();
+  result.itemContext=r.itemContext;result.itemIssueConfirmed=r.itemIssueConfirmed;result.unresolvedItemCount=r.unresolvedItemCount;result.itemReasonCodes=r.itemReasonCodes;
+  if(r.itemContext==='reference-only'||r.itemIssueConfirmed!==true)result.canApproveMapping=false;
+ }
  if(r.auditHistory!=null){if(!Array.isArray(r.auditHistory)||r.auditHistory.length>50)throw Error();result.auditHistory=r.auditHistory.map(a=>{if(!reason(a.action)||!time(a.at)||!(a.ruleVersion==null||Number.isSafeInteger(a.ruleVersion)&&a.ruleVersion>0)||!text(a.reason||'',200))throw Error();return {action:a.action,at:a.at,ruleVersion:a.ruleVersion||null,reason:a.reason||''};});}
  if(r.recovery){const x=r.recovery;if(![null,'ready','retry_wait','blocked'].includes(x.state)||!count(x.attempts)||!['nextRetryAt','firstFailedAt','lastFailedAt'].every(k=>x[k]==null||time(x[k])))throw Error();result.recovery={state:x.state,attempts:x.attempts,nextRetryAt:x.nextRetryAt||null,firstFailedAt:x.firstFailedAt||null,lastFailedAt:x.lastFailedAt||null};}
  return result;
