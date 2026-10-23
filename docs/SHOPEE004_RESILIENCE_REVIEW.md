@@ -35,7 +35,7 @@ SQL/Hourly timeout is changed.
 
 ## Exception administration
 
-Admin endpoints live under `/api/admin/shopee004`. They require the existing
+Admin endpoints live under `/admin/shopee004`. They require the existing
 session/admin permission; writes also require existing CSRF protection.
 
 - `GET /stock-exceptions` returns bounded, whitelisted operational metadata.
@@ -71,10 +71,11 @@ There are no automatic mutation retries.
    before release. Source candidate migration 035 extends only the existing
    queue and identity metadata. It must be reviewed and explicitly approved;
    never run the production migration runner for a local fixture.
-2. Deploy the backward-compatible consumer/web candidate before new source
-   metadata administration. Keep the new admin flags OFF while validating the
-   read-only paths. Merging these repositories can auto-deploy; a checked PR is
-   not separate production permission.
+2. With release and migration approval, deploy the source and additive 035 first,
+   verify the unchanged opening/holds, then deploy API and web in order. Empty
+   identity metadata retains the legacy resolver. Keep the new admin flags OFF
+   while validating read-only paths. Merging these repositories can auto-deploy;
+   a checked PR is not separate production permission.
 3. Review source migration, exact start/predeploy effects, dedicated bridge
    authority and bounded bootstrap candidate. Only then enable new administration
    and import approved evidence/rules. These are separate approvals from lifecycle
@@ -110,3 +111,9 @@ retries, cache restart/invalidation, admin authentication/CSRF, revision and
 idempotency, and privacy. These are synthetic tests; passing them does not prove
 a future natural Hourly run. Actual production observations are recorded
 separately from candidate local API/browser tests.
+
+During live release verification, a native fetch timeout exposed a classification
+defect: DOMException has a numeric `code`, while the reader treated every code as
+a string. Check the type before reading the internal `PROJECTION_` prefix. Native
+timeout/abort failures must keep the confirmed reference separate from current
+unknown quantities; they retain the existing total deadline and retry limits.

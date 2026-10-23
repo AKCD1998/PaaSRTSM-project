@@ -31,7 +31,7 @@ function createProjectionReader({fetchImpl=globalThis.fetch,clock=Date.now,sleep
         let value;try{value=JSON.parse(raw);}catch{throw failure('PROJECTION_CONTRACT_INVALID');}
         return {value,attempts};
       } catch(e) {
-        const error=e?.code?.startsWith('PROJECTION_')?e:failure(['TimeoutError','AbortError'].includes(e?.name)?'PROJECTION_TIMEOUT':'PROJECTION_TEMPORARILY_UNAVAILABLE',true);
+        const error=typeof e?.code==='string'&&e.code.startsWith('PROJECTION_')?e:failure(['TimeoutError','AbortError'].includes(e?.name)?'PROJECTION_TIMEOUT':'PROJECTION_TEMPORARILY_UNAVAILABLE',true);
         if(!error.temporary||attempts>=2)throw error;
         if(clock()-retryWindowStart>=retryWindowMs){retryWindowStart=clock();retries=0;}
         if(retries>=retriesPerWindow||budgetMs-(clock()-start)<250)throw error;
