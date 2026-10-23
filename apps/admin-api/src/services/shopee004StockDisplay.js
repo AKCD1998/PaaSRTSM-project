@@ -1,37 +1,30 @@
 "use strict";
 
 const STOCK_VIEW_SHOPEE = "hourly004-shopee";
+const {createProjectionReader,createConfirmedReferenceCache}=require('./shopee004ProjectionRecovery');
 const PROJECTION_URL = "https://sc-official-website.onrender.com/api/internal/shopee004-stock/projection";
 const normalizeUnit = value => String(value || "").normalize("NFKC").trim().toLowerCase();
 const safeCount = value => Number.isSafeInteger(value) && value >= 0 && value <= 20000 ? value : null;
 const safeTime = value => typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
 
 // Consumer only: no cross-database reservations, stock writer, Sync hook or POS query.
-function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now = () => new Date() }) {
+function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now = () => new Date(), projectionReader, referenceCache } = {}) {
+  const read=projectionReader||createProjectionReader({fetchImpl});
+  const references=referenceCache||createConfirmedReferenceCache({now});
+  let previousToken=null;
   return async function project(display) {
     if (config.featureShopee004StockAvailability !== true) {
+      references.clear();
       return { ...display, shopeeStock004: { status: "disabled", branchCode: "004", applied: false } };
     }
-    let projection = null, diagnostic = null, failure = "projection-unavailable";
+    let projection = null, diagnostic = null, failure = "projection-unavailable",temporaryFailure=false,readAttempts=0;
     const codes = display.records.map(r => r.productCode);
     const requestedCodes = new Set(codes);
     try {
       const token = config.shopee004StockProjectionToken;
+      if(previousToken&&previousToken!==token)references.clear();previousToken=token;
       if (typeof token !== "string" || token.length < 32 || codes.length > 10000 || requestedCodes.size !== codes.length) throw new Error();
-      const response = await fetchImpl(PROJECTION_URL, { method: "POST", redirect: "error", cache: "no-store",
-        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ productCodes: codes }), signal: AbortSignal.timeout(5000) });
-      if (!response.ok) throw new Error();
-      // Bound both declared and streamed response sizes. Never log its body.
-      if (Number(response.headers?.get("content-length") || 0) > 4000000) throw new Error();
-      let raw = "", bytes = 0; const decoder = new TextDecoder();
-      for await (const chunk of response.body) {
-        bytes += chunk.byteLength;
-        if (bytes > 4000000) throw new Error();
-        raw += decoder.decode(chunk, { stream: true });
-      }
-      raw += decoder.decode();
-      const value = JSON.parse(raw);
+      const loaded=await read(PROJECTION_URL,codes,token);const value=loaded.value;readAttempts=loaded.attempts;
       // Operational status is separate from quantity qualification. A review
       // queue does not mean POS Hourly failed, and no raw upstream text escapes.
       if (value?.schemaVersion === "shopee004-commitments-v1" && value.branchCode === "004"
@@ -74,12 +67,14 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
         throw new Error();
       }
       projection = value;
+      references.observeCutover(value.cutoverAt);
     } catch (error) {
-      if (["TimeoutError","AbortError"].includes(error?.name)) failure = "projection-timeout";
+      if (["TimeoutError","AbortError"].includes(error?.name)||error?.code==='PROJECTION_TIMEOUT') failure = "projection-timeout";
+      temporaryFailure=error?.temporary===true;
       // Fail closed for quantities, with only a bounded operational diagnosis.
     }
     const commitments = new Map(projection?.records.map(r => [r.productCode,r]) || []);
-    let unknownProducts = 0,estimatedProducts=0;
+    let unknownProducts = 0,estimatedProducts=0,referenceProducts=0;
     const records = display.records.map(record => {
       const line = commitments.get(record.productCode);
       const demand = line ? line.reservedQuantity + line.shippedUnpostedQuantity : null;
@@ -89,19 +84,26 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
       if (reason) unknownProducts++;
       const estimated=!reason&&line?.availabilityStatus==='known-commitments-only';if(estimated)estimatedProducts++;
       const quantity = reason ? null : record.qtyBranch004 - demand;
-      return { ...record, posQtyBranch004: record.qtyBranch004, qtyBranch004: quantity,
+      const lastConfirmed=reason&&temporaryFailure?references.get(record,failure):null;
+      if(lastConfirmed)referenceProducts++;
+      const result={ ...record, posQtyBranch004: record.qtyBranch004, qtyBranch004: quantity,
         qtyTotalAllBranches: reason ? null : record.qtyTotalAllBranches - demand,
         stock004: { ...record.stock004, basis: reason ? "shopee-availability-unknown" : estimated?'hourly-and-shopee-known-only':"hourly-and-shopee",
-          posBasis: record.stock004?.basis || "full-sync", reason,
+          posBasis: record.stock004?.basis || "full-sync", reason,viewStatus:lastConfirmed?'reference':reason||estimated?'unverified':'confirmed',
+          ...(lastConfirmed?{lastConfirmed}:{}),
           shopee: { reservedQuantity: line?.reservedQuantity ?? null,
             shippedUnpostedQuantity: line?.shippedUnpostedQuantity ?? null, asOf: projection?.asOf || null,
             allOrdersAllocated:projection?!(projection.unallocatedOrders>0):false,unallocatedOrders:projection?.unallocatedOrders??null } } };
+      if(!reason&&!estimated)references.remember(result,projection);
+      if(reason&&!temporaryFailure)references.remove(record.productCode);
+      return result;
     });
     return { ...display, records, shopeeStock004: { status: projection ? (projection.unallocatedOrders>0?'partial-known-commitments':unknownProducts || projection.status === 'partial' ? "partial" : "available") : failure,
       branchCode: "004", applied: Boolean(projection), asOf: projection?.asOf || diagnostic?.asOf || null,
       lastEmailIngestedAt: projection?.lastEmailIngestedAt || diagnostic?.lastEmailIngestedAt || null, cutoverAt: projection?.cutoverAt || null,
       reviewOrders:diagnostic?.reviewOrders ?? null,pendingOrders:diagnostic?.pendingOrders ?? null,
       unallocatedOrders:projection?.unallocatedOrders??null,pageEstimatedProducts:estimatedProducts,
+      issueClass:temporaryFailure?'temporary':projection?'none':'unverified',pageReferenceProducts:referenceProducts,readAttempts,
       sourceLabelReviewOrders: Number.isSafeInteger(projection?.sourceLabelReviewOrders) ? projection.sourceLabelReviewOrders : null,
       pageUnknownProducts: unknownProducts, emailCoverage: "email-orders-only", physicalStockWrites: false,
       businessFreshnessQualified: false, atomicSnapshotVerified: false } };
