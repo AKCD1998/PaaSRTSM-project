@@ -38,6 +38,7 @@ const { createReconciliationRouter } = require("./routes/reconciliation");
 const { createAdaSyncRouter } = require("./routes/sync-ada");
 const { createSyncRouter } = require("./routes/sync");
 const { createBranchStockRouter } = require("./routes/branch-stock");
+const { createShopee004StockExceptionsRouter } = require("./routes/shopee004-stock-exceptions");
 const { createHourlyStockEvidenceRouter } = require("./routes/hourly-stock-evidence");
 const { createReviewQueueRouter } = require("./routes/review-queue");
 const { createMovementAnalyticsRouter } = require("./routes/movement-analytics");
@@ -302,6 +303,8 @@ function createApp(overrides = {}) {
       requireCsrfMiddleware: requireCsrf,
     }),
   );
+  app.use(createShopee004StockExceptionsRouter({config,
+    requireAuthMiddleware,requireRoleMiddleware:requireRole,requireCsrfMiddleware:requireCsrf}));
   app.use(
     "/api/hourly-stock-evidence",
     createHourlyStockEvidenceRouter({
