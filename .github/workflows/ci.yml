@@ -29,6 +29,7 @@ jobs:
       CP4_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
       HOURLY_EVIDENCE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_hourly_evidence_test_ci
       TRANSFER_DELTA_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/transfer_delta_ci
+      KY9_DOCUMENTS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_ky9_documents_test_ci
 
     steps:
       - name: Checkout
@@ -52,6 +53,11 @@ jobs:
         run: >-
           node -e 'const {Pool}=require("pg"); const pool=new Pool({connectionString:process.env.CP4_TEST_DATABASE_URL}); pool.query("CREATE DATABASE transfer_delta_ci").then(()=>pool.end()).catch(error=>{console.error(error.message);process.exit(1);});'
 
+      - name: Create isolated KY9 document test database
+        env:
+          PGPASSWORD: postgres
+        run: createdb --host=127.0.0.1 --port=5432 --username=postgres sc_ky9_documents_test_ci
+
       - name: Run test suite
         run: npm test -- --test-concurrency=1
 
@@ -66,3 +72,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: dropdb --if-exists --host=127.0.0.1 --port=5432 --username=postgres transfer_delta_ci
+
+      - name: Remove isolated KY9 document test database
+        if: always()
+        env:
+          PGPASSWORD: postgres
+        run: dropdb --if-exists --host=127.0.0.1 --port=5432 --username=postgres sc_ky9_documents_test_ci
