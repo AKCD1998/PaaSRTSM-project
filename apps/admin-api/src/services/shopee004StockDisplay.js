@@ -1,7 +1,7 @@
 "use strict";
 
 const STOCK_VIEW_SHOPEE = "hourly004-shopee";
-const {createProjectionReader,createConfirmedReferenceCache}=require('./shopee004ProjectionRecovery');
+const {createProjectionReader,createConfirmedReferenceCache,PROJECTION_REQUEST_BUDGET_MS}=require('./shopee004ProjectionRecovery');
 const PROJECTION_URL = "https://sc-official-website.onrender.com/api/internal/shopee004-stock/projection";
 const normalizeUnit = value => String(value || "").normalize("NFKC").trim().toLowerCase();
 const safeCount = value => Number.isSafeInteger(value) && value >= 0 && value <= 20000 ? value : null;
@@ -24,7 +24,9 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
       const token = config.shopee004StockProjectionToken;
       if(previousToken&&previousToken!==token)references.clear();previousToken=token;
       if (typeof token !== "string" || token.length < 32 || codes.length > 10000 || requestedCodes.size !== codes.length) throw new Error();
+      const requestStartedAt=now().getTime();
       const loaded=await read(PROJECTION_URL,codes,token);const value=loaded.value;readAttempts=loaded.attempts;
+      const receivedAt=now().getTime(),readDuration=receivedAt-requestStartedAt;
       // Operational status is separate from quantity qualification. A review
       // queue does not mean POS Hourly failed, and no raw upstream text escapes.
       if (value?.schemaVersion === "shopee004-commitments-v1" && value.branchCode === "004"
@@ -32,7 +34,9 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
         diagnostic = { reviewOrders:safeCount(value.reviewOrders),pendingOrders:safeCount(value.pendingOrders),
           asOf:safeTime(value.asOf),lastEmailIngestedAt:safeTime(value.lastEmailIngestedAt) };
       }
-      const age = now().getTime() - Date.parse(value.asOf);
+      const age = receivedAt - Date.parse(value.asOf);
+      // Preserve the 30-second pre-request age allowance. A snapshot created
+      // during this bounded read must not expire just because transport is slow.
       const v2=value.availabilityContract==='per-product-review-v2';
       const scoped = v2 || value.availabilityContract === 'per-product-review-v1';
       const unallocated=v2?safeCount(value.unallocatedOrders):0;
@@ -52,7 +56,8 @@ function createShopee004StockDisplay({ config, fetchImpl = globalThis.fetch, now
         || value.posPostingPolicy !== "not-recorded-in-pos" || value.mode !== "live" || !(scopedReady || legacyReady)
         || value.emailCoverage !== "email-orders-only" || !Number.isFinite(Date.parse(value.cutoverAt))
         || Date.parse(value.cutoverAt) > Date.parse(value.asOf)
-        || !Number.isFinite(age) || age < -5000 || age > 30000
+        || !Number.isFinite(readDuration) || readDuration < 0 || readDuration > PROJECTION_REQUEST_BUDGET_MS
+        || !Number.isFinite(age) || age < -5000 || age > 30000 + readDuration
         || !Array.isArray(value.records) || value.records.length !== codes.length
         || new Set(value.records.map(r => r.productCode)).size !== codes.length
         || value.records.some(r => !requestedCodes.has(r.productCode)

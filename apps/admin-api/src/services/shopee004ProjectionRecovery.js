@@ -1,5 +1,6 @@
 "use strict";
 const { createHash } = require('node:crypto');
+const PROJECTION_REQUEST_BUDGET_MS = 60000;
 
 const transientStatuses = new Set([408,429,500,502,503,504]);
 function failure(code, temporary = false) {
@@ -9,7 +10,7 @@ function failure(code, temporary = false) {
 // One bounded budget for the whole call, plus a process-wide retry allowance.
 // Concurrent reads of the same scope share parsed data, never a consumed stream.
 function createProjectionReader({fetchImpl=globalThis.fetch,clock=Date.now,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),
-  budgetMs=5000,maxConcurrent=4,retriesPerWindow=4,retryWindowMs=30000}={}) {
+  budgetMs=PROJECTION_REQUEST_BUDGET_MS,maxConcurrent=4,retriesPerWindow=4,retryWindowMs=30000}={}) {
   const inflight=new Map();let retryWindowStart=clock(),retries=0;
   async function fetchValue(url,codes,token){
     const start=clock();let attempts=0;
@@ -73,4 +74,4 @@ function createConfirmedReferenceCache({now=()=>new Date(),maxProducts=10000,ret
     }
   };
 }
-module.exports={createProjectionReader,createConfirmedReferenceCache};
+module.exports={createProjectionReader,createConfirmedReferenceCache,PROJECTION_REQUEST_BUDGET_MS};
