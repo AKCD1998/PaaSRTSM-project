@@ -34,9 +34,11 @@ function buildLoyaltyDecision(product) {
   }
 
   if (productKind.toLowerCase() === "medicine") {
+    // Shop-approved purchase-point policy, 2026-10-29. This endpoint screens
+    // earning from purchases; it does not authorize dispensing gifts/rewards.
     return {
-      eligible: false,
-      reason: "medicine_blocked",
+      eligible: true,
+      reason: "medicine_purchase_allowed",
     };
   }
 
