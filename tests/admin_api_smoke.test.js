@@ -480,7 +480,7 @@ test("admin can read products, edit product, run import dry-run, and apply rules
   assert.ok(db.state.auditActions.includes("enrichment.apply_rules.dry_run"));
 });
 
-test("pos loyalty eligibility endpoint blocks medicine items by barcode", async () => {
+test("pos loyalty earning eligibility includes medicine without changing its classification", async () => {
   const { app } = createTestApp();
 
   const response = await request(app)
@@ -491,8 +491,9 @@ test("pos loyalty eligibility endpoint blocks medicine items by barcode", async 
   assert.equal(response.body.ok, true);
   assert.equal(response.body.matched_by, "barcode");
   assert.equal(response.body.product.company_code, "630010001");
-  assert.equal(response.body.loyalty.eligible, false);
-  assert.equal(response.body.loyalty.reason, "medicine_blocked");
+  assert.equal(response.body.product.product_kind, "medicine");
+  assert.equal(response.body.loyalty.eligible, true);
+  assert.equal(response.body.loyalty.reason, "medicine_purchase_allowed");
 });
 
 test("pos loyalty eligibility endpoint requires api key", async () => {
@@ -501,6 +502,18 @@ test("pos loyalty eligibility endpoint requires api key", async () => {
   const response = await request(app).get("/api/loyalty/products/eligibility?company_code=630010001");
 
   assert.equal(response.status, 401);
+});
+
+test("pos earning policy still rejects unknown classification and preserves non-medicine decisions", async () => {
+  const { app, db } = createTestApp();
+  db.state.product.product_kind = null;
+  const unknown = await request(app).get("/api/loyalty/products/eligibility?company_code=630010001").set("x-pos-api-key", "test-pos-key");
+  assert.equal(unknown.status, 200);
+  assert.deepEqual(unknown.body.loyalty, { eligible: false, reason: "unknown_product_kind" });
+  db.state.product.product_kind = "supplement";
+  const supplement = await request(app).get("/api/loyalty/products/eligibility?company_code=630010001").set("x-pos-api-key", "test-pos-key");
+  assert.equal(supplement.status, 200);
+  assert.deepEqual(supplement.body.loyalty, { eligible: true, reason: "non_medicine_allowed" });
 });
 
 test("admin import prices route accepts .xls and uses excel-dataonly importer", async () => {
