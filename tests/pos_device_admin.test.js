@@ -44,7 +44,7 @@ test("admins receive the reviewed inventory and verified restricted installer", 
   const response = await request(app()).get("/api/admin/pos-devices").set("Cookie", session("admin"));
   assert.equal(response.status, 200);
   assert.equal(response.headers["cache-control"], "private, no-store");
-  assert.equal(response.body.devices.filter(d => d.status === "approved").length, 7);
+  assert.equal(response.body.devices.filter(d => d.status === "approved").length, 8);
   const pos2 = response.body.devices.find(d => d.nodeId === "nEdQXowQ4t11CNTRL");
   assert.equal(pos2.hostname, "POS2");
   assert.equal(pos2.ipv4, "100.93.254.58");
@@ -56,6 +56,13 @@ test("admins receive the reviewed inventory and verified restricted installer", 
   assert.equal(branch004Pos2.status, "approved");
   assert.equal(branch004Pos2.adaVersion, "4.6006.0032");
   assert.match(branch004Pos2.reason, /1\.3\.8/);
+  const branch003Pos2 = response.body.devices.find(d => d.nodeId === "nFQPDepQTh11CNTRL");
+  assert.equal(branch003Pos2.hostname, "POS2");
+  assert.equal(branch003Pos2.ipv4, "100.100.253.52");
+  assert.equal(branch003Pos2.status, "approved");
+  assert.equal(branch003Pos2.adaVersion, "4.6006.0032");
+  assert.match(branch003Pos2.reason, /003 \/ POS002/);
+  assert.match(branch003Pos2.reason, /1\.3\.11/);
   assert.equal(response.body.devices.find(d => d.hostname === "ScProductDev").status, "denied");
   assert.equal(response.body.installer.legacyRestricted, false);
   assert.equal(response.body.installer.version, "1.3.1");
