@@ -1,5 +1,13 @@
 # POS device admin inventory
 
+29 October 2026 adds the user-approved branch 003 POS 002: hostname `POS2`,
+Tailscale node `nFQPDepQTh11CNTRL`, address `100.100.253.52`.
+Read-only SMB checks confirmed D-drive AdaPosFront 4.6006.0032 and
+AdaSmart 4.6006.0024. The desktop approval requires installer 1.3.11 or later;
+the web inventory alone does not approve an older binary. The user confirmed
+003/002 explicitly; SQL connectivity and installation are separate checks.
+The prior seven approved identities and all pending/denied decisions remain.
+
 `GET /api/admin/pos-devices` is read-only and applies the existing cookie-session
 `requireAuth` and `requireRole("admin")` middleware inside the router. Anonymous
 requests receive 401; authenticated non-admin accounts receive 403. Inventory is
