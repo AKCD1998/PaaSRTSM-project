@@ -48,6 +48,7 @@ const { createIngredientKnowledgeRouter } = require("./routes/ingredient-knowled
 const { createIngredientAdminRouter } = require("./routes/ingredient-admin");
 const { createFocusProductsRouter, createFocusProductsAdminRouter } = require("./routes/focus-products");
 const { createSalesTargetsRouter } = require("./routes/sales-targets");
+const { createMemberRegistrationTargetsRouter } = require("./routes/member-registration-targets");
 const {
   createMobileEnrollRouter,
   createBranchStaffRouter,
@@ -365,6 +366,10 @@ function createApp(overrides = {}) {
       requireRoleMiddleware: requireRole,
       requireCsrfMiddleware: requireCsrf,
     }),
+  );
+  app.use(
+    "/api",
+    createMemberRegistrationTargetsRouter({ config, requireAuthMiddleware, fetchImpl: overrides.fetchImpl || global.fetch }),
   );
   app.use(
     "/api",
