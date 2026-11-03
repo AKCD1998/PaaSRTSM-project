@@ -1,6 +1,6 @@
 "use strict";
 
-const TARGETS = { '001': 500, '003': 500, '004': 250, '005': 250 };
+const TARGETS = { '001': 300, '003': 200, '004': 200, '005': 200 };
 function thaiDate(value) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
