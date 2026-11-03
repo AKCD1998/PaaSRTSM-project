@@ -30,9 +30,10 @@ test('authenticated admin sees exact recurring targets and Thai daily/zero/futur
   const { server, calls, cookie } = app();
   const result = await request(server).get('/api/member-registration-targets?month=2026-11').set('Cookie', cookie('admin'));
   assert.equal(result.status, 200); assert.match(result.headers['cache-control'], /no-store/);
-  assert.deepEqual(result.body.branches.map(b => b.target), [500, 500, 250, 250]);
+  assert.deepEqual(result.body.branches.map(b => b.target), [300, 200, 200, 200]);
   assert.equal(result.body.branches[0].total, 23); assert.equal(result.body.branches[0].today, 3);
-  assert.equal(result.body.branches[0].remaining, 477); assert.equal(result.body.branches[1].remaining, 0);
+  assert.equal(result.body.branches[0].remaining, 277); assert.equal(result.body.branches[1].remaining, 0);
+  assert.equal(result.body.branches[0].percent, 7.7);
   assert.equal(result.body.daily[1].byBranch['001'], 0); assert.equal(result.body.daily[3].byBranch['001'], null);
   assert.equal(result.body.unassignedTotal, 2); assert.equal(result.body.partialMonth, true);
   assert.equal(calls[0].url.pathname, '/internal/crm/member-registrations');
@@ -74,5 +75,5 @@ test('Bangkok midnight, closed month, untracked days and next-month targets', ()
   const nov = buildRegistrationProgress(body, '2026-11', ['005']);
   assert.equal(nov.asOfDate, '2026-12-02'); assert.equal(nov.daily[1].status, 'untracked'); assert.equal(nov.daily[2].status, 'recorded');
   const dec = buildRegistrationProgress({ ...body, month: '2026-12' }, '2026-12', ['001']);
-  assert.equal(dec.branches[0].target, 500); assert.equal(dec.partialMonth, false); assert.equal(dec.daily.length, 31);
+  assert.equal(dec.branches[0].target, 300); assert.equal(dec.partialMonth, false); assert.equal(dec.daily.length, 31);
 });
