@@ -90,6 +90,12 @@ function createMockDb() {
     async query(sql, params = []) {
       const q = normalizeSql(sql);
 
+      if (q.includes("join ingest.sync_runs run")) {
+        return { rows: params[0].map((branch_code, i) => ({
+          branch_code, sync_run_id: 100 + i, finished_at: params[1],
+        })) };
+      }
+
       if (q.startsWith("select fp.*, bs.hire_date as assigned_staff_hire_date from focus.focus_products fp left join core.branch_staff bs")
         && q.includes("where fp.is_active = true")) {
         const now = Date.now();
@@ -506,7 +512,7 @@ test("salesperson row surfaces the assigned employee name", async () => {
   assert.equal(res.body.focusProducts[0].assignedPersonName, "กนกวรา มันทะเสน");
 });
 
-test("a focus row whose date_to has already passed is frozen on first read", async () => {
+test("an expired focus row freezes after all branch sales syncs completed", async () => {
   const { app, db } = createTestApp();
   db.state.rows.get(1).date_from = "2026-01-01";
   db.state.rows.get(1).date_to = "2026-01-31"; // well in the past relative to test run time
@@ -537,7 +543,7 @@ test("a focus row whose date_to has already passed is frozen on first read", asy
 test("editing a frozen row's date range clears the freeze so it re-evaluates", async () => {
   const { app, db } = createTestApp();
   const bangkokToday = todayBangkokIso();
-  const expiredDateTo = addIsoDays(bangkokToday, -1);
+  const expiredDateTo = addIsoDays(bangkokToday, -2);
   const activeDateTo = addIsoDays(bangkokToday, 7);
   db.state.rows.get(1).date_from = addIsoDays(bangkokToday, -30);
   db.state.rows.get(1).date_to = expiredDateTo;
