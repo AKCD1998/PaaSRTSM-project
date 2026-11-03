@@ -64,6 +64,7 @@ const { startAssetCleanupSchedule } = require("./services/videoAssetCleanup");
 const { startPreorderAttachmentCleanupSchedule } = require("./services/preorderAttachmentCleanup");
 const { startStockRecommendationSchedule } = require("./services/stockRecommendationSchedule");
 const { startFocusLinePackageCleanupSchedule } = require("./services/focusLineChatPackages");
+const { startFocusCloseSchedule } = require("./services/focusCloseSchedule");
 const { createCrmMirrorClient } = require("./integrations/currentScCrm");
 const { createInternalProductCatalogRouter } = require("./routes/internal-product-catalog");
 const { createTransferDeltaEvidenceRouter } = require("./routes/transfer-delta-evidence");
@@ -578,7 +579,10 @@ async function startServer() {
     logger: console,
   });
 
+  const focusCloseTimer = startFocusCloseSchedule({ db, logger: console });
+
   const shutdown = async () => {
+    if (focusCloseTimer) clearInterval(focusCloseTimer);
     if (assetCleanupTimer) clearInterval(assetCleanupTimer);
     if (preorderAttachmentCleanupTimer) clearInterval(preorderAttachmentCleanupTimer);
     if (focusLinePackageCleanupTimer) clearInterval(focusLinePackageCleanupTimer);

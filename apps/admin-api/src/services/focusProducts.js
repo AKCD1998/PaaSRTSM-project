@@ -1,5 +1,7 @@
 "use strict";
 
+const { closeWindow, focusCloseReadiness } = require("./focusClose");
+
 const FOCUS_TYPES = new Set(["salesperson", "pharmacist", "store_manager", "group_manager"]);
 const PUBLICATION_STATUSES = new Set(["draft", "published", "scheduled"]);
 const REQUIRED_FOCUS_BRANCHES = ["001", "003", "004", "005"];
@@ -302,20 +304,22 @@ function computeStatus(focusType, targetQty, soldByBranch, branchCodes, branchTa
   };
 }
 
-// Once a focus row's date_to has passed, snapshot its sold-qty progress once
-// and lock it — protects the historical/HR record from being silently
+// After 08:30 Bangkok on the following day AND the completed sales syncs,
+// snapshot progress once — protects the historical/HR record from being silently
 // rewritten by late-arriving AdaPOS corrections (voids/refunds synced after
 // month-end). Uses a conditional UPDATE so concurrent reads can't double-write.
-async function freezeFocusProduct(db, id, soldByBranch, totalSold, soldByBranchByProduct) {
+async function freezeFocusProduct(db, id, soldByBranch, totalSold, soldByBranchByProduct, completionRuns) {
   const result = await db.query(
     `UPDATE focus.focus_products
      SET frozen_sold_by_branch = $2::jsonb, frozen_total_sold = $3, frozen_at = now(),
-         frozen_sold_by_branch_by_product = $4::jsonb
+         frozen_sold_by_branch_by_product = $4::jsonb,
+         freeze_completion_runs = $5::jsonb
      WHERE id = $1 AND frozen_at IS NULL
      RETURNING frozen_sold_by_branch, frozen_total_sold, frozen_at, frozen_sold_by_branch_by_product`,
-    [id, JSON.stringify(soldByBranch), totalSold, JSON.stringify(soldByBranchByProduct)],
+    [id, JSON.stringify(soldByBranch), totalSold, JSON.stringify(soldByBranchByProduct), JSON.stringify(completionRuns)],
   );
-  return result.rows[0] || null;
+  // Another reader may have won; use its persisted snapshot.
+  return result.rows[0] || await fetchFocusProductRow(db, id);
 }
 
 // Per-product view of a code map for one focus row — {productCode: {branchCode: qty}} —
@@ -328,7 +332,7 @@ function soldByBranchByProductForRow(codeMap, productCodes) {
   return result;
 }
 
-async function attachProgress(db, focusRows, allActiveBranchCodes, timings = null) {
+async function attachProgress(db, focusRows, allActiveBranchCodes, timings = null, { now = new Date() } = {}) {
   const mark = (label, start) => {
     if (timings) timings.push({ label, ms: Date.now() - start });
   };
@@ -337,7 +341,15 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
   const productCodes = [...new Set(focusRows.flatMap(rowProductCodes))];
   const nameMap = await fetchProductNames(db, productCodes);
   mark("fetchProductNames", t);
-  const today = todayBangkokIso();
+  const closeByBranches = new Map();
+  // Check completion BEFORE reading sales, never validate a partial earlier SELECT.
+  for (const row of focusRows.filter((item) => !item.frozen_at)) {
+    const branches = normalizeBranchCodes(row.branch_codes) || allActiveBranchCodes;
+    const key = JSON.stringify([toIsoDateOnly(row.date_to), [...branches].sort()]);
+    if (!closeByBranches.has(key)) {
+      closeByBranches.set(key, await focusCloseReadiness(db, row.date_to, branches, now));
+    }
+  }
 
   // Frozen rows never need a live sales query. Unfrozen rows are grouped by
   // (dateFrom, dateTo) — usually just one group, since most focus rows share
@@ -366,6 +378,8 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
     let soldByBranchByProduct;
     let isFrozen = false;
     let frozenAt = row.frozen_at || null;
+    const closeKey = JSON.stringify([toIsoDateOnly(row.date_to), [...branchCodes].sort()]);
+    const close = closeByBranches.get(closeKey);
 
     if (row.frozen_at) {
       soldByBranch = row.frozen_sold_by_branch || {};
@@ -377,15 +391,15 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
       const codeMap = batchByRange.get(key);
       soldByBranch = sumSoldAcrossCodes(codeMap, productCodesForRow);
       soldByBranchByProduct = soldByBranchByProductForRow(codeMap, productCodesForRow);
-      if (toIsoDateOnly(row.date_to) < today) {
+      if (close?.ready) {
         const totalSold = Object.values(soldByBranch).reduce((sum, v) => sum + v, 0);
-        const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold, soldByBranchByProduct);
-        if (frozen) {
+        const frozen = await freezeFocusProduct(db, row.id, soldByBranch, totalSold, soldByBranchByProduct, close.completionRuns);
+        if (frozen?.frozen_at) {
           soldByBranch = frozen.frozen_sold_by_branch || soldByBranch;
           soldByBranchByProduct = frozen.frozen_sold_by_branch_by_product || soldByBranchByProduct;
           frozenAt = frozen.frozen_at;
+          isFrozen = true;
         }
-        isFrozen = true;
       }
     }
 
@@ -406,6 +420,8 @@ async function attachProgress(db, focusRows, allActiveBranchCodes, timings = nul
       soldByBranch,
       isFrozen,
       frozenAt,
+      freezeNotBefore: closeWindow(row.date_to).freezeNotBefore.toISOString(),
+      freezePendingBranches: row.frozen_at ? [] : (close?.pendingBranches || []),
       ...status,
     });
   }
@@ -672,7 +688,7 @@ async function updateFocusProduct(db, id, fields) {
          branch_codes = $7, note = $8, is_active = $9, assigned_person_name = $10, branch_targets = $11::jsonb,
          publication_status = $12, scheduled_publish_at = $13, published_at = $14, published_by = $15, assigned_staff_id = $16,
          updated_at = now()
-         ${dateRangeChanged ? ", frozen_sold_by_branch = NULL, frozen_total_sold = NULL, frozen_at = NULL" : ""}
+         ${dateRangeChanged ? ", frozen_sold_by_branch = NULL, frozen_total_sold = NULL, frozen_at = NULL, frozen_sold_by_branch_by_product = NULL, freeze_completion_runs = NULL" : ""}
      WHERE id = $1`,
     [id, productCode, focusType, targetQty, dateFrom, dateTo, branchCodes, note, isActive,
       resolvedAssignedPersonName, branchTargets ? JSON.stringify(branchTargets) : null,
@@ -710,4 +726,8 @@ module.exports = {
   REQUIRED_FOCUS_BRANCHES,
   validateBulkRows,
   createFocusProductsBulk,
+  fetchSoldQtyBatch,
+  sumSoldAcrossCodes,
+  soldByBranchByProductForRow,
+  toIsoDateOnly,
 };
