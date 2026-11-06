@@ -4,6 +4,7 @@ const express = require("express");
 const fs = require("node:fs");
 const path = require("node:path");
 const XLSX = require("xlsx");
+const { requireCodexBranchStock } = require("../auth/codex-branch-stock");
 const { auditLog } = require("../audit");
 const { auditBase } = require("../utils/audit-payload");
 const { acquireIngestionDbClient } = require("../utils/db-acquire");
@@ -1785,7 +1786,7 @@ function createBranchStockRouter(deps) {
     }
   });
 
-  router.get("/branch-stock", requireAuthMiddleware, async (req, res, next) => {
+  async function getBranchStock(req, res, next, stockView = req.query.stockView) {
     const limit = parsePositiveInt(req.query.limit, 25);
     const offset = parseNonNegativeInt(req.query.offset, 0);
     if (limit == null) {
@@ -1891,8 +1892,8 @@ function createBranchStockRouter(deps) {
           );
 
       const records = rowsResult.rows.map(mapBranchStockRow);
-      const display = await stockDisplay(req.query.stockView, records, rowsResult.rows);
-      if (req.query.stockView === STOCK_VIEW_SHOPEE) res.set("Cache-Control", "no-store");
+      const display = await stockDisplay(stockView, records, rowsResult.rows);
+      if (stockView === STOCK_VIEW_SHOPEE) res.set("Cache-Control", "no-store");
       return res.json({
         ...display,
         pagination: {
@@ -1904,7 +1905,27 @@ function createBranchStockRouter(deps) {
     } catch (routeError) {
       return next(routeError);
     }
-  });
+  }
+
+  router.get("/branch-stock", requireAuthMiddleware, getBranchStock);
+  router.get(
+    "/codex/v1/branch-stock",
+    requireCodexBranchStock(config.codexBranchStockIdentity, deps.codexGoogleAuth),
+    (req, res, next) => {
+      const { limit, offset, search } = req.query;
+      if (limit !== undefined &&
+          (typeof limit !== "string" || !/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 200)) {
+        return res.status(400).json({ error: "limit must be an integer from 1 to 200" });
+      }
+      if (offset !== undefined && (typeof offset !== "string" || !/^\d{1,6}$/.test(offset))) {
+        return res.status(400).json({ error: "offset must be an integer from 0 to 999999" });
+      }
+      if (search !== undefined && (typeof search !== "string" || search.length > 120 || search.includes("\u0000"))) {
+        return res.status(400).json({ error: "search must be text of up to 120 characters" });
+      }
+      return getBranchStock(req, res, next, STOCK_VIEW_SHOPEE);
+    },
+  );
 
   // Accumulate-mode history: reads ada.stock_snapshots, an insert-only ledger
   // (unique key includes snapshot_at) populated by the branch_stock_history sync
