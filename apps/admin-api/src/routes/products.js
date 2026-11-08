@@ -590,6 +590,8 @@ function createProductsRouter(deps) {
 
 module.exports = {
   createProductsRouter,
+  queryProducts,
+  queryProductDetail,
   buildFiltersFromQuery,
   parseUpdatePayload,
   EDITABLE_FIELDS,
