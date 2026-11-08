@@ -20,6 +20,7 @@ const { createCrmWebRouter } = require("./routes/crm-web");
 const { createAuthRouter } = require("./routes/auth");
 const { createMeRouter } = require("./routes/me");
 const { createScpdaReadRouter } = require("./routes/scpda-read");
+const { createScpdaCountsRouter, createScpdaAdminLotsRouter } = require("./routes/scpda-counts");
 const { createCipdataRouter } = require("./routes/cipdata");
 const { createProductsRouter } = require("./routes/products");
 const { createTaxonomyRouter } = require("./routes/taxonomy");
@@ -193,6 +194,8 @@ function createApp(overrides = {}) {
   );
 
   app.use("/admin/health", createHealthRouter());
+  app.use("/api/scpda/counts", createScpdaCountsRouter({ config, db }));
+  app.use("/api/stock-lots", createScpdaAdminLotsRouter({ config, db, requireAuthMiddleware, requireCsrfMiddleware: requireCsrf }));
   app.use("/api/scpda", createScpdaReadRouter({ config, db }));
   app.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config }));
   app.use("/api/admin/ky9-documents", createKy9DocumentsRouter({ config, db }));
