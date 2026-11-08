@@ -132,3 +132,32 @@ unmarked store. Its unit and movement assertions are synthetic-only.
 
 See the delivered evidence manifest for exact source hashes, check counts,
 actual receipts, screenshots, fixture restart proof and unfinished checks.
+
+### Fixture startup inputs
+
+Use existing dependencies and an empty **disposable** PostgreSQL database named
+`scpda_read_fixture`, user `scpda_fixture`, fixture password
+`scpda-fixture-only`, on an explicitly loopback-bound port. No generic
+`DATABASE_URL` is read by this harness. Never point it at a real database.
+
+```sh
+node tests/fixtures/scpda-count-fixture-config.cjs /absolute/empty/fixture-files --synthetic-only
+node tests/fixtures/scpda-counts-http.cjs /absolute/backend/root 32773 /absolute/empty/fixture-files/backend-config.json --http-port 39963
+```
+
+Replace `32773` with the actual disposable Postgres port. The first command
+refuses a nonempty directory and generates two disposable invitations plus
+the public synthetic operator PINs 1111/2222/3333 (not live account PINs). The
+second refuses an existing unmarked database. To reopen the same marked fixture,
+add `--reopen`; never reset the store to make a failed test pass. The HTTP
+listener binds only 127.0.0.1. Current fixture admin credentials are
+`fixture-admin` / `fixture-admin-only-password`; they exist only in this harness.
+
+Run the PostgreSQL suite with explicit fixture origin/port/files variables in
+a fresh fixture; it consumes `invitation.json`. Then the synthetic browser seed
+can create a valid fixture-only FEFO snapshot. The exact-APK host-JVM browser
+test uses the separate `java-invitation.json`. The admin fixture runs in Vite on
+127.0.0.1:5197 with `VITE_API_BASE_URL=http://127.0.0.1:39963` and the frontend
+feature flag; fixture CORS permits that exact loopback origin only. No private
+test device key/certificate, live config, DB dump, session or invitation is
+included in the public review evidence package.
