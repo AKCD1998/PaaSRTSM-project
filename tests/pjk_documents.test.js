@@ -27,3 +27,15 @@ test('PDF download uses allowlisted identifiers and transports storage bytes', a
   assert.equal(r.status, 200); assert.match(r.headers['content-type'], /application\/pdf/); assert.equal(r.body.subarray(0,4).toString(), '%PDF');
   assert.equal((await request(app).get('/api/admin/pjk-documents/nonexistent/pdf').set('Cookie', cookie('admin'))).status, 404);
 });
+
+test('monthly bundles keep storage private and require admin download', async () => {
+  const base='/api/admin/pjk-documents';
+  assert.equal((await request(app).get(base+'/monthly/2026-11/pdf')).status,401);
+  assert.equal((await request(app).get(base+'/monthly/2026-11/pdf').set('Cookie',cookie('branch'))).status,403);
+  const a=await request(app).get(base+'/').set('Cookie',cookie('admin'));
+  const b=a.body.monthlyBundles.find(d=>d.month==='2026-11');
+  assert.equal(b.pageCount,22); assert.equal(b.objectKey,undefined); assert.equal(b.file,undefined);
+  const r=await request(app).get(base+'/monthly/2026-11/pdf').set('Cookie',cookie('admin'));
+  assert.equal(r.status,200); assert.match(r.headers['content-disposition'],/attachment;.*2026-11/);
+  assert.equal((await request(app).get(base+'/monthly/2099-01/pdf').set('Cookie',cookie('admin'))).status,404);
+});
