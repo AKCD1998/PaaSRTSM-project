@@ -17,7 +17,7 @@ test('archive and nested PDFs require an admin session', async () => {
 });
 test('filters, provenance and excluded shifts survive readback', async () => {
   const r = await request(app).get('/api/admin/pjk-documents/?month=2026-12&branch=005&q=25418').set('Cookie', cookie('admin'));
-  assert.equal(r.status, 200); assert.ok(r.body.documents.length); assert.equal(r.body.archiveTotal, 177);
+  assert.equal(r.status, 200); assert.ok(r.body.documents.length); assert.equal(r.body.archiveTotal, 149);
   for (const d of r.body.documents) { assert.equal(d.branch, '005'); assert.equal(d.month, '2026-12'); assert.equal(d.file, undefined); assert.equal(d.objectKey, undefined); assert.equal(d.signatureApplied, true); }
   assert.equal(r.body.exclusions.length, 2); assert.match(r.headers['cache-control'], /no-store/);
 });
@@ -38,4 +38,16 @@ test('monthly bundles keep storage private and require admin download', async ()
   const r=await request(app).get(base+'/monthly/2026-11/pdf').set('Cookie',cookie('admin'));
   assert.equal(r.status,200); assert.match(r.headers['content-disposition'],/attachment;.*2026-11/);
   assert.equal((await request(app).get(base+'/monthly/2099-01/pdf').set('Cookie',cookie('admin'))).status,404);
+});
+
+
+test('corrected archive excludes test and wrapper records and retains complete recovered slots', async () => {
+ const fs=require('node:fs');const archive=JSON.parse(fs.readFileSync('apps/admin-api/data/pjk-documents/manifest.json','utf8'));
+ assert.equal(archive.documents.length,149);
+ assert.equal(archive.documents.filter(d=>d.provenance==='legacy-recovered').length,64);
+ for(const d of archive.documents){assert.ok(d.month);assert.ok(d.slots.length);assert.ok(!d.id.startsWith('legacy-'));
+  for(const s of d.slots)for(const key of ['pharmacistName','pharmacistLicense','dateStart','dateEnd','timeStart','timeEnd'])assert.ok(s[key],d.id+' '+key);
+ }
+ const may=archive.documents.find(d=>d.id==='recovered-2026-05-005-02');assert.equal(may.slots[0].pharmacistLicense,'37877');
+ assert.equal(archive.monthlyBundles.reduce((n,b)=>n+b.pageCount,0),149);
 });
