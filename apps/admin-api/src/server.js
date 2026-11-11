@@ -197,7 +197,7 @@ function createApp(overrides = {}) {
   app.use("/api/scpda", createScpdaReadRouter({ config, db }));
   app.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config }));
   app.use("/api/admin/ky9-documents", createKy9DocumentsRouter({ config, db }));
-  app.use("/api/admin/pjk-documents", createPjkDocumentsRouter({ config }));
+  app.use("/api/admin/pjk-documents", createPjkDocumentsRouter({ config, db }));
   app.use("/api/admin/sccrm-members", createSccrmMemberDirectoryRouter({ config }));
   app.use("/sccrm", createCrmWebRouter());
   app.use(

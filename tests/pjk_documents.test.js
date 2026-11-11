@@ -1,53 +1,22 @@
-const { test } = require('node:test');
-const assert = require('node:assert/strict');
-const express = require('express');
-const cookieParser = require('cookie-parser');
-const request = require('supertest');
-const { signSessionToken } = require('../apps/admin-api/src/auth/session');
-const { createPjkDocumentsRouter } = require('../apps/admin-api/src/routes/pjk-documents');
-const config = { authJwtSecret: 'local-test-only', cookieName: 'session', sessionTtlHours: 1 };
-const app = express(); app.use(cookieParser()); app.use('/api/admin/pjk-documents', createPjkDocumentsRouter({ config,
-  readPdf: async () => Buffer.from('%PDF-1.4\n%transport-test\n%%EOF') }));
-const cookie = role => 'session=' + signSessionToken({ sub: 'test', role }, config);
-test('archive and nested PDFs require an admin session', async () => {
-  for (const route of ['/', '/october-001/pdf']) {
-    assert.equal((await request(app).get('/api/admin/pjk-documents' + route)).status, 401);
-    assert.equal((await request(app).get('/api/admin/pjk-documents' + route).set('Cookie', cookie('branch'))).status, 403);
-  }
-});
-test('filters, provenance and excluded shifts survive readback', async () => {
-  const r = await request(app).get('/api/admin/pjk-documents/?month=2026-12&branch=005&q=25418').set('Cookie', cookie('admin'));
-  assert.equal(r.status, 200); assert.ok(r.body.documents.length); assert.equal(r.body.archiveTotal, 149);
-  for (const d of r.body.documents) { assert.equal(d.branch, '005'); assert.equal(d.month, '2026-12'); assert.equal(d.file, undefined); assert.equal(d.objectKey, undefined); assert.equal(d.signatureApplied, true); }
-  assert.equal(r.body.exclusions.length, 2); assert.match(r.headers['cache-control'], /no-store/);
-});
-test('PDF download uses allowlisted identifiers and transports storage bytes', async () => {
-  const a = await request(app).get('/api/admin/pjk-documents/?month=2026-11').set('Cookie', cookie('admin'));
-  const r = await request(app).get('/api/admin/pjk-documents/' + a.body.documents[0].id + '/pdf').set('Cookie', cookie('admin'));
-  assert.equal(r.status, 200); assert.match(r.headers['content-type'], /application\/pdf/); assert.equal(r.body.subarray(0,4).toString(), '%PDF');
-  assert.equal((await request(app).get('/api/admin/pjk-documents/nonexistent/pdf').set('Cookie', cookie('admin'))).status, 404);
-});
-
-test('monthly bundles keep storage private and require admin download', async () => {
-  const base='/api/admin/pjk-documents';
-  assert.equal((await request(app).get(base+'/monthly/2026-11/pdf')).status,401);
-  assert.equal((await request(app).get(base+'/monthly/2026-11/pdf').set('Cookie',cookie('branch'))).status,403);
-  const a=await request(app).get(base+'/').set('Cookie',cookie('admin'));
-  const b=a.body.monthlyBundles.find(d=>d.month==='2026-11');
-  assert.equal(b.pageCount,22); assert.equal(b.objectKey,undefined); assert.equal(b.file,undefined);
-  const r=await request(app).get(base+'/monthly/2026-11/pdf').set('Cookie',cookie('admin'));
-  assert.equal(r.status,200); assert.match(r.headers['content-disposition'],/attachment;.*2026-11/);
-  assert.equal((await request(app).get(base+'/monthly/2099-01/pdf').set('Cookie',cookie('admin'))).status,404);
-});
-
-
-test('corrected archive excludes test and wrapper records and retains complete recovered slots', async () => {
- const fs=require('node:fs');const archive=JSON.parse(fs.readFileSync('apps/admin-api/data/pjk-documents/manifest.json','utf8'));
- assert.equal(archive.documents.length,149);
- assert.equal(archive.documents.filter(d=>d.provenance==='legacy-recovered').length,64);
- for(const d of archive.documents){assert.ok(d.month);assert.ok(d.slots.length);assert.ok(!d.id.startsWith('legacy-'));
-  for(const s of d.slots)for(const key of ['pharmacistName','pharmacistLicense','dateStart','dateEnd','timeStart','timeEnd'])assert.ok(s[key],d.id+' '+key);
- }
- const may=archive.documents.find(d=>d.id==='recovered-2026-05-005-02');assert.equal(may.slots[0].pharmacistLicense,'37877');
- assert.equal(archive.monthlyBundles.reduce((n,b)=>n+b.pageCount,0),149);
-});
+const {test}=require('node:test'),assert=require('node:assert/strict'),express=require('express'),cookieParser=require('cookie-parser'),request=require('supertest'),fs=require('fs'),crypto=require('crypto');
+const {signSessionToken}=require('../apps/admin-api/src/auth/session');
+const {createPjkDocumentsRouter}=require('../apps/admin-api/src/routes/pjk-documents');
+const {createPjkDocumentRows}=require('../apps/admin-api/src/services/pjkDocumentRows');
+const records=JSON.parse(fs.readFileSync('apps/admin-api/data/pjk-documents/records.json','utf8'));
+const config={authJwtSecret:'local-test-only',cookieName:'session',sessionTtlHours:1};
+const signature=Buffer.from('test-private-signature'),sha=crypto.createHash('sha256').update(signature).digest('hex');let assetMissing=false;
+const db={async query(sql,params){
+ if(sql.startsWith('SELECT id, month'))return {rows:records.map(r=>({id:r.id,month:r.month,branch:r.branch,metadata:r.metadata}))};
+ if(sql.startsWith('SELECT id,payload'))return {rows:records.filter(r=>sql.includes('WHERE id=')?r.id===params[0]:r.month===params[0]).map(r=>({id:r.id,payload:r.payload,template_version:'form_gor_gor_1-v1',signature_asset_id:'songpol-v1'}))};
+ if(sql.startsWith('SELECT content,'))return {rows:assetMissing?[]:[{content:signature,content_sha256:sha}]};
+ throw Error('Unexpected SQL');
+}};
+const render=async ({payloads,signatureBytes})=>{assert.equal(signatureBytes.toString(),signature.toString());return Buffer.from('%PDF-1.4\n%pages='+payloads.length+'\n%%EOF');};
+const app=express();app.use(cookieParser());app.use('/api/admin/pjk-documents',createPjkDocumentsRouter({config,db,service:createPjkDocumentRows(db,{render})}));
+const cookie=role=>'session='+signSessionToken({sub:'test',role},config),base='/api/admin/pjk-documents';
+test('list and every rendering endpoint require admin authentication',async()=>{for(const route of ['/','/one/pdf','/monthly/2026-11/pdf']){assert.equal((await request(app).get(base+route)).status,401);assert.equal((await request(app).get(base+route).set('Cookie',cookie('branch'))).status,403);}});
+test('rows preserve filters and monthly counts without exposing snapshots/signature/storage',async()=>{const r=await request(app).get(base+'/?month=2026-05&branch=005&q=37877').set('Cookie',cookie('admin'));assert.equal(r.status,200);assert.equal(r.body.archiveTotal,149);assert.equal(r.body.total,1);assert.equal(r.body.storageMode,'database-rows');assert.equal(r.body.monthlyBundles.find(b=>b.month==='2026-05').pageCount,21);assert.equal(r.body.monthlyBundles.reduce((n,b)=>n+b.pageCount,0),149);for(const d of r.body.documents){assert.equal(d.payload,undefined);assert.equal(d.file,undefined);assert.equal(d.objectKey,undefined);assert.equal(d.pdfGeneratedOnDemand,true);}assert.equal(r.body.exclusions.length,2);assert.match(r.headers['cache-control'],/no-store/);});
+test('monthly and single PDFs are generated from matching saved snapshots',async()=>{const r=await request(app).get(base+'/monthly/2026-11/pdf').set('Cookie',cookie('admin'));assert.equal(r.status,200);assert.match(r.body.toString(),/pages=22/);assert.match(r.headers['content-disposition'],/attachment;.*2026-11/);const id=records[0].id;assert.equal((await request(app).get(base+'/'+id+'/pdf').set('Cookie',cookie('admin'))).status,200);for(const route of ['/nonexistent/pdf','/monthly/2099-01/pdf','/monthly/2026-99/pdf'])assert.equal((await request(app).get(base+route).set('Cookie',cookie('admin'))).status,404);});
+test('a missing private signature fails closed instead of returning an unsigned PDF',async()=>{assetMissing=true;try{const r=await request(app).get(base+'/'+records[0].id+'/pdf').set('Cookie',cookie('admin'));assert.equal(r.status,503);assert.match(r.body.error,/ลายเซ็น/);}finally{assetMissing=false;}});
+test('all149 permanent snapshots are complete and contain no file blobs',()=>{assert.equal(records.length,149);for(const r of records){assert.ok(!r.id.startsWith('legacy-'));assert.equal(r.metadata.objectKey,undefined);for(const key of ['pharmacyDisplayName','licenseNo','addressNo','operatorTitle','operatorWorkHours','licenseeNameTh'])assert.ok(r.payload[key],r.id+' '+key);for(const s of r.payload.subPharmacistSlots)for(const key of ['pharmacistName','pharmacistLicense','dateStart','dateEnd','timeStart','timeEnd'])assert.ok(s[key]);}});
+test('real renderer shares a private signature and font across generated pages',async()=>{const {renderSignedPjkPdf}=await import('../apps/admin-api/src/services/pjk-v1/pdfStampService.mjs');const {PDFDocument,PDFName}=require('pdf-lib');const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aT50AAAAASUVORK5CYII=','base64');const pdf=await PDFDocument.load(await renderSignedPjkPdf({payloads:records.slice(0,3).map(r=>r.payload),signatureBytes:png}));assert.equal(pdf.getPageCount(),3);for(const page of pdf.getPages()){assert.ok(page.node.Resources().lookup(PDFName.of('XObject')));assert.ok(page.node.Resources().lookup(PDFName.of('Font')));}});
