@@ -5708,5 +5708,70 @@
     "type": "user-supplied-image",
     "appliedAt": "2026-11-11",
     "sourceSha256": "8866b494f6a136badf8ede80118744005f7c507f14a0e4b913519490ee9226d4"
-  }
+  },
+  "monthlyBundles": [
+    {
+      "month": "2027-01",
+      "file": "monthly-2027-01.pdf",
+      "sha256": "becd285389eae66f6bc58223560796dd43cb28a07969bd53f1a2ba436aa1fbca",
+      "objectKey": "pjk-documents/20261111/becd285389eae66f6bc58223560796dd43cb28a07969bd53f1a2ba436aa1fbca.pdf",
+      "pageCount": 20,
+      "documentCount": 20,
+      "signatureApplied": true
+    },
+    {
+      "month": "2026-12",
+      "file": "monthly-2026-12.pdf",
+      "sha256": "625abfd9349a71e253a68aff288ee87a8321fbf3ec73e91def48bd822ce8ea3e",
+      "objectKey": "pjk-documents/20261111/625abfd9349a71e253a68aff288ee87a8321fbf3ec73e91def48bd822ce8ea3e.pdf",
+      "pageCount": 19,
+      "documentCount": 19,
+      "signatureApplied": true
+    },
+    {
+      "month": "2026-11",
+      "file": "monthly-2026-11.pdf",
+      "sha256": "3ee7c75efa4352a3b0fbb19e53dcbdcdb2ec83ada7e9894f83882876d4fd7876",
+      "objectKey": "pjk-documents/20261111/3ee7c75efa4352a3b0fbb19e53dcbdcdb2ec83ada7e9894f83882876d4fd7876.pdf",
+      "pageCount": 22,
+      "documentCount": 22,
+      "signatureApplied": true
+    },
+    {
+      "month": "2026-10",
+      "file": "monthly-2026-10.pdf",
+      "sha256": "5ae2df5113e5f98b355462733011bf030a003ecb163c1865a6480c03073596f8",
+      "objectKey": "pjk-documents/20261111/5ae2df5113e5f98b355462733011bf030a003ecb163c1865a6480c03073596f8.pdf",
+      "pageCount": 24,
+      "documentCount": 24,
+      "signatureApplied": true
+    },
+    {
+      "month": "2026-04",
+      "file": "monthly-2026-04.pdf",
+      "sha256": "d61cd1ada027517edd8d10989d2539e646a9a5d6a84af35e51a7ac97094a37a8",
+      "objectKey": "pjk-documents/20261111/d61cd1ada027517edd8d10989d2539e646a9a5d6a84af35e51a7ac97094a37a8.pdf",
+      "pageCount": 18,
+      "documentCount": 18,
+      "signatureApplied": true
+    },
+    {
+      "month": "2026-02",
+      "file": "monthly-2026-02.pdf",
+      "sha256": "ce781e40551e68bcf2ac977b0846285eab5baea749e3e6de3379d6e20715994e",
+      "objectKey": "pjk-documents/20261111/ce781e40551e68bcf2ac977b0846285eab5baea749e3e6de3379d6e20715994e.pdf",
+      "pageCount": 23,
+      "documentCount": 23,
+      "signatureApplied": true
+    },
+    {
+      "month": "2026-01",
+      "file": "monthly-2026-01.pdf",
+      "sha256": "1e68a4979af587a0a0c59e900067559e9ebf9cba50bf58aaf6507040b8f5b256",
+      "objectKey": "pjk-documents/20261111/1e68a4979af587a0a0c59e900067559e9ebf9cba50bf58aaf6507040b8f5b256.pdf",
+      "pageCount": 1,
+      "documentCount": 1,
+      "signatureApplied": true
+    }
+  ]
 }

@@ -33,8 +33,21 @@ function createPjkDocumentsRouter({ config, archiveRoot = path.resolve(__dirname
       const offset = Math.max(0, Math.min(100000, Number.parseInt(req.query.offset, 10) || 0));
       res.json({ asOf: archive.asOf, total: rows.length, archiveTotal: archive.documents.length,
         months: [...new Set(archive.documents.map(d => d.month).filter(Boolean))].sort().reverse(),
+        monthlyBundles: (archive.monthlyBundles || []).map(({ file, objectKey, ...d }) => d),
         exclusions: archive.exclusions || [],
         documents: rows.slice(offset, offset + 50).map(({ file, objectKey, ...d }) => d) });
+    } catch (e) { next(e); }
+  });
+  router.get("/monthly/:month/pdf", async (req, res, next) => {
+    try {
+      const doc = (load().monthlyBundles || []).find(d => d.month === req.params.month);
+      if (!doc) return res.status(404).json({ error: "ไม่พบเอกสารรวมเดือนนี้" });
+      const bytes = await readStoredPdf(doc);
+      if (bytes.subarray(0, 4).toString() !== "%PDF") throw new Error("Invalid archive PDF");
+      res.set("Content-Type", "application/pdf");
+      res.set("Content-Disposition", `attachment; filename="PJK-${doc.month}-All-Branches-Signed.pdf"`);
+      res.set("X-Content-Type-Options", "nosniff");
+      res.send(bytes);
     } catch (e) { next(e); }
   });
   router.get("/:id/pdf", async (req, res, next) => {
