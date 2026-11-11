@@ -91,6 +91,37 @@ function createSccrmMemberDirectoryRouter({ config, fetchImpl = global.fetch, ti
   router.get('/ada-links', (req, res) => linking(req, res, 'pending'));
   router.get('/:id/ada-links', (req, res) => linking(req, res, 'options'));
   router.post('/:id/ada-links', requireCsrf, (req, res) => linking(req, res, 'confirm'));
+  async function syncStatus(req, res, retry = false) {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuid.test(req.params.id) || Object.keys(req.query).length || (retry &&
+      (!req.body || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== 'jobId') || !uuid.test(req.body.jobId || '')))) {
+      return res.status(400).json({ error: 'ข้อมูลสมาชิกหรือรายการส่งไม่ถูกต้อง' });
+    }
+    if (retry && !config.crmAdaLinkAdminToken) return res.status(503).json({ error: 'ระบบลองส่งข้อมูลใหม่ยังไม่พร้อม' });
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeoutMs);
+    const disconnected = () => controller.abort(); res.on('close', disconnected);
+    try {
+      const base = new URL(config.crmMirrorBaseUrl);
+      if (!config.crmMirrorInternalToken || base.username || base.password || (base.protocol !== 'https:' &&
+        !(base.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(base.hostname)))) throw Error('CRM unavailable');
+      const path = '/internal/crm/member-directory/' + encodeURIComponent(req.params.id) + '/sync-status' + (retry ? '/retry' : '');
+      const response = await fetchImpl(new URL(path, base), {
+        method: retry ? 'POST' : 'GET', signal: controller.signal, redirect: 'error', cache: 'no-store',
+        headers: { 'x-internal-token': config.crmMirrorInternalToken, Accept: 'application/json',
+          ...(retry ? { 'Content-Type': 'application/json', 'x-ada-link-admin-token': config.crmAdaLinkAdminToken } : {}) },
+        ...(retry ? { body: JSON.stringify({ jobId: req.body.jobId, actor: { id: String(req.auth.userId), role: 'admin' } }) } : {}),
+      });
+      const chunks = []; let size = 0;
+      for await (const chunk of response.body) { size += chunk.length; if (size > 1024 * 1024) throw Error('Oversized sync log'); chunks.push(Buffer.from(chunk)); }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if ([400, 404, 409].includes(response.status)) return res.status(response.status).json({ error: response.status === 404 ? 'ไม่พบรายการส่งของสมาชิกนี้' : response.status === 409 ? 'รับคำขอแล้วหรือข้อมูลเปลี่ยน กรุณาโหลดสถานะใหม่' : 'ข้อมูลรายการส่งไม่ถูกต้อง' });
+      if (!response.ok || !body.ok || (!retry && (body.member?.id !== req.params.id || !Array.isArray(body.jobs) || !Array.isArray(body.events)))) throw Error('Invalid sync log');
+      return res.json(body);
+    } catch { if (!res.destroyed) return res.status(503).json({ error: 'ยังอ่านสถานะการส่งข้อมูลไม่ได้ กรุณาลองใหม่' }); }
+    finally { clearTimeout(timer); res.off('close', disconnected); }
+  }
+  router.get('/:id/sync-status', (req, res) => syncStatus(req, res));
+  router.post('/:id/sync-status/retry', requireCsrf, (req, res) => syncStatus(req, res, true));
   router.get("/:id/purchase-history", (req, res) => read(req, res, true));
   return router;
 }
