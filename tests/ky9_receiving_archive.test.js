@@ -19,7 +19,7 @@ test("identity, dates, units and stable import keys; reject duplicate or unbound
  assert.throws(() => filters({ q: "--" }), { status: 400 });
  assert.throws(() => filters({ branch: "002" }), { status: 400 });
  assert.throws(() => filters({ limit: 200 }), { status: 400 });
- const p = packet(), first = prepare(p, "test-operator");
+  const p = packet(), first = prepare(p, "test-operator");
  assert.deepEqual(prepare(p, "test-operator"), first);
  assert.equal(first[0].rows[0].data.baseQty, 24); assert.equal(first[0].rows[0].data.qty, 2);
  const duplicate = packet(); duplicate.batches[1].rows[0].id = duplicate.batches[0].rows[0].id;
@@ -54,7 +54,8 @@ const url = process.env.KY9_ARCHIVE_TEST_DATABASE_URL;
   const r = spawnSync(psql, [url, "-X", "-f", f], { encoding: "utf8", timeout: 30000, maxBuffer: 2 ** 20 });
   assert.equal(r.status === 0, okay, r.stderr || r.error?.message); return r;
  }
- const initial = prepare(packet(), "test-operator"); apply(initial, "initial"); apply(initial, "again");
+ const input = packet(); input.batches[1].rows[0].expiry = "2030-06-30"; input.batches[1].rows[0].expiryPrecision = "month";
+ const initial = prepare(input, "test-operator"); apply(initial, "initial"); apply(initial, "again");
  assert.equal(Number((await db.query("SELECT count(*) FROM ky9_documents.receiving_rows")).rows[0].count), 2);
  const api = createKy9ReceivingArchive(db), auth = { role: "admin" };
  let r = await api.search(auth, { q: " IC TEST001 " }); assert.equal(r.total, 2); assert.equal(r.rows[0].base_quantity, 24);
@@ -62,6 +63,7 @@ const url = process.env.KY9_ARCHIVE_TEST_DATABASE_URL;
  assert.equal((await api.search(auth, { q: "%' OR 1=1" })).total, 0);
  const data = await api.handoff(auth, { dateFrom: "2026-08-01", limit: 1, offset: 99 }); assert.equal(data.rowCount, 1);
  assert.equal(data.rows[0].qty, 2); assert.equal(data.rows[0].baseQty, 24); assert.equal(data.rows[0].ready, false);
+ assert.equal(data.rows[0].expiry, "2030-06-30"); assert.equal(data.rows[0].expiryPrecision, "month");
  assert.equal(data.rows[0].physical_lot_confirmed, false); assert.equal(data.stockEffect, "none");
  const previous = initial[0], p = packet(); p.batches = [p.batches[0]]; p.batches[0].previousBatchId = previous.id;
  p.batches[0].label = "synthetic-v2"; p.batches[0].rows[0].lot = "002B";

@@ -34,6 +34,7 @@ const columns = `r.row_key,r.batch_id,r.event_id,r.branch_code,r.received_date::
  r.data->>'reportQuantityDisplay' AS quantity_display,r.data->'qty' AS quantity,r.data->>'unit' AS unit,
  r.data->'baseQty' AS base_quantity,r.data->>'quantityUnit' AS base_unit,r.data->>'expiry' AS expiry,
  r.data->>'manufacturedDate' AS manufactured_date,r.data->'freeGoods' AS free_goods,
+ r.data->>'manufacturedPrecision' AS manufactured_precision,r.data->>'expiryPrecision' AS expiry_precision,
  r.data->>'status' AS source_status,r.data->>'sourceFile' AS source_file,r.data->>'sourceSha256' AS source_sha256,
  r.data->>'sourceId' AS source_id,r.data->'physical_lot_confirmed' AS physical_lot_confirmed,
  r.data->>'batchExceptionLabel' AS batch_exception_label`;
@@ -84,7 +85,8 @@ function createKy9ReceivingArchive(db) {
       evidenceRule: "Read the immutable original row using archive.lookupPath when a decision, exception or lot proposal needs full context.",
       rows: rows.map(r => ({
         id: r.event_id, branch: r.branch_code, date: r.received_date, productCode: r.product_code, productName: r.product_name,
-        lot: r.lot, manufacturedDate: r.manufactured_date, expiry: r.expiry, qty: r.quantity, unit: r.unit,
+        lot: r.lot, manufacturedDate: r.manufactured_date, expiry: r.expiry,
+        manufacturedPrecision: r.manufactured_precision, expiryPrecision: r.expiry_precision, qty: r.quantity, unit: r.unit,
         baseQty: r.base_quantity, quantityUnit: r.base_unit, reportQuantityDisplay: r.quantity_display,
         documentNo: r.document_no, invoiceNo: r.invoice_no, supplier: r.supplier, type: r.movement_type,
         freeGoods: r.free_goods, pairedEventIds: r.paired_event_ids, status: r.source_status,
