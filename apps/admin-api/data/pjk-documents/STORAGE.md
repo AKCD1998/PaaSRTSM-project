@@ -10,7 +10,8 @@ PDFs are generated in memory and streamed without writing output files or storin
 
 1. Apply migration 079 using the repository migration protocol (never re-run the Windows runner against a Linux migration ledger).
 2. Use `scripts/import_pjk_rows.js` (`importPjkRows(client, records, signatureBytes)`) with the reviewed `data/pjk-documents/records.json` and an explicitly supplied private signature file. Imports are transactional, idempotent and read back every saved payload. Existing snapshots are never silently overwritten.
-3. Confirm all149 rows and the signature hash, render all8 months and compare text to reviewed PDFs before deployment.
+3. Confirm all208 rows and the signature hash, render all11 months and compare text to reviewed PDFs before deployment.
 4. Preserve the database backup plus reviewed local original ZIPs. Generated PDFs are disposable; source rows, template/font assets and signature are required to reproduce them.
 
 Version1 renderer/template/font were ported unchanged from the existing shared DigitalPJK implementation. Only multi-page rendering and embedding the user-authorized signature were added. No DigitalPJK historical database records are changed by this import.
+
