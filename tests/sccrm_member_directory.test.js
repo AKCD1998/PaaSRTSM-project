@@ -67,3 +67,26 @@ test('link reads stay admin-only and write conflicts expose only known safe mess
   const r=await request(conflict).post('/api/admin/sccrm-members/'+id+'/ada-links').set('Cookie',session('admin')).set('x-csrf-token','synthetic-csrf').send({adaCode:'A-1',reviewToken:'x'});
   assert.equal(r.status,409);assert.equal(r.body.code,'ADA_ALREADY_LINKED');assert.ok(!r.text.includes('secret'));
 });
+
+test('sync logs remain member-bound and admin-only, while retry also requires CSRF and the server-side write credential',async()=>{
+ const jobId='22222222-2222-4222-8222-222222222222',calls=[];
+ const a=app(async(url,options)=>{calls.push({url,options});return Response.json(options.method==='POST'?{ok:true}:{ok:true,member:{id},jobs:[],events:[]});},
+  {config:{...config,crmAdaLinkAdminToken:'synthetic-sync-write'}});
+ assert.equal((await get(a,`/${id}/sync-status`,'staff')).status,403);
+ assert.equal((await get(a,`/${id}/sync-status?target=001`)).status,400);
+ const read=await get(a,`/${id}/sync-status`);assert.equal(read.status,200);assert.equal(read.body.member.id,id);
+ const post=()=>request(a).post('/api/admin/sccrm-members/'+id+'/sync-status/retry').set('Cookie',session('admin'));
+ assert.equal((await post().send({jobId})).status,403);
+ assert.equal((await post().set('x-csrf-token','synthetic-csrf').send({jobId,memberId:'forged'})).status,400);
+ assert.equal((await post().set('x-csrf-token','synthetic-csrf').send({jobId})).status,200);
+ assert.equal(calls.length,2);assert.equal(calls[1].options.headers['x-ada-link-admin-token'],'synthetic-sync-write');
+ assert.deepEqual(JSON.parse(calls[1].options.body),{jobId,actor:{id:'synthetic',role:'admin'}});
+ assert.equal(calls[1].url.pathname,`/internal/crm/member-directory/${id}/sync-status/retry`);
+});
+
+test('sync logs reject mismatched member responses and sanitize upstream credential errors',async()=>{
+ const wrong=app(async()=>Response.json({ok:true,member:{id:'another'},jobs:[],events:[]}));
+ assert.equal((await get(wrong,`/${id}/sync-status`)).status,503);
+ const error=app(async()=>Response.json({error:config.crmMirrorInternalToken},{status:500}));
+ const r=await get(error,`/${id}/sync-status`);assert.equal(r.status,503);assert.ok(!r.text.includes(config.crmMirrorInternalToken));
+});

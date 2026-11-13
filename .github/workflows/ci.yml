@@ -30,6 +30,7 @@ jobs:
       HOURLY_EVIDENCE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_hourly_evidence_test_ci
       TRANSFER_DELTA_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/transfer_delta_ci
       KY9_DOCUMENTS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_ky9_documents_test_ci
+      KY9_ARCHIVE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_ky9_archive_test_ci
 
     steps:
       - name: Checkout
@@ -58,7 +59,13 @@ jobs:
           PGPASSWORD: postgres
         run: createdb --host=127.0.0.1 --port=5432 --username=postgres sc_ky9_documents_test_ci
 
+      - name: Create isolated KY9 archive test database
+        env:
+          PGPASSWORD: postgres
+        run: createdb --host=127.0.0.1 --port=5432 --username=postgres sc_ky9_archive_test_ci
+
       - name: Run test suite
+        # The archive integration test has its own disposable database.
         run: npm test -- --test-concurrency=1
 
       - name: Remove isolated hourly evidence test database
@@ -78,3 +85,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: dropdb --if-exists --host=127.0.0.1 --port=5432 --username=postgres sc_ky9_documents_test_ci
+
+      - name: Remove isolated KY9 archive test database
+        if: always()
+        env:
+          PGPASSWORD: postgres
+        run: dropdb --if-exists --host=127.0.0.1 --port=5432 --username=postgres sc_ky9_archive_test_ci
