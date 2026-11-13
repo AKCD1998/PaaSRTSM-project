@@ -98,7 +98,12 @@ function createCorsMiddleware(config) {
     }
 
     const normalizedOrigin = normalizeOrigin(origin);
-    const allowOrigin = config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
+    // Separately approved browser capability: this Site, these bearer routes.
+    // Does not add the Site to the general web-session/admin CORS allowlist.
+    const scpdaWeb = config.featureScpdaWeb001 === true
+      && normalizedOrigin === "https://sc-stockday-pda-lab.scgroup1989-it.chatgpt.site"
+      && /^\/api\/scpda(?:\/|$)/.test(req.path);
+    const allowOrigin = scpdaWeb || config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
     if (!allowOrigin) {
       if (req.method === "OPTIONS") {
         return res.status(403).json({
@@ -110,6 +115,15 @@ function createCorsMiddleware(config) {
     }
 
     res.setHeader("Access-Control-Allow-Origin", origin);
+    if (scpdaWeb) {
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      appendVaryHeader(res, "Origin");
+      appendVaryHeader(res, "Access-Control-Request-Method");
+      appendVaryHeader(res, "Access-Control-Request-Headers");
+      if (req.method === "OPTIONS") return res.status(204).end();
+      return next();
+    }
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader(
       "Access-Control-Allow-Headers",
@@ -618,4 +632,5 @@ if (require.main === module) {
 module.exports = {
   createApp,
   startServer,
+  createCorsMiddleware,
 };

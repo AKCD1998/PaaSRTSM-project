@@ -1,5 +1,47 @@
 # SCPDA branch 001 count pilot — activation candidate
 
+## Browser continuation, 2026-11-13
+
+Prepared on current backend main `46985c9` without changing its PJK/other work.
+The existing Sites staff panel was separately removed and published; this count
+backend and its schema/access changes remain unactivated.
+
+Live read-only checks still found no `ordering.scpda_observations`, lot or review
+tables. `/api/scpda/counts/admission` returns 405 `READ_ONLY` from the old reader
+catch-all. The existing preview origin receives preflight 403. Therefore the
+current hosted demo is not evidence of live count persistence.
+
+The new default-off `FEATURE_SCPDA_WEB_001` capability admits exactly
+`https://sc-stockday-pda-lab.scgroup1989-it.chatgpt.site` and `/api/scpda` paths.
+It permits Content-Type/Authorization and GET/POST/OPTIONS, **without credentialed
+cookies**. It does not put the Site on the general CORS allowlist and grants no
+admin, legacy-mobile-enrollment or Sync route access. Existing device/PIN auth
+and separate count-purpose proof still run. Four actual middleware checks cover
+default-off, exact scope, lack of cookie admission and preserved auth rejection.
+
+The actual browser adapter uses a nonextractable P256 key persisted in its own
+IndexedDB, the existing one-time device invitation/PIN login and the existing
+count contracts. PINs and reader/count JWTs are not persisted. There is no
+backend proxy, no-cors mode, shared credential or mock stock fallback. A browser
+is a separate registered device from Android Keystore; do not reuse/export an
+Android private key or register a new production device without approval.
+
+New cloud browser checks exercised real WebCrypto proof and real isolated
+HTTP/auth/PostgreSQL handlers: count receipt, lot dates, late-lot reason, offline
+cold reopen, lost response recovery, original-preserving correction, second
+browser, CSRF admin review and logout (12 linked assertions). Synthetic movement
+coverage was explicitly seeded only for the late-lot case; real Ada movement
+coverage is still unverified. Current-main backend 38 checks, admin45 and build
+also passed. No production count write or physical-phone acceptance is claimed.
+
+Activation now needs the previously reserved approval for migration083 plus the
+reviewed backend/admin deployment, `FEATURE_SCPDA_COUNTS_001=true`, the narrowly
+scoped `FEATURE_SCPDA_WEB_001=true`, the prepared browser Site version, and one
+new branch001 browser admission invitation. Existing three account/PIN values,
+general CORS configuration, Sites audience and official Ada inventory remain
+unchanged. The preview request is not permission to bypass the existing 403 or
+mint a session from the application's signing secret.
+
 Status: implemented and tested in an isolated cloud fixture; NOT deployed. Existing
 live reader contract remains `scpda-read-001-v1`. Production flags, credentials,
 inventory and migration history have not been changed in this phase.

@@ -12,7 +12,7 @@ async function main(){
   if(!baseline)throw Error('Fixture baseline required');
   const last=(await db.query('SELECT revision FROM ordering.scpda_review_events WHERE event_id=$1 ORDER BY revision DESC LIMIT 1',[baseline.event_id])).rows[0];
   await ledger.review(db,{userId:'synthetic-browser-seed'},baseline.event_id,{action:'accepted-observation',reason:'Synthetic baseline only; not Ada movement coverage',expectedRevision:last.revision});
-  const asOf=new Date(Date.now()-1000).toISOString(),start=baseline.observed_at.toISOString(),e=baseline.evidence;
+  const asOf=new Date(Date.now()).toISOString(),start=baseline.observed_at.toISOString(),e=baseline.evidence;
   const result=projectFefo({baseline:{eventId:baseline.event_id,accepted:true,completeProduct:true,unitLabel:e.unitLabel,observedAt:start,lots:e.lots},unitProof:{verified:true,ruleVersion:'synthetic-only',unitCode:'TAB',unitLabel:e.unitLabel},coverage:{complete:true,deduplicated:true,sourceRevision:'synthetic-browser-only',from:start,through:asOf},movements:[{id:randomUUID(),kind:'sale',direction:'out',quantity:e.quantity,unitCode:'TAB',identityVerified:true,at:asOf}],asOf});
   if(result.status!=='estimated'||result.lots.some(l=>l.estimatedRemaining!=='0'))throw Error('Expected synthetic depletion');
   const id=randomUUID();await db.query("INSERT INTO ordering.scpda_fefo_projections(projection_id,baseline_event_id,branch_code,product_code,unit_label,valid_through,policy_version,source_revision,evidence,result) VALUES($1,$2,'001','QA-001',$3,$4,$5,'synthetic-browser-only',$6::jsonb,$7::jsonb)",[id,baseline.event_id,e.unitLabel,asOf,result.policy,JSON.stringify({synthetic:true,notAdaCoverage:true}),JSON.stringify(result)]);
