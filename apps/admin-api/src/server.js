@@ -20,6 +20,7 @@ const { createCrmWebRouter } = require("./routes/crm-web");
 const { createAuthRouter } = require("./routes/auth");
 const { createMeRouter } = require("./routes/me");
 const { createScpdaReadRouter } = require("./routes/scpda-read");
+const { createScpdaCountsRouter, createScpdaAdminLotsRouter } = require("./routes/scpda-counts");
 const { createCipdataRouter } = require("./routes/cipdata");
 const { createProductsRouter } = require("./routes/products");
 const { createTaxonomyRouter } = require("./routes/taxonomy");
@@ -97,7 +98,12 @@ function createCorsMiddleware(config) {
     }
 
     const normalizedOrigin = normalizeOrigin(origin);
-    const allowOrigin = config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
+    // Separately approved browser capability: this Site, these bearer routes.
+    // Does not add the Site to the general web-session/admin CORS allowlist.
+    const scpdaWeb = config.featureScpdaWeb001 === true
+      && normalizedOrigin === "https://sc-stockday-pda-lab.scgroup1989-it.chatgpt.site"
+      && /^\/api\/scpda(?:\/|$)/.test(req.path);
+    const allowOrigin = scpdaWeb || config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
     if (!allowOrigin) {
       if (req.method === "OPTIONS") {
         return res.status(403).json({
@@ -109,6 +115,15 @@ function createCorsMiddleware(config) {
     }
 
     res.setHeader("Access-Control-Allow-Origin", origin);
+    if (scpdaWeb) {
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      appendVaryHeader(res, "Origin");
+      appendVaryHeader(res, "Access-Control-Request-Method");
+      appendVaryHeader(res, "Access-Control-Request-Headers");
+      if (req.method === "OPTIONS") return res.status(204).end();
+      return next();
+    }
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader(
       "Access-Control-Allow-Headers",
@@ -194,6 +209,8 @@ function createApp(overrides = {}) {
   );
 
   app.use("/admin/health", createHealthRouter());
+  app.use("/api/scpda/counts", createScpdaCountsRouter({ config, db }));
+  app.use("/api/stock-lots", createScpdaAdminLotsRouter({ config, db, requireAuthMiddleware, requireCsrfMiddleware: requireCsrf }));
   app.use("/api/scpda", createScpdaReadRouter({ config, db }));
   app.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config }));
   app.use("/api/admin/ky9-documents", createKy9DocumentsRouter({ config, db }));
@@ -615,4 +632,5 @@ if (require.main === module) {
 module.exports = {
   createApp,
   startServer,
+  createCorsMiddleware,
 };
