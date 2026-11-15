@@ -1,9 +1,11 @@
 # SCPDA branch-001 reader activation
 
-This additive, default-off surface provides the requested three reusable PIN logins on an admitted Android phone. It does not activate the pending count ledger, assign core staff identities, modify web/mobile permissions or allow Ada/inventory writes. There are no migrations in this change.
+This additive, default-off surface provides the requested three reusable reader logins on an admitted Android phone. It does not activate the pending count ledger, assign core staff identities, modify web/mobile permissions or allow Ada/inventory writes. There are no migrations in this change.
+
+R10 password compatibility and targeted credential-rotation boundaries are documented in [SCPDA_CREDENTIAL_COMPATIBILITY_R10.md](SCPDA_CREDENTIAL_COMPATIBILITY_R10.md).
 
 - Prefix `/api/scpda`, flag `FEATURE_SCPDA_READ_001` (default false).
-- Operator IDs `01001`, `02001`, `03001`. Each has a bcrypt cost-12+ four-digit PIN hash, independent version and six-month rotation reminder in secret configuration `SCPDA_OPERATOR_CREDENTIALS_JSON`. Never use public demo PINs in live configuration.
+- Operator IDs `01001`, `02001`, `03001`. Each has a bcrypt cost-12+ credential hash (legacy four-digit PIN or exact visible-ASCII password of 6–64 characters), independent version and six-month rotation reminder in secret configuration `SCPDA_OPERATOR_CREDENTIALS_JSON`. Never use public demo PINs in live configuration.
 - One-use, expiring device invitations are SHA-256 hashed in `SCPDA_DEVICE_INVITATIONS_JSON`. The activation file is supplied privately to the device owner and is not inside the APK or repository.
 - Activation binds an EC P-256 Android Keystore public key. The public admission certificate lasts 180 days. A server nonce and ECDSA proof of possession are required before checking a PIN. Every nonce is consumed once; there is no anonymous internet PIN-only login.
 - Reader session JWTs last at most eight hours, remain only in native memory, and use an HMAC-derived signing key distinct from existing web/mobile keys and from admission certificates. They cannot authorize existing admin/mobile routes. Each request rechecks credential version/fingerprint, device revocation and durable logout evidence.

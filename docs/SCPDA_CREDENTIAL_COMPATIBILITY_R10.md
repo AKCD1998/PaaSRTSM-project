@@ -1,0 +1,13 @@
+# SCPDA credential compatibility — R10
+
+The user requested a temporary alphanumeric password for existing reader01001. Accept exact visible-ASCII passwords of6–64characters while preserving existing four-digit numeric readers. The legacy request key `pin` and reader-v1 contract stay compatible. Credentials are not trimmed or case-normalized; control characters, whitespace, non-ASCII and oversized input are rejected. The64byte bound stays below bcrypt's72byte input limit.
+
+Only input validation and staff-facing password wording change. Device certificate/challenge/signature, reader branch/operator scope, bcrypt verification, rate holds, durable logout and credential-version session invalidation are retained. No migrations, count flags, stock writes, device registrations, permissions or general web accounts change in this patch.
+
+Production rotation is a separate user-authorized configuration step: change only01001's hash/version/rotation reminder in the existing service's `SCPDA_OPERATOR_CREDENTIALS_JSON`. Preserve02001/03001 records and all other service variables. Never place the requested password, hashes, provider key or private setup material in this repository or delivery files. Use a single-key provider update and verify the target plus unchanged peers after deployment. Existing01001 sessions are invalidated; the updated app logs in again. Android installation keys and saved counts remain intact.
+
+The patch starts from deployed/main `46985c97491529311ccaa4366ab5905b2c4759fc`, with no migration diff. PR52/migration083 and the admin count-review release remain separate, unmerged and inactive. The readiness question is not a new production count-submission activation.
+
+Isolated evidence:17 backend policy/default-off/real HTTP/PostgreSQL assertions cover all3readers, exact alphanumeric rotation, old target-password/session rejection, unchanged peer credentials/sessions, proof/replay, lockout, logout, no secret audit values and unchanged stock. Additional policy boundaries reject trailing newline/whitespace and oversized input. Shipping Android JVM/exact APK tests use a synthetic password and software device proof against isolated reader/PostgreSQL. These do not register a production device or prove physical phone login.
+
+Read-only Render preflight: My Workspace, service `srv-d6c0sd0gjchc73fvup5g`; auto-deploy waits for CI and runs the existing migration predeploy command. Current live/main matched; no new migration is included. Count admission returned405 READ_ONLY, and all4dedicated `ordering.scpda_*` tables were absent. Do not merge the count branch as part of this password change.
