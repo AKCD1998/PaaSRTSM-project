@@ -5,6 +5,9 @@ const { createCustomerPreorderService } = require("../services/customerPreorders
 const { createPreorderWorkflow } = require("../services/preorderWorkflow");
 const { createPreorderReceiptEvidence } = require("../services/preorderReceiptEvidence");
 const { createPreorderTransferEvidence } = require("../services/preorderTransferEvidence");
+const { createPreorderWorkspaceMiddleware, requirePreorderCapability } = require("../services/preorderWorkspace");
+const { WORKSPACE_CONTRACT } = require("../services/preorderWorkspace");
+const { createPreorderPhysicalReceipts } = require("../services/preorderPhysicalReceipts");
 
 function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requireCsrfMiddleware, storageProvider }) {
   const router = express.Router();
@@ -13,6 +16,16 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
   const workflow = createPreorderWorkflow({ db });
   const receipts = createPreorderReceiptEvidence({ db });
   const transfers = createPreorderTransferEvidence({ db });
+  const physicalReceipts = createPreorderPhysicalReceipts({ db });
+  const requireCapability = (capability) => requirePreorderCapability(config, capability);
+  const requireAnyCapability = (...capabilities) => (req, res, next) => {
+    if (!config.featurePreorderRoleWorkspace) return next();
+    const granted = req.auth?.preorderWorkspace?.capabilities || [];
+    if (!capabilities.some((capability) => granted.includes(capability))) {
+      return res.status(403).json({ error: "Forbidden", request_id: req.requestId || null });
+    }
+    return next();
+  };
   const upload = multer({ storage: multer.memoryStorage(), limits: { files: 3, fileSize: 5 * 1024 * 1024, fields: 30 } });
   const asyncRoute = (handler) => async (req, res, next) => { try { await handler(req, res); } catch (error) { next(error); } };
   const acceptImages = (req, res, next) => upload.array("images", 3)(req, res, (error) => {
@@ -21,31 +34,57 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
     return next(Object.assign(new Error(message), { statusCode: 400 }));
   });
   router.use(requireAuthMiddleware);
-  router.get("/product-suggestions", asyncRoute(async (req, res) => res.json({ items: await service.productSuggestions(req.auth, req.query) })));
-  router.get("/unread-count", asyncRoute(async (req, res) => res.json(await service.counts(req.auth))));
-  router.get("/cases", asyncRoute(async (req, res) => res.json(await service.list(req.auth, req.query))));
-  router.post("/cases", requireCsrfMiddleware, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.body, req.files))));
-  router.get("/cases/:publicId", asyncRoute(async (req, res) => res.json(await service.get(req.auth, req.params.publicId))));
-  router.post("/cases/:publicId/read", requireCsrfMiddleware, asyncRoute(async (req, res) => res.json(await service.markRead(req.auth, req.params.publicId))));
-  router.post("/cases/:publicId/messages", requireCsrfMiddleware, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.createMessage(req.auth, req.params.publicId, req.body, req.files))));
-  const action = (path, handler) => router.post(`/cases/:publicId/${path}`, requireCsrfMiddleware, asyncRoute(async (req, res) => res.json(await handler(req.auth, req.params.publicId, req.body || {}))));
-  action("start-review", workflow.startReview); action("request-info", workflow.requestInfo); action("provide-info", workflow.provideInfo);
-  action("quotes", workflow.publishQuote); action("customer-decision", workflow.customerDecision); action("mark-ordered", workflow.markOrdered);
-  action("mark-unavailable", workflow.markUnavailable); action("confirm-branch-arrival", workflow.confirmArrival); action("customer-notified", workflow.customerNotified);
-  action("complete", workflow.complete); action("cancel", workflow.cancel); action("reopen", workflow.reopen);
-  router.post("/cases/:publicId/items/:itemId/match-sku", requireCsrfMiddleware, asyncRoute(async (req, res) => res.json(await workflow.matchSku(req.auth, req.params.publicId, req.params.itemId, req.body || {}))));
-  router.get("/cases/:publicId/items/:itemId/receipt-candidates", asyncRoute(async (req,res)=>res.json({items:await receipts.candidates(req.auth,req.params.publicId,req.params.itemId)})));
-  router.post("/cases/:publicId/items/:itemId/receipt-links",requireCsrfMiddleware,asyncRoute(async(req,res)=>res.status(201).json(await receipts.link(req.auth,req.params.publicId,req.params.itemId,req.body||{}))));
-  router.post("/cases/:publicId/receipt-links/:linkId/unlink",requireCsrfMiddleware,asyncRoute(async(req,res)=>res.json(await receipts.unlink(req.auth,req.params.publicId,req.params.linkId,req.body||{}))));
-  router.post("/cases/:publicId/eta-override",requireCsrfMiddleware,asyncRoute(async(req,res)=>res.json(await receipts.overrideEta(req.auth,req.params.publicId,req.body||{}))));
-  router.get("/cases/:publicId/items/:itemId/transfer-candidates",asyncRoute(async(req,res)=>res.json({items:await transfers.candidates(req.auth,req.params.publicId,req.params.itemId)})));
-  router.post("/cases/:publicId/items/:itemId/transfer-links",requireCsrfMiddleware,asyncRoute(async(req,res)=>res.status(201).json(await transfers.link(req.auth,req.params.publicId,req.params.itemId,req.body||{}))));
-  router.post("/cases/:publicId/transfer-links/:linkId/unlink",requireCsrfMiddleware,asyncRoute(async(req,res)=>res.json(await transfers.unlink(req.auth,req.params.publicId,req.params.linkId,req.body||{}))));
-  router.get("/attachments/:attachmentId/download-url", asyncRoute(async (req, res) => { res.set("Cache-Control", "private, no-store"); res.set("X-Content-Type-Options", "nosniff"); res.json(await service.signedUrl(req.auth, req.params.attachmentId)); }));
+  router.use(createPreorderWorkspaceMiddleware(config));
+  router.get("/workspace", asyncRoute(async (req, res) => {
+    if (!config.featurePreorderRoleWorkspace) return res.status(404).json({ error: "Not found" });
+    res.set("Cache-Control", "private, no-store");
+    const workspace = req.auth.preorderWorkspace;
+    return res.json({ contractVersion: WORKSPACE_CONTRACT, subjectUserId: workspace.subjectUserId, workRole: workspace.role, branchCode: workspace.branchCode, capabilities: workspace.capabilities });
+  }));
+  router.get("/product-suggestions", requireAnyCapability("cases.create", "catalog.match"), asyncRoute(async (req, res) => res.json({ items: await service.productSuggestions(req.auth, req.query) })));
+  router.get("/unread-count", requireAnyCapability("cases.read.branch", "cases.read.all"), asyncRoute(async (req, res) => res.json(await service.counts(req.auth))));
+  router.get("/cases", asyncRoute(async (req, res, next) => {
+    if (config.featurePreorderRoleWorkspace) {
+      const allowed = req.auth.preorderWorkspace.capabilities.includes("cases.read.all") || req.auth.preorderWorkspace.capabilities.includes("cases.read.branch");
+      if (!allowed) return res.status(403).json({ error: "Forbidden", request_id: req.requestId || null });
+    }
+    return res.json(await service.list(req.auth, req.query));
+  }));
+  router.post("/cases", requireCapability("cases.create"), requireCsrfMiddleware, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.body, req.files))));
+  router.get("/cases/:publicId", asyncRoute(async (req, res) => {
+    if (config.featurePreorderRoleWorkspace) {
+      const allowed = req.auth.preorderWorkspace.capabilities.includes("cases.read.all") || req.auth.preorderWorkspace.capabilities.includes("cases.read.branch");
+      if (!allowed) return res.status(403).json({ error: "Forbidden", request_id: req.requestId || null });
+    }
+    return res.json(await service.get(req.auth, req.params.publicId));
+  }));
+  router.post("/cases/:publicId/read", requireAnyCapability("cases.read.all", "cases.read.branch"), requireCsrfMiddleware, asyncRoute(async (req, res) => res.json(await service.markRead(req.auth, req.params.publicId))));
+  router.post("/cases/:publicId/messages", requireCapability("messages.send"), requireCsrfMiddleware, acceptImages, asyncRoute(async (req, res) => {
+    if (config.featurePreorderRoleWorkspace && req.body?.visibility === "ADMIN_INTERNAL" && !req.auth.preorderWorkspace.capabilities.includes("messages.internal")) return res.status(403).json({ error: "Forbidden", request_id: req.requestId || null });
+    return res.status(201).json(await service.createMessage(req.auth, req.params.publicId, req.body, req.files));
+  }));
+  const action = (path, capability, handler) => router.post(`/cases/:publicId/${path}`, requireCapability(capability), requireCsrfMiddleware, asyncRoute(async (req, res) => res.json(await handler(req.auth, req.params.publicId, req.body || {}))));
+  action("start-review", "commercial.review", workflow.startReview); action("request-info", "commercial.review", workflow.requestInfo); action("provide-info", "customer.info", workflow.provideInfo);
+  action("quotes", "commercial.quote", workflow.publishQuote); action("customer-decision", "customer.decision", workflow.customerDecision); action("mark-ordered", "commercial.order", workflow.markOrdered);
+  action("mark-unavailable", "commercial.unavailable", workflow.markUnavailable); action("confirm-branch-arrival", "branch.arrival", workflow.confirmArrival); action("customer-notified", "customer.notify", workflow.customerNotified);
+  action("complete", "customer.complete", workflow.complete); action("cancel", "cases.cancel", workflow.cancel); action("reopen", "commercial.reopen", workflow.reopen);
+  router.post("/cases/:publicId/items/:itemId/match-sku", requireCapability("catalog.match"), requireCsrfMiddleware, asyncRoute(async (req, res) => res.json(await workflow.matchSku(req.auth, req.params.publicId, req.params.itemId, req.body || {}))));
+  router.get("/cases/:publicId/items/:itemId/receipt-candidates", requireCapability("receipts.link"), asyncRoute(async (req,res)=>{
+    const items = await receipts.candidates(req.auth,req.params.publicId,req.params.itemId);
+    return res.json({items:await physicalReceipts.decorateCandidates(req.auth,items)});
+  }));
+  router.post("/cases/:publicId/items/:itemId/receipt-verifications", requireCapability("receipts.physical.record"), requireCsrfMiddleware, asyncRoute(async (req,res)=>res.status(201).json(await physicalReceipts.record(req.auth,req.params.publicId,req.params.itemId,req.body||{}))));
+  router.post("/cases/:publicId/items/:itemId/receipt-links",requireCapability("receipts.link"),requireCsrfMiddleware,asyncRoute(async(req,res)=>res.status(201).json(await receipts.link(req.auth,req.params.publicId,req.params.itemId,req.body||{}))));
+  router.post("/cases/:publicId/receipt-links/:linkId/unlink",requireCapability("receipts.link"),requireCsrfMiddleware,asyncRoute(async(req,res)=>res.json(await receipts.unlink(req.auth,req.params.publicId,req.params.linkId,req.body||{}))));
+  router.post("/cases/:publicId/eta-override",requireCapability("eta.override"),requireCsrfMiddleware,asyncRoute(async(req,res)=>res.json(await receipts.overrideEta(req.auth,req.params.publicId,req.body||{}))));
+  router.get("/cases/:publicId/items/:itemId/transfer-candidates",requireCapability("transfers.link"),asyncRoute(async(req,res)=>res.json({items:await transfers.candidates(req.auth,req.params.publicId,req.params.itemId)})));
+  router.post("/cases/:publicId/items/:itemId/transfer-links",requireCapability("transfers.link"),requireCsrfMiddleware,asyncRoute(async(req,res)=>res.status(201).json(await transfers.link(req.auth,req.params.publicId,req.params.itemId,req.body||{}))));
+  router.post("/cases/:publicId/transfer-links/:linkId/unlink",requireCapability("transfers.link"),requireCsrfMiddleware,asyncRoute(async(req,res)=>res.json(await transfers.unlink(req.auth,req.params.publicId,req.params.linkId,req.body||{}))));
+  router.get("/attachments/:attachmentId/download-url", requireAnyCapability("cases.read.all", "cases.read.branch"), asyncRoute(async (req, res) => { res.set("Cache-Control", "private, no-store"); res.set("X-Content-Type-Options", "nosniff"); res.json(await service.signedUrl(req.auth, req.params.attachmentId)); }));
   // Compatibility aliases for the initial flagged UI. Canonical paths are /cases and /attachments/:id/download-url.
-  router.get("/", asyncRoute(async (req, res) => res.json(await service.list(req.auth, req.query))));
-  router.post("/", requireCsrfMiddleware, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.body, req.files))));
-  router.get("/:publicId/attachments/:attachmentId/url", asyncRoute(async (req, res) => res.json(await service.signedUrl(req.auth, req.params.attachmentId))));
+  router.get("/", requireAnyCapability("cases.read.all", "cases.read.branch"), asyncRoute(async (req, res) => res.json(await service.list(req.auth, req.query))));
+  router.post("/", requireCapability("cases.create"), requireCsrfMiddleware, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.body, req.files))));
+  router.get("/:publicId/attachments/:attachmentId/url", requireAnyCapability("cases.read.all", "cases.read.branch"), asyncRoute(async (req, res) => res.json(await service.signedUrl(req.auth, req.params.attachmentId))));
   return router;
 }
 module.exports = { createCustomerPreordersRouter };

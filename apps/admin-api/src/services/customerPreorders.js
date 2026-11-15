@@ -12,7 +12,12 @@ function httpError(statusCode, message) { return Object.assign(new Error(message
 function normalizePhone(value) { return String(value || "").replace(/\D/g, ""); }
 function maskPhone(value) { const phone = normalizePhone(value); return phone.length <= 4 ? "••••" : `${phone.slice(0, 3)}••••${phone.slice(-4)}`; }
 function maskName(value) { const name = String(value || "").trim(); return name ? `${name.slice(0, 1)}${"•".repeat(Math.min(6, Math.max(2, name.length - 1)))}` : "-"; }
+function workspaceRole(auth) { return auth?.preorderWorkspace?.role || null; }
+function systemRole(auth) { return workspaceRole(auth) === "branch" ? "staff" : auth?.role; }
 function actorScope(auth) {
+  const workRole = workspaceRole(auth);
+  if (workRole === "purchasing" || workRole === "fulfillment") return { branchCode: null };
+  if (workRole === "branch") return { branchCode: auth.preorderWorkspace.branchCode };
   if (auth?.role === "admin") return { branchCode: null };
   if (auth?.role !== "staff" || !auth.effectiveBranchCode) throw httpError(403, "Forbidden");
   return { branchCode: auth.effectiveBranchCode };
@@ -79,23 +84,28 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
   }
 
   function buildCaseWhere(auth, filters = {}) {
-    const scope = actorScope(auth); const params = []; const clauses = ["TRUE", "NOT EXISTS (SELECT 1 FROM customer_relations.preorder_attachments pending_attachment WHERE pending_attachment.case_id=c.case_id AND pending_attachment.message_id IS NULL AND pending_attachment.upload_state<>'ready')"];
+    const scope = actorScope(auth); const workRole = workspaceRole(auth); const allCases = workRole === "purchasing" || workRole === "fulfillment" || (!workRole && auth.role === "admin"); const params = []; const clauses = ["TRUE", "NOT EXISTS (SELECT 1 FROM customer_relations.preorder_attachments pending_attachment WHERE pending_attachment.case_id=c.case_id AND pending_attachment.message_id IS NULL AND pending_attachment.upload_state<>'ready')"];
     const add = (sql, value) => { params.push(value); clauses.push(sql.replace("?", `$${params.length}`)); };
     if (scope.branchCode) add("c.branch_code=?", scope.branchCode);
     else if (/^\d{3}$/.test(String(filters.branch || ""))) add("c.branch_code=?", String(filters.branch));
     if (VALID_STATUSES.has(filters.status)) add("c.status=?", filters.status);
     if (VALID_INTENTS.has(filters.intent)) add("c.intent=?", filters.intent);
     if (String(filters.actionable).toLowerCase() === "true") {
-      params.push(auth.role === "admin" ? ADMIN_ACTIONABLE : STAFF_ACTIONABLE);
+      params.push(workRole === "fulfillment" ? ["ORDERED", "RECEIVED_AT_HQ"] : allCases ? ADMIN_ACTIONABLE : STAFF_ACTIONABLE);
       clauses.push(`c.status=ANY($${params.length}::text[])`);
     }
-    if (auth.role === "admin" && String(filters.actionable).toLowerCase() === "stuck") {
+    if (allCases && workRole !== "fulfillment" && String(filters.actionable).toLowerCase() === "stuck") {
       clauses.push("c.status IN ('SUBMITTED','IN_REVIEW','PROCUREMENT_PENDING','ORDERED','RECEIVED_AT_HQ','IN_TRANSIT_TO_BRANCH') AND c.last_activity_at<now()-interval '48 hours'");
     }
     const search = String(filters.search || "").trim().slice(0, 100);
     if (search) {
-      params.push(`%${search}%`, `%${normalizePhone(search)}%`);
-      clauses.push(`(c.public_id ILIKE $${params.length - 1} OR c.customer_name ILIKE $${params.length - 1} OR c.customer_phone_normalized LIKE $${params.length})`);
+      if (workRole === "fulfillment") {
+        params.push(`%${search}%`);
+        clauses.push(`(c.public_id ILIKE $${params.length - 1} OR EXISTS (SELECT 1 FROM customer_relations.preorder_items si WHERE si.case_id=c.case_id AND (COALESCE(si.display_name_snapshot,si.original_description,'') ILIKE $${params.length - 1} OR COALESCE(si.product_code_snapshot,'') ILIKE $${params.length - 1})))`);
+      } else {
+        params.push(`%${search}%`, `%${normalizePhone(search)}%`);
+        clauses.push(`(c.public_id ILIKE $${params.length - 1} OR c.customer_name ILIKE $${params.length - 1} OR c.customer_phone_normalized LIKE $${params.length})`);
+      }
     }
     return { where: clauses.join(" AND "), params };
   }
@@ -126,22 +136,40 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
 
   async function get(auth, publicId) {
     const row = await findAuthorizedCase(auth, publicId);
+    const workRole = workspaceRole(auth);
+    const fulfillmentView = workRole === "fulfillment";
+    const canViewInternal = workRole ? workRole === "purchasing" : auth.role === "admin";
     const [items, attachments, messages, quotes, decisions, procurement, evidence, eta, timeline] = await Promise.all([
-      db.query("SELECT * FROM customer_relations.preorder_items WHERE case_id=$1 ORDER BY position", [row.case_id]),
+      db.query(`SELECT item_id,position,item_kind,sku_id,product_code_snapshot,display_name_snapshot,generic_name_snapshot,barcode_snapshot,unit_snapshot,original_description,requested_qty,confirmed_qty,matched_sku_id,matched_at FROM customer_relations.preorder_items WHERE case_id=$1 ORDER BY position`, [row.case_id]),
       db.query("SELECT attachment_public_id,mime_type,size_bytes,sha256,upload_state,created_at FROM customer_relations.preorder_attachments WHERE case_id=$1 AND upload_state='ready' ORDER BY attachment_id", [row.case_id]),
-      db.query(`SELECT * FROM customer_relations.preorder_messages WHERE case_id=$1 AND is_ready=TRUE ${auth.role === "admin" ? "" : "AND visibility='PUBLIC'"} ORDER BY activity_seq`, [row.case_id]),
-      db.query(`SELECT q.quote_id,q.case_id,q.quote_version,q.valid_until,q.public_note,${auth.role === "admin" ? "q.admin_internal_note," : ""}q.published_by,q.published_at,q.supersedes_quote_id,COALESCE(lines.lines,'[]'::jsonb) AS lines FROM customer_relations.preorder_quotes q LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('quoteLineId',l.quote_line_id,'itemId',l.item_id,'offeredQty',l.offered_qty,'unitPrice',l.unit_price,'unit',l.unit) ORDER BY l.quote_line_id) lines FROM customer_relations.preorder_quote_lines l WHERE l.quote_id=q.quote_id) lines ON TRUE WHERE q.case_id=$1 ORDER BY q.quote_version`, [row.case_id]),
+      db.query(`SELECT * FROM customer_relations.preorder_messages WHERE case_id=$1 AND is_ready=TRUE ${canViewInternal ? "" : "AND visibility='PUBLIC'"} ORDER BY activity_seq`, [row.case_id]),
+      db.query(`SELECT q.quote_id,q.case_id,q.quote_version,q.valid_until,q.public_note,${canViewInternal ? "q.admin_internal_note," : ""}q.published_by,q.published_at,q.supersedes_quote_id,COALESCE(lines.lines,'[]'::jsonb) AS lines FROM customer_relations.preorder_quotes q LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('quoteLineId',l.quote_line_id,'itemId',l.item_id,'offeredQty',l.offered_qty,'unitPrice',l.unit_price,'unit',l.unit) ORDER BY l.quote_line_id) lines FROM customer_relations.preorder_quote_lines l WHERE l.quote_id=q.quote_id) lines ON TRUE WHERE q.case_id=$1 ORDER BY q.quote_version`, [row.case_id]),
       db.query("SELECT d.*,COALESCE(lines.lines,'[]'::jsonb) AS lines FROM customer_relations.preorder_customer_decisions d LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('itemId',l.item_id,'finalQty',l.final_qty) ORDER BY l.decision_line_id) lines FROM customer_relations.preorder_decision_lines l WHERE l.decision_id=d.decision_id) lines ON TRUE WHERE d.case_id=$1 ORDER BY d.created_at", [row.case_id]),
-      db.query(`SELECT outcome_id,outcome_type,supplier_reference,public_note,${auth.role === "admin" ? "admin_internal_note," : ""}reason_code,recorded_by,created_at FROM customer_relations.preorder_procurement_outcomes WHERE case_id=$1 ORDER BY created_at`, [row.case_id]),
-      db.query(`SELECT evidence_link_id,item_id,evidence_type,allocated_qty,unit,source_synced_at,linked_at,source_allocated_qty,source_unit,target_unit,${auth.role === "admin" ? "allocation_note,source_key,snapshot_json" : "jsonb_build_object('docDate',snapshot_json->>'docDate','productCode',snapshot_json->>'productCode','sourceUnit',snapshot_json->>'sourceUnit','phase',snapshot_json->>'phase','sourceMatchStatus',snapshot_json->>'sourceMatchStatus','inboundProcessState',snapshot_json->>'inboundProcessState') snapshot_json"} FROM customer_relations.preorder_evidence_links WHERE case_id=$1 AND unlinked_at IS NULL ORDER BY linked_at`, [row.case_id]),
-      db.query("SELECT * FROM customer_relations.preorder_eta_projections WHERE case_id=$1 ORDER BY version DESC LIMIT 1", [row.case_id]),
-      db.query("SELECT * FROM customer_relations.preorder_events WHERE case_id=$1 ORDER BY activity_seq", [row.case_id]),
+      db.query(`SELECT outcome_id,outcome_type,supplier_reference,public_note,${canViewInternal ? "admin_internal_note," : ""}reason_code,recorded_by,created_at FROM customer_relations.preorder_procurement_outcomes WHERE case_id=$1 ORDER BY created_at`, [row.case_id]),
+      db.query(`SELECT evidence_link_id,item_id,evidence_type,allocated_qty,unit,source_synced_at,linked_at,source_allocated_qty,source_unit,target_unit,${canViewInternal ? "allocation_note,source_key,snapshot_json" : "jsonb_build_object('docDate',snapshot_json->>'docDate','productCode',snapshot_json->>'productCode','sourceUnit',snapshot_json->>'sourceUnit','phase',snapshot_json->>'phase','sourceMatchStatus',snapshot_json->>'sourceMatchStatus','inboundProcessState',snapshot_json->>'inboundProcessState') snapshot_json"} FROM customer_relations.preorder_evidence_links WHERE case_id=$1 AND unlinked_at IS NULL ORDER BY linked_at`, [row.case_id]),
+      db.query("SELECT version,estimated_date,basis,source_evidence_date,is_override,override_reason,calculated_at FROM customer_relations.preorder_eta_projections WHERE case_id=$1 ORDER BY version DESC LIMIT 1", [row.case_id]),
+      db.query(`SELECT ${fulfillmentView ? "event_id,activity_seq,event_type,actor_role,from_status,to_status,created_at,payload_json" : "*"} FROM customer_relations.preorder_events WHERE case_id=$1 ORDER BY activity_seq`, [row.case_id]),
     ]);
     const activity = [
       ...timeline.rows.map((event) => ({ ...event, activityKind: "EVENT" })),
       ...messages.rows.map((message) => ({ ...message, activityKind: "MESSAGE" })),
     ].sort((a, b) => Number(a.activity_seq) - Number(b.activity_seq));
-    return { ...row, items: items.rows, attachments: attachments.rows, messages: messages.rows, quotes: quotes.rows, decisions: decisions.rows, procurementOutcomes: procurement.rows, evidence: evidence.rows, eta: eta.rows[0] || null, timeline: activity };
+    const safeRow = fulfillmentView
+      ? Object.fromEntries(["public_id", "branch_code", "intent", "status", "last_activity_at", "version", "created_at", "updated_at"].map((key) => [key, row[key]]))
+      : { ...row };
+    const safeMessages = fulfillmentView ? [] : messages.rows;
+    const safeQuotes = fulfillmentView ? [] : quotes.rows;
+    const safeDecisions = fulfillmentView ? [] : decisions.rows;
+    const safeProcurement = fulfillmentView
+      ? procurement.rows.map(({ outcome_id, outcome_type, supplier_reference, reason_code, created_at }) => ({ outcome_id, outcome_type, supplier_reference, reason_code, created_at }))
+      : procurement.rows;
+    const safeTimeline = fulfillmentView
+      ? timeline.rows.map(({ event_id, activity_seq, event_type, actor_role, from_status, to_status, created_at, payload_json }) => ({
+        event_id, activity_seq, event_type, actor_role, from_status, to_status, created_at, activityKind: "EVENT",
+        ...(event_type === "HQ_PHYSICAL_RECEIPT_COUNTED" ? { payload_json: { quantity: Number(payload_json?.quantity), unit: String(payload_json?.unit || ""), observedAt: payload_json?.observedAt || null } } : {}),
+      }))
+      : activity;
+    return { ...safeRow, items: items.rows, attachments: attachments.rows, messages: safeMessages, quotes: safeQuotes, decisions: safeDecisions, procurementOutcomes: safeProcurement, evidence: evidence.rows, eta: eta.rows[0] || null, timeline: safeTimeline };
   }
 
   async function markRead(auth, publicId) {
@@ -162,9 +190,10 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
   }
 
   async function counts(auth) {
-    const scope = actorScope(auth); const params = [auth.userId, auth.role === "admin" ? ADMIN_ACTIONABLE : STAFF_ACTIONABLE]; let scopeSql = "";
+    const scope = actorScope(auth); const workRole = workspaceRole(auth); const params = [auth.userId, workRole === "fulfillment" ? ["ORDERED", "RECEIVED_AT_HQ"] : (workRole === "purchasing" || (!workRole && auth.role === "admin")) ? ADMIN_ACTIONABLE : STAFF_ACTIONABLE]; let scopeSql = "";
     if (scope.branchCode) { params.push(scope.branchCode); scopeSql = `AND c.branch_code=$${params.length}`; }
-    const result = await db.query(`SELECT COUNT(*) FILTER (WHERE GREATEST(COALESCE(ev.max_seq,0),COALESCE(msg.max_seq,0))>COALESCE(rc.last_read_activity_seq,0))::int AS unread_count,COUNT(*) FILTER (WHERE c.status=ANY($2::text[]))::int AS actionable_count FROM customer_relations.preorder_cases c LEFT JOIN customer_relations.preorder_read_cursors rc ON rc.case_id=c.case_id AND rc.user_id=$1 LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_events WHERE case_id=c.case_id) ev ON TRUE LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_messages WHERE case_id=c.case_id AND is_ready=TRUE ${auth.role === "admin" ? "" : "AND visibility='PUBLIC'"}) msg ON TRUE WHERE NOT EXISTS (SELECT 1 FROM customer_relations.preorder_attachments pending_attachment WHERE pending_attachment.case_id=c.case_id AND pending_attachment.message_id IS NULL AND pending_attachment.upload_state<>'ready') ${scopeSql}`, params);
+    const messageVisibility = workRole === "fulfillment" ? "AND FALSE" : (workRole === "purchasing" || (!workRole && auth.role === "admin")) ? "" : "AND visibility='PUBLIC'";
+    const result = await db.query(`SELECT COUNT(*) FILTER (WHERE GREATEST(COALESCE(ev.max_seq,0),COALESCE(msg.max_seq,0))>COALESCE(rc.last_read_activity_seq,0))::int AS unread_count,COUNT(*) FILTER (WHERE c.status=ANY($2::text[]))::int AS actionable_count FROM customer_relations.preorder_cases c LEFT JOIN customer_relations.preorder_read_cursors rc ON rc.case_id=c.case_id AND rc.user_id=$1 LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_events WHERE case_id=c.case_id) ev ON TRUE LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_messages WHERE case_id=c.case_id AND is_ready=TRUE ${messageVisibility}) msg ON TRUE WHERE NOT EXISTS (SELECT 1 FROM customer_relations.preorder_attachments pending_attachment WHERE pending_attachment.case_id=c.case_id AND pending_attachment.message_id IS NULL AND pending_attachment.upload_state<>'ready') ${scopeSql}`, params);
     return { unreadCount: result.rows[0]?.unread_count || 0, actionableCount: result.rows[0]?.actionable_count || 0 };
   }
 
@@ -232,7 +261,7 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
     if (!idempotency) throw httpError(400, "idempotencyKey is required");
     if (!text || text.length > 4000) throw httpError(400, "ข้อความต้องมีความยาว 1–4,000 ตัวอักษร");
     const visibility = body.visibility === "ADMIN_INTERNAL" ? "ADMIN_INTERNAL" : "PUBLIC";
-    if (visibility === "ADMIN_INTERNAL" && auth.role !== "admin") throw httpError(403, "Forbidden");
+    if (visibility === "ADMIN_INTERNAL" && (workspaceRole(auth) ? workspaceRole(auth) !== "purchasing" : auth.role !== "admin")) throw httpError(403, "Forbidden");
     const client = await db.connect(); const objects = []; let caseRow; let messageRow;
     try {
       await client.query("BEGIN"); caseRow = await findAuthorizedCase(auth, publicId, client, { forUpdate: true, includePending: true });
@@ -252,7 +281,7 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
       const count = await client.query("SELECT COUNT(*)::int AS count FROM customer_relations.preorder_attachments WHERE case_id=$1 AND upload_state<>'deleted'", [caseRow.case_id]);
       if (Number(count.rows[0]?.count || 0) + images.length > 3) throw httpError(400, "แนบรูปได้ไม่เกิน 3 รูปต่อเคส");
       const seq = await client.query("SELECT GREATEST(COALESCE((SELECT MAX(activity_seq) FROM customer_relations.preorder_events WHERE case_id=$1),0),COALESCE((SELECT MAX(activity_seq) FROM customer_relations.preorder_messages WHERE case_id=$1),0))+1 AS seq", [caseRow.case_id]);
-      const inserted = await client.query("INSERT INTO customer_relations.preorder_messages(case_id,visibility,body,author_user_id,author_role,author_branch_code,activity_seq,idempotency_key,is_ready) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING message_id,case_id,is_ready", [caseRow.case_id, visibility, text, auth.userId, auth.role, auth.effectiveBranchCode || null, Number(seq.rows[0]?.seq || 1), idempotency, images.length === 0]);
+      const inserted = await client.query("INSERT INTO customer_relations.preorder_messages(case_id,visibility,body,author_user_id,author_role,author_branch_code,activity_seq,idempotency_key,is_ready) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING message_id,case_id,is_ready", [caseRow.case_id, visibility, text, auth.userId, systemRole(auth), auth.effectiveBranchCode || null, Number(seq.rows[0]?.seq || 1), idempotency, images.length === 0]);
       messageRow = inserted.rows[0];
       for (const image of images) {
         const attachmentPublicId = crypto.randomUUID(); const key = createObjectKey({ environment: config.nodeEnv, branchCode: caseRow.branch_code, casePublicId: caseRow.public_id, attachmentPublicId, ext: image.detected.ext });
@@ -293,4 +322,4 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
   return { productSuggestions, list, get, markRead, counts, create, createMessage, signedUrl, buildCaseWhere };
 }
 
-module.exports = { ADMIN_ACTIONABLE, STAFF_ACTIONABLE, createCustomerPreorderService, normalizePhone, maskPhone, maskName, actorScope, normalizeSuggestionQuery, parseCreateBody };
+module.exports = { ADMIN_ACTIONABLE, STAFF_ACTIONABLE, createCustomerPreorderService, normalizePhone, maskPhone, maskName, actorScope, workspaceRole, systemRole, normalizeSuggestionQuery, parseCreateBody };
