@@ -1758,31 +1758,41 @@ async function upsertApprovedReceiptRecord(client, body, branchCode, record) {
 //     approved-receipts admin list reads and displays `source_synced_at`
 //     per row, but nothing in that reader (or elsewhere) compares rows'
 //     timestamps against each other or depends on their relative sequence.
-// The existing AdaAcc sync is read-only against AdaPOS. Once approved HQ
-// receipt lines reach the central Postgres projection, create one idempotent
-// preorder activity per matching open order item. This is an HQ work cue:
-// it does not mark stock physically counted or tell the branch the goods are
-// ready. Those actions still require the fulfillment workspace.
-async function notifyPreorderReceiptsAtHq(client, branchCode, records) {
+// The existing AdaAcc sync is read-only against AdaPOS. Pending and approved
+// HQ receipt lines create separate idempotent preorder activities for matching
+// open order items. Both are HQ work cues, never physical counts or branch
+// delivery claims; FIFO allocation remains in the fulfillment workspace.
+async function notifyPreorderReceiptRowsAtHq(client, branchCode, rows, receiptPhase) {
   const normalizedBranch = normalizeBranchCode(branchCode);
-  if (!normalizedBranch || !Array.isArray(records) || records.length === 0) return 0;
+  if (!normalizedBranch || !Array.isArray(rows) || rows.length === 0) return 0;
   const branch = await client.query(
     "SELECT is_hq FROM core.branches WHERE branch_code=$1",
     [normalizedBranch],
   );
   if (branch.rows[0]?.is_hq !== true) return 0;
 
+  const pending = receiptPhase === "PENDING_APPROVAL";
+  const eventType = pending ? "HQ_RECEIPT_PENDING_SYNCED" : "HQ_RECEIPT_SYNCED";
   let notified = 0;
-  for (const record of records) {
-    const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
-    if (!docNo) continue;
-    for (const line of record.lines || []) {
-      const seqNo = Number(pick(line, ["FNXidSeqNo", "seqNo"], 0));
-      const productCode = normalizeNullableText(pick(line, ["FTPdtCode", "productCode"]));
-      if (!Number.isInteger(seqNo) || seqNo <= 0 || !productCode) continue;
-      const sourceKey = `${normalizedBranch}|${docNo}|${seqNo}`;
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [sourceKey]);
-      const matches = await client.query(
+  for (const row of rows) {
+    const docNo = normalizeNullableText(row.docNo);
+    const seqNo = Number(row.seqNo);
+    const productCode = normalizeNullableText(row.productCode);
+    if (!docNo || !Number.isInteger(seqNo) || seqNo <= 0 || !productCode) continue;
+    const sourceKey = `${normalizedBranch}|${docNo}|${seqNo}`;
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [sourceKey]);
+
+    // The approved payload supersedes a stale pending poll. If approval is
+    // already visible, do not create a pending event after that transition.
+    if (pending) {
+      const approved = await client.query(
+        "SELECT 1 FROM ada.approved_receipt_headers WHERE branch_code=$1 AND doc_no=$2 LIMIT 1",
+        [normalizedBranch, docNo],
+      );
+      if (approved.rows[0]) continue;
+    }
+
+    const matches = await client.query(
         `SELECT c.case_id,c.branch_code,c.status,i.item_id,i.position,
                 COALESCE(i.product_code_snapshot,s.company_code) AS product_code,
                 COALESCE(i.display_name_snapshot,i.original_description,s.display_name,'สินค้า') AS display_name,
@@ -1799,21 +1809,21 @@ async function notifyPreorderReceiptsAtHq(client, branchCode, records) {
            AND GREATEST(0,COALESCE(i.confirmed_qty,i.requested_qty)-COALESCE(allocated.qty,0))>0
            AND NOT EXISTS (
              SELECT 1 FROM customer_relations.preorder_events e
-             WHERE e.case_id=c.case_id AND e.event_type='HQ_RECEIPT_SYNCED'
+             WHERE e.case_id=c.case_id AND e.event_type=$3
                AND e.payload_json->>'sourceKey'=$2 AND e.payload_json->>'itemId'=i.item_id::text
            )
          ORDER BY c.created_at ASC,c.case_id ASC,i.position ASC
          FOR UPDATE OF c`,
-        [productCode, sourceKey],
-      );
+      [productCode, sourceKey, eventType],
+    );
 
-      for (const match of matches.rows) {
-        const seq = await client.query(
+    for (const match of matches.rows) {
+      const seq = await client.query(
           "SELECT GREATEST(COALESCE((SELECT MAX(activity_seq) FROM customer_relations.preorder_events WHERE case_id=$1),0),COALESCE((SELECT MAX(activity_seq) FROM customer_relations.preorder_messages WHERE case_id=$1),0))+1 AS seq",
           [match.case_id],
         );
-        const activitySeq = Number(seq.rows[0]?.seq || 1);
-        const payload = {
+      const activitySeq = Number(seq.rows[0]?.seq || 1);
+      const payload = {
           sourceKey,
           docNo,
           lineSeq: seqNo,
@@ -1821,26 +1831,61 @@ async function notifyPreorderReceiptsAtHq(client, branchCode, records) {
           itemId: Number(match.item_id),
           displayName: match.display_name,
           remainingQty: Number(match.remaining_qty),
+          receiptPhase,
+          receiptProductName: normalizeNullableText(row.productName),
+          receiptQuantity: row.quantity == null ? null : Number(row.quantity),
+          receiptUnit: normalizeNullableText(row.unitCode || row.unitName),
           priorityAt: "case_created_at_ascending",
-        };
-        await client.query(
+      };
+      await client.query(
           "UPDATE customer_relations.preorder_cases SET version=version+1,last_activity_at=now(),updated_at=now() WHERE case_id=$1",
           [match.case_id],
-        );
-        await client.query(
+      );
+      await client.query(
           `INSERT INTO customer_relations.preorder_events(case_id,activity_seq,event_type,actor_role,from_status,to_status,payload_json)
-           VALUES($1,$2,'HQ_RECEIPT_SYNCED','ada_sync',$3,$3,$4::jsonb)`,
-          [match.case_id, activitySeq, match.status, JSON.stringify(payload)],
-        );
-        await client.query(
-          "INSERT INTO customer_relations.preorder_notifications(case_id,recipient_role,activity_seq,notification_type) VALUES($1,'admin',$2,'HQ_RECEIPT_SYNCED') ON CONFLICT(case_id,recipient_role,activity_seq) DO NOTHING",
-          [match.case_id, activitySeq],
-        );
-        notified += 1;
-      }
+           VALUES($1,$2,$3,'ada_sync',$4,$4,$5::jsonb)`,
+          [match.case_id, activitySeq, eventType, match.status, JSON.stringify(payload)],
+      );
+      await client.query(
+          "INSERT INTO customer_relations.preorder_notifications(case_id,recipient_role,activity_seq,notification_type) VALUES($1,'admin',$2,$3) ON CONFLICT(case_id,recipient_role,activity_seq) DO NOTHING",
+          [match.case_id, activitySeq, eventType],
+      );
+      notified += 1;
     }
   }
   return notified;
+}
+
+async function notifyPreorderPendingReceiptsAtHq(client, branchCode, lines) {
+  const rows = (lines || []).map((line) => ({
+    docNo: pick(line, ["FTXihDocNo", "docNo"]),
+    seqNo: pick(line, ["FNXidSeqNo", "seqNo"], 0),
+    productCode: pick(line, ["FTPdtCode", "productCode"]),
+    productName: pick(line, ["FTPdtName", "productName"]),
+    quantity: pick(line, ["FCXidQty", "qty"]),
+    unitCode: pick(line, ["FTPunCode", "unitCode"]),
+    unitName: pick(line, ["FTXidUnitName", "unitName"]),
+  }));
+  return notifyPreorderReceiptRowsAtHq(client, branchCode, rows, "PENDING_APPROVAL");
+}
+
+async function notifyPreorderReceiptsAtHq(client, branchCode, records) {
+  const rows = [];
+  for (const record of records || []) {
+    const docNo = pick(record, ["FTXihDocNo", "docNo"]);
+    for (const line of record.lines || []) {
+      rows.push({
+        docNo,
+        seqNo: pick(line, ["FNXidSeqNo", "seqNo"], 0),
+        productCode: pick(line, ["FTPdtCode", "productCode"]),
+        productName: pick(line, ["FTPdtName", "productName"]),
+        quantity: pick(line, ["FCXidQty", "qty"]),
+        unitCode: pick(line, ["FTPunCode", "unitCode"]),
+        unitName: pick(line, ["FTXidUnitName", "unitName"]),
+      });
+    }
+  }
+  return notifyPreorderReceiptRowsAtHq(client, branchCode, rows, "APPROVED");
 }
 
 async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
@@ -2884,6 +2929,7 @@ function createAdaSyncRouter(deps) {
     try {
       await client.query("BEGIN");
       const result = await replacePendingReceipts(client, req.body, headers, lines);
+      await notifyPreorderPendingReceiptsAtHq(client, result.branchCode, lines);
       await client.query("COMMIT");
       return res.json({
         headersAccepted: result.headersAccepted,
