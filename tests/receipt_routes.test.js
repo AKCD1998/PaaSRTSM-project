@@ -63,6 +63,10 @@ function createReceiptMockDb() {
         return { rowCount: 1, rows: [{}] };
       }
 
+      if (normalized.startsWith("select c.case_id,c.branch_code,c.status,i.item_id,i.position")) {
+        return { rowCount: 0, rows: [] };
+      }
+
       if (normalized.startsWith("insert into public.audit_logs")) {
         return {
           rowCount: 1,
