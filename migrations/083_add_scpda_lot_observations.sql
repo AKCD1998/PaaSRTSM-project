@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS ordering.scpda_observations (
 CREATE UNIQUE INDEX IF NOT EXISTS scpda_one_successor ON ordering.scpda_observations(correction_of) WHERE correction_of IS NOT NULL;
 CREATE INDEX IF NOT EXISTS scpda_observation_product ON ordering.scpda_observations(branch_code,product_code,observed_at DESC,received_at DESC,event_id);
 CREATE INDEX IF NOT EXISTS scpda_observation_actor ON ordering.scpda_observations(branch_code,operator_code,received_at DESC,event_id);
+CREATE INDEX IF NOT EXISTS scpda_observation_product_received ON ordering.scpda_observations(branch_code,product_code,received_at DESC,event_id DESC);
 CREATE TABLE IF NOT EXISTS ordering.scpda_lot_observations (
  event_id uuid NOT NULL REFERENCES ordering.scpda_observations(event_id),
  ordinal integer NOT NULL CHECK(ordinal>=0),

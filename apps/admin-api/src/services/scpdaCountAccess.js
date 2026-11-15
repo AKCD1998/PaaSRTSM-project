@@ -5,6 +5,7 @@ const {CountError}=require('./scpdaObservationLedger');
 const fail=(s,c,m)=>{throw new CountError(s,c,m);};
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 function createCountAccess({config,db,now=Date.now}){
+ const admitted=new Set(String(config.scpdaCountOperators001||'').split(',').map(x=>x.trim()).filter(Boolean));
  let settings=null;if(config.featureScpdaRead001&&config.featureScpdaCounts001)try{settings=parseConfig(config);}catch{}
  const challenges=new Map(),bursts=new Map();
  const countKey=()=>crypto.createHmac('sha256',config.authJwtSecret).update('scpda:count-session-v1').digest('base64url');
@@ -13,6 +14,7 @@ function createCountAccess({config,db,now=Date.now}){
  function bearer(req){const b=String(req.headers.authorization||'').match(/^Bearer ([A-Za-z0-9_.-]{1,8192})$/)?.[1];if(!b)fail(401,'LOGIN_REQUIRED','เข้าสู่ระบบอีกครั้ง');return b;}
  async function verify(req,kind){enabled();let p;try{p=jwt.verify(bearer(req),kind==='reader'?settings.sessionKey:countKey(),{algorithms:['HS256'],issuer:'sc-stockday',audience:kind==='reader'?'scpda-read-001':'scpda-count-001',clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'COUNT_ACCESS_REQUIRED','เข้าสู่ระบบรับสิทธิ์นับอีกครั้ง');}
   const op=settings.operators.get(p.sub),parent=kind==='reader'?p.jti:p.parent_jti;if(!op||p.kind!==(kind==='reader'?'scpda-reader':'scpda-counter')||p.role!==(kind==='reader'?'reader':'counter')||p.branch_code!=='001'||p.cv!==op.fingerprint||!UUID.test(p.jti||'')||!UUID.test(parent||'')||!/^[a-f0-9]{64}$/.test(p.device_ref||'')||settings.revoked.has(p.device_ref))fail(401,'COUNT_ACCESS_REQUIRED','สิทธิ์นับไม่ตรงกับบัญชี');
+  if(!admitted.has(p.sub))fail(403,'COUNT_OPERATOR_NOT_ADMITTED','บัญชีนี้ยังไม่เปิดส่งผลนับ');
   if((await db.query("SELECT 1 FROM public.audit_logs WHERE action='scpda.logout' AND target_type='scpda_session' AND target_id=$1 AND success=TRUE LIMIT 1",[parent])).rows.length)fail(401,'SESSION_ENDED','ออกจากระบบแล้ว');return {operatorCode:p.sub,branchCode:'001',deviceRef:p.device_ref,parentSessionId:parent,claims:p};
  }
  function device(raw,who){let d;try{d=jwt.verify(raw,settings.deviceKey,{algorithms:['HS256'],issuer:'sc-stockday',audience:'scpda-device-001',clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'DEVICE_CERT_INVALID','เชื่อมเครื่องอีกครั้ง');}if(d.kind!=='scpda-device'||d.branch_code!=='001'||d.device_ref!==who.deviceRef||crypto.createHash('sha256').update(Buffer.from(d.public_key||'','base64')).digest('hex')!==who.deviceRef)fail(401,'DEVICE_PROOF_INVALID','เครื่องไม่ตรงกับบัญชี');let key;try{key=crypto.createPublicKey({key:Buffer.from(d.public_key,'base64'),format:'der',type:'spki'});if(key.asymmetricKeyType!=='ec'||key.asymmetricKeyDetails?.namedCurve!=='prime256v1')throw Error();}catch{fail(401,'DEVICE_PROOF_INVALID','กุญแจเครื่องไม่ถูกต้อง');}return {claims:d,key};}

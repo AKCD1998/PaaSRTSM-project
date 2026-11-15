@@ -34,7 +34,7 @@ coverage was explicitly seeded only for the late-lot case; real Ada movement
 coverage is still unverified. Current-main backend 38 checks, admin45 and build
 also passed. No production count write or physical-phone acceptance is claimed.
 
-Activation now needs the previously reserved approval for migration083 plus the
+Historical browser-preview activation needed the previously reserved approval for migration083 plus the
 reviewed backend/admin deployment, `FEATURE_SCPDA_COUNTS_001=true`, the narrowly
 scoped `FEATURE_SCPDA_WEB_001=true`, the prepared browser Site version, and one
 new branch001 browser admission invitation. Existing three account/PIN values,
@@ -141,7 +141,14 @@ physical Android/WebView/camera/HID test. Existing CORS restrictions remain.
 
 ## Exact activation and rollback boundary
 
-Before production activation, obtain the user's explicit approval for:
+**15 November update:** the user explicitly authorized Android count intake for
+**01001 only**, dates/lots, and the StockDay **เช็คสินค้า** catalog for existing
+branch001/admin web accounts. [R11 scope and evidence](SCPDA_STOCK_CHECK_ACTIVATION_R11.md)
+records this approval. Migration083 and the listed backend/admin deployment are
+authorized for that pilot, with `SCPDA_COUNT_OPERATORS_001=01001`. No new Site
+browser admission/invitation, other operator/branch, Ada adjustment or source
+override is included. The following remains the concrete deployment boundary;
+future expansion needs its own authorization:
 
 1. Applying `083_add_scpda_lot_observations.sql` to existing `sc_drug_db` and
    deploying the reviewed backend commit to `paasrtsm-project`.
