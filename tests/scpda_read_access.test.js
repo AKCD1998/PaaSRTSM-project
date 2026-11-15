@@ -22,6 +22,20 @@ test('branch001 stock preserves raw null/zero/negative meaning and exposes no ot
 test('reader has no count, inventory or product write operation',async()=>{await temporary(config,async baseUrl=>{assert.equal((await request('/counts',{body:{},token:firstToken,baseUrl})).status,405);assert.equal((await request('/products/1',{body:{},token:firstToken,baseUrl})).status,405);});const r=await fetch(origin+'/admin/me',{headers:{Cookie:'scpda_read_fixture='+firstToken}});assert.equal(r.status,401);});
 test('logout is durable and refuses the former session token',async()=>{assert.equal((await request('/auth/logout',{body:{},token:firstToken})).status,200);assert.equal((await request('/session',{token:firstToken})).status,401);});
 test('configured device revocation and PIN rotation reject old leases',async()=>{const ref=crypto.createHash('sha256').update(Buffer.from(publicKey,'base64')).digest('hex');await temporary({...config,scpdaRevokedDeviceRefsJson:JSON.stringify([ref])},async baseUrl=>assert.equal((await request('/session',{baseUrl,token:tokens.get('02001')})).status,401));const ops=JSON.parse(config.scpdaOperatorCredentialsJson);ops[1]={...ops[1],version:crypto.randomUUID(),hash:await bcrypt.hash('9876',12)};await temporary({...config,scpdaOperatorCredentialsJson:JSON.stringify(ops)},async baseUrl=>{assert.equal((await request('/session',{baseUrl,token:tokens.get('02001')})).status,401);assert.equal((await login('02001','9876',{baseUrl})).status,200);});});
+test('password rotation changes only the selected reader and accepts exact alphanumeric credentials',async()=>{
+ const ops=JSON.parse(config.scpdaOperatorCredentialsJson),untouched=JSON.stringify(ops.slice(1));
+ ops[0]={...ops[0],version:crypto.randomUUID(),hash:await bcrypt.hash('qaRead7!',12)};
+ assert.equal(JSON.stringify(ops.slice(1)),untouched);
+ await temporary({...config,scpdaOperatorCredentialsJson:JSON.stringify(ops)},async baseUrl=>{
+  assert.equal((await login('01001','4567',{baseUrl})).status,401);
+  assert.equal((await login('01001','qaRead7! ',{baseUrl})).status,401);
+  const updated=await login('01001','qaRead7!',{baseUrl});assert.equal(updated.status,200);
+  assert.equal((await request('/session',{baseUrl,token:updated.data.token})).status,200);
+  assert.equal((await request('/session',{baseUrl,token:tokens.get('01001')})).status,401);
+  assert.equal((await request('/session',{baseUrl,token:tokens.get('02001')})).status,200);
+  assert.equal((await login('02001','6789',{baseUrl})).status,200);
+ });
+});
 test('five bad PINs from an admitted device cause a durable hold',async()=>{for(let i=0;i<5;i++)assert.equal((await login('03001','0000')).status,401);assert.equal((await login('03001','7890')).status,429);});
 test('auth evidence contains no PIN, invitation secret or session token and stock is unchanged',async()=>{const logs=(await db.query("SELECT meta FROM public.audit_logs WHERE action LIKE 'scpda.%'")).rows;for(const row of logs){const text=JSON.stringify(row.meta);assert.equal(text.includes('fixture-node-invitation-only'),false);assert.equal(text.includes(firstToken),false);assert.equal(/\"(pin|token|activationCode)\"/.test(text),false);}assert.deepEqual((await db.query('SELECT qty_branch_001 FROM ada.branch_stock_snapshots ORDER BY product_code')).rows.map(r=>r.qty_branch_001),['6',null,'-2']);});
 test.after(async()=>{await db.end();});
