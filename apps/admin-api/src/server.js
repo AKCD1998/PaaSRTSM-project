@@ -128,8 +128,7 @@ function createCorsMiddleware(config) {
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id",
-      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id, X-API-Key",
+      "Authorization, Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id, X-API-Key, X-Preorder-Workspace",
     );
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     appendVaryHeader(res, "Origin");
@@ -510,6 +509,7 @@ function createApp(overrides = {}) {
       db,
       requireAuthMiddleware,
       requireCsrfMiddleware: requireCsrf,
+      requireMobileTokenMiddleware,
       storageProvider: preorderStorageProvider,
     }),
   );

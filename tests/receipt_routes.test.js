@@ -59,10 +59,33 @@ function createReceiptMockDb() {
         return { rowCount: 0, rows: [] };
       }
 
+      if (normalized.startsWith("select pg_advisory_xact_lock")) {
+        return { rowCount: 1, rows: [{}] };
+      }
+
+      if (normalized.startsWith("select c.case_id,c.branch_code,c.status,i.item_id,i.position")) {
+        return { rowCount: 0, rows: [] };
+      }
+
       if (normalized.startsWith("insert into public.audit_logs")) {
         return {
           rowCount: 1,
           rows: [{ audit_id: 1, event_time: new Date().toISOString() }],
+        };
+      }
+
+      if (normalized.includes("from core.branches") && normalized.includes("where branch_code")) {
+        const branchCode = String(params[0] || "");
+        return {
+          rowCount: branchCode ? 1 : 0,
+          rows: branchCode
+            ? [{
+                branch_code: branchCode,
+                branch_name: branchCode === "000" ? "สำนักงานใหญ่" : `สาขา ${branchCode}`,
+                is_active: true,
+                is_hq: state.hqBranches.has(branchCode),
+              }]
+            : [],
         };
       }
 

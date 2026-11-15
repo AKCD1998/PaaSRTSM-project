@@ -152,6 +152,30 @@ function parseBranchTokenMap(value) {
   return map;
 }
 
+// Server-owned business profiles for the gated preorder workspace.
+// Format: subject=purchasing;subject=fulfillment;subject=branch:001
+// Multi-workspace executive: subject=purchasing+fulfillment+branch:001
+function parsePreorderWorkspaceProfiles(value) {
+  const profiles = new Map();
+  for (const rawEntry of String(value || "").split(";")) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const separatorIndex = entry.indexOf("=");
+    if (separatorIndex <= 0 || separatorIndex === entry.length - 1) return new Map();
+    const subjectUserId = entry.slice(0, separatorIndex).trim().toLowerCase();
+    const [rolesText, branchCode, extra] = entry.slice(separatorIndex + 1).trim().split(":");
+    const workRoles = String(rolesText || "").split("+");
+    const allowedRoles = new Set(["purchasing", "fulfillment", "branch"]);
+    if (!subjectUserId || extra !== undefined || !workRoles.length
+        || workRoles.some((role) => !allowedRoles.has(role))
+        || new Set(workRoles).size !== workRoles.length || profiles.has(subjectUserId)) return new Map();
+    if ((workRoles.includes("branch") && !/^\d{3}$/.test(branchCode || ""))
+        || (!workRoles.includes("branch") && branchCode)) return new Map();
+    profiles.set(subjectUserId, { workRole: workRoles[0], workRoles, branchCode: branchCode || null });
+  }
+  return profiles;
+}
+
 function parseCookieSameSite(value, fallback = "lax") {
   const normalized = String(value || fallback).trim().toLowerCase();
   if (["lax", "strict", "none"].includes(normalized)) {
@@ -215,6 +239,9 @@ function loadConfig(env = process.env) {
     defaultPeriodDays: parseIntWithFallback(env.DEFAULT_PERIOD_DAYS, 30),
     featureStockRequests: parseBool(env.FEATURE_STOCK_REQUESTS, false),
     featureCustomerPreorders: parseBool(env.FEATURE_CUSTOMER_PREORDERS, false),
+    featurePreorderRoleWorkspace: parseBool(env.FEATURE_PREORDER_ROLE_WORKSPACE, false),
+    preorderWorkspaceProfiles: parsePreorderWorkspaceProfiles(env.PREORDER_WORKSPACE_PROFILES),
+    preorderCancelPassword: String(env.PREORDER_CANCEL_PASSWORD || ""),
     r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
     r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
     r2Endpoint: env.R2_ENDPOINT || "",
@@ -368,4 +395,5 @@ function loadConfig(env = process.env) {
 
 module.exports = {
   loadConfig,
+  parsePreorderWorkspaceProfiles,
 };
