@@ -66,6 +66,21 @@ function createReceiptMockDb() {
         };
       }
 
+      if (normalized.includes("from core.branches") && normalized.includes("where branch_code")) {
+        const branchCode = String(params[0] || "");
+        return {
+          rowCount: branchCode ? 1 : 0,
+          rows: branchCode
+            ? [{
+                branch_code: branchCode,
+                branch_name: branchCode === "000" ? "สำนักงานใหญ่" : `สาขา ${branchCode}`,
+                is_active: true,
+                is_hq: state.hqBranches.has(branchCode),
+              }]
+            : [],
+        };
+      }
+
       if (normalized.startsWith("delete from ada.pending_receipt_headers where branch_code = $1")) {
         for (const [docNo, row] of state.pendingHeaders.entries()) {
           if (row.branch_code === params[0]) {
