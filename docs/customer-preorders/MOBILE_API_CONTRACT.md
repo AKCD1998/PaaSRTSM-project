@@ -18,6 +18,7 @@ This adapter exposes the existing customer preorder case API to an enrolled PDA 
 The PDA uses the same paths, request/response shapes, case IDs, and idempotency behavior as the web client under `/api/customer-preorders`:
 
 - `GET /workspace`
+- `GET /members/lookup?phone=...` returns active SCCRM members whose primary or linked phone exactly matches. It returns `matchKind` (`none`, `single`, or `multiple`) and only the ID/name/member code needed for selection.
 - `GET /product-suggestions?q=...`
 - `GET /cases` and `GET /cases/:publicId`
 - `POST /cases` to create preorder and price-inquiry cases
@@ -26,12 +27,13 @@ The PDA uses the same paths, request/response shapes, case IDs, and idempotency 
 - The branch-capability workflow actions exposed by the router, including customer decisions, arrival confirmation, customer notification, completion, and cancellation
 
 Multipart images use the same existing attachment flow and upload limits. The client should keep and retry the same `idempotencyKey` when a create request times out.
+When an existing member is selected, include its `customerMemberId` in `POST /cases`. The API repeats the exact phone/member check against SCCRM, uses the canonical member name and persists the member UUID on the preorder case. Keep the phone entered by the staff member as the contact phone for this request.
 
 ## Not included in this adapter
 
-- SCCRM member lookup/create and member sync receipt endpoints.
+- Creating a new SCCRM member from PDA and returning its ADA/branch sync receipt.
 - Offline case creation or background upload queue.
 - Any ADA write, product creation, or stock mutation.
 - HQ fulfillment and purchasing access through PDA.
 
-Those require their own reviewed contracts and integration paths. Enabling this adapter alone does not make preorder production-ready.
+New member creation is not exposed by this adapter: the existing SCCRM staff registration route requires a separate revocable staff-device credential, date of birth and general PDPA consent. The current PDA enrollment token is a different credential. The existing SCCRM source documents a background Ada/HQ-to-branch member delivery worker, but its deployed health still needs an operational check. Enabling this adapter alone does not make preorder production-ready.

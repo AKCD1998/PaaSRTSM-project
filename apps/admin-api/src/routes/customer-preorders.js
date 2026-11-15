@@ -10,6 +10,7 @@ const { createPreorderWorkspaceMiddleware, requirePreorderCapability } = require
 const { WORKSPACE_CONTRACT } = require("../services/preorderWorkspace");
 const { createPreorderPhysicalReceipts } = require("../services/preorderPhysicalReceipts");
 const { createPreorderFifoAllocation } = require("../services/preorderFifoAllocation");
+const { createPreorderMemberDirectory, UUID_PATTERN } = require("../services/preorderMemberDirectory");
 
 function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requireCsrfMiddleware, requireMobileTokenMiddleware, storageProvider }) {
   const router = express.Router();
@@ -20,6 +21,7 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
   const transfers = createPreorderTransferEvidence({ db });
   const physicalReceipts = createPreorderPhysicalReceipts({ db, config, storageProvider });
   const fifoAllocation = createPreorderFifoAllocation({ db });
+  const memberDirectory = createPreorderMemberDirectory({ config });
   const requireCapability = (capability) => requirePreorderCapability(config, capability);
   const requirePreorderAuth = (req, res, next) => {
     const authorization = String(req.headers?.authorization || "").trim();
@@ -78,6 +80,32 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
     const message = error.code === "LIMIT_FILE_SIZE" ? "แต่ละรูปต้องมีขนาดไม่เกิน 5 MB" : error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE" ? "แนบรูปได้ไม่เกิน 3 รูป" : "ข้อมูลไฟล์ไม่ถูกต้อง";
     return next(Object.assign(new Error(message), { statusCode: 400 }));
   });
+  const resolvePreorderMember = async (req, res, next) => {
+    try {
+      let body = req.body || {};
+      if (typeof body.payload === "string") {
+        try { body = { ...body, ...JSON.parse(body.payload) }; }
+        catch { throw Object.assign(new Error("payload ไม่ใช่ JSON ที่ถูกต้อง"), { statusCode: 400 }); }
+      }
+      const memberId = String(body.customerMemberId || "").trim();
+      if (!memberId) {
+        req.preorderCreateBody = body;
+        return next();
+      }
+      if (!config.featurePreorderRoleWorkspace) throw Object.assign(new Error("Not found"), { statusCode: 404 });
+      if (req.auth?.preorderWorkspace?.role !== "branch") throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+      if (!UUID_PATTERN.test(memberId)) throw Object.assign(new Error("ข้อมูลสมาชิกไม่ถูกต้อง"), { statusCode: 400 });
+      const result = await memberDirectory.findByPhone(body.customerPhone);
+      const member = result.matches.find((candidate) => candidate.id === memberId);
+      if (!member) throw Object.assign(new Error("ไม่พบสมาชิกที่เลือกจากเบอร์นี้ กรุณาค้นหาใหม่"), { statusCode: 409 });
+      const canonicalBody = { ...body, customerMemberId: member.id, customerName: member.name };
+      delete canonicalBody.payload;
+      req.preorderCreateBody = canonicalBody;
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  };
   router.use(requirePreorderAuth);
   router.use(createPreorderWorkspaceMiddleware(config));
   router.get("/workspace", asyncRoute(async (req, res) => {
@@ -85,6 +113,13 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
     res.set("Cache-Control", "private, no-store");
     const workspace = req.auth.preorderWorkspace;
     return res.json({ contractVersion: WORKSPACE_CONTRACT, subjectUserId: workspace.subjectUserId, workRole: workspace.role, workRoles: workspace.workRoles, branchCode: workspace.branchCode, capabilities: workspace.capabilities });
+  }));
+  router.get("/members/lookup", requireCapability("cases.create"), asyncRoute(async (req, res) => {
+    if (!config.featurePreorderRoleWorkspace) return res.status(404).json({ error: "Not found", request_id: req.requestId || null });
+    if (req.auth?.preorderWorkspace?.role !== "branch") return res.status(403).json({ error: "Forbidden", request_id: req.requestId || null });
+    const result = await memberDirectory.findByPhone(typeof req.query.phone === "string" ? req.query.phone : "");
+    res.set("Cache-Control", "private, no-store");
+    return res.json({ ...result, matchKind: result.matches.length === 0 ? "none" : result.matches.length === 1 ? "single" : "multiple" });
   }));
   router.get("/product-suggestions", requireAnyCapability("cases.create", "catalog.match"), asyncRoute(async (req, res) => res.json({ items: await service.productSuggestions(req.auth, req.query) })));
   router.get("/unread-count", requireAnyCapability("cases.read.branch", "cases.read.all"), asyncRoute(async (req, res) => res.json(await service.counts(req.auth))));
@@ -95,7 +130,7 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
     }
     return res.json(await service.list(req.auth, req.query));
   }));
-  router.post("/cases", requireCapability("cases.create"), requirePreorderMutationProtection, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.body, req.files))));
+  router.post("/cases", requireCapability("cases.create"), requirePreorderMutationProtection, acceptImages, resolvePreorderMember, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.preorderCreateBody, req.files))));
   router.get("/cases/:publicId", asyncRoute(async (req, res) => {
     if (config.featurePreorderRoleWorkspace) {
       const allowed = req.auth.preorderWorkspace.capabilities.includes("cases.read.all") || req.auth.preorderWorkspace.capabilities.includes("cases.read.branch");
@@ -142,7 +177,7 @@ function createCustomerPreordersRouter({ config, db, requireAuthMiddleware, requ
   router.get("/attachments/:attachmentId/download-url", requireAnyCapability("cases.read.all", "cases.read.branch"), asyncRoute(async (req, res) => { res.set("Cache-Control", "private, no-store"); res.set("X-Content-Type-Options", "nosniff"); res.json(await service.signedUrl(req.auth, req.params.attachmentId)); }));
   // Compatibility aliases for the initial flagged UI. Canonical paths are /cases and /attachments/:id/download-url.
   router.get("/", requireAnyCapability("cases.read.all", "cases.read.branch"), asyncRoute(async (req, res) => res.json(await service.list(req.auth, req.query))));
-  router.post("/", requireCapability("cases.create"), requirePreorderMutationProtection, acceptImages, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.body, req.files))));
+  router.post("/", requireCapability("cases.create"), requirePreorderMutationProtection, acceptImages, resolvePreorderMember, asyncRoute(async (req, res) => res.status(201).json(await service.create(req.auth, req.preorderCreateBody, req.files))));
   router.get("/:publicId/attachments/:attachmentId/url", requireAnyCapability("cases.read.all", "cases.read.branch"), asyncRoute(async (req, res) => res.json(await service.signedUrl(req.auth, req.params.attachmentId))));
   return router;
 }

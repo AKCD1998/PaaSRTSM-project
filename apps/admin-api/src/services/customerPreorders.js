@@ -204,6 +204,8 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
     if (!branch) throw httpError(400, "Admin must select an effective branch context");
     const idempotency = String(body.idempotencyKey || "").trim().slice(0, 200); if (!idempotency) throw httpError(400, "idempotencyKey is required");
     const phone = normalizePhone(body.customerPhone); if (phone.length < 8 || !String(body.customerName || "").trim()) throw httpError(400, "กรุณากรอกชื่อลูกค้าและเบอร์โทรให้ถูกต้อง");
+    const customerMemberId = String(body.customerMemberId || "").trim() || null;
+    if (customerMemberId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(customerMemberId)) throw httpError(400, "ข้อมูลสมาชิกไม่ถูกต้อง");
     const items = parseItems(body.items); const images = validateImages(files); const client = await db.connect(); const uploaded = []; let caseRow;
     try {
       await client.query("BEGIN"); const existing = await client.query("SELECT case_id,public_id,branch_code,status FROM customer_relations.preorder_cases WHERE idempotency_key=$1", [idempotency]);
@@ -221,7 +223,7 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
         return get(auth, existing.rows[0].public_id);
       }
       const publicId = makePublicId(branch); const intent = VALID_INTENTS.has(body.intent) ? body.intent : "PRICE_INQUIRY"; const status = intent === "ORDER_REQUEST" ? "PROCUREMENT_PENDING" : "SUBMITTED";
-      const inserted = await client.query("INSERT INTO customer_relations.preorder_cases(public_id,branch_code,intent,status,customer_name,customer_phone,customer_phone_normalized,customer_phone_last4,staff_note,created_by,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10) RETURNING *", [publicId, branch, intent, status, String(body.customerName).trim(), phone, phone.slice(-4), body.staffNote || null, auth.userId, idempotency]); caseRow = inserted.rows[0];
+      const inserted = await client.query("INSERT INTO customer_relations.preorder_cases(public_id,branch_code,intent,status,customer_member_id,customer_name,customer_phone,customer_phone_normalized,customer_phone_last4,staff_note,created_by,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11) RETURNING *", [publicId, branch, intent, status, customerMemberId, String(body.customerName).trim(), phone, phone.slice(-4), body.staffNote || null, auth.userId, idempotency]); caseRow = inserted.rows[0];
       for (let index = 0; index < items.length; index += 1) {
         const item = items[index]; const kind = item.itemKind === "CATALOG" ? "CATALOG" : "FREEFORM"; let snapshot = {};
         if (kind === "CATALOG") {
