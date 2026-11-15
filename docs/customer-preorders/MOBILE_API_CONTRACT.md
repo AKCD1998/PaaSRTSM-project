@@ -29,6 +29,18 @@ The PDA uses the same paths, request/response shapes, case IDs, and idempotency 
 Multipart images use the same existing attachment flow and upload limits. The client should keep and retry the same `idempotencyKey` when a create request times out.
 When an existing member is selected, include its `customerMemberId` in `POST /cases`. The API repeats the exact phone/member check against SCCRM, uses the canonical member name and persists the member UUID on the preorder case. Keep the phone entered by the staff member as the contact phone for this request.
 
+## In-app notifications
+
+The receipt/case inbox poll is separate from the case routes above:
+
+- `GET /api/mobile/preorder-notifications?afterId=0&limit=30` (also mounted as `/api/pda/preorder-notifications`)
+- Use the same enrolled-device Bearer. The response contains `items`, a monotonically increasing `nextAfterId`, and `pollingRecommendedSeconds: 30`; persist `nextAfterId` and pass it on the next poll. This is in-app polling, not an OS push notification.
+- HQ device branch `000` receives `HQ_RECEIPT_SYNCED` work cues, including the linked request/item and approved receipt source details. These are generated in the same backend transaction that ingests approved HQ receipt records, deduplicated by source document/line and preorder item. They mean “review/count this synced receipt”; they do not mean the physical quantity was verified, allocated, dispatched or delivered.
+- A branch device receives `HQ_RECEIPT_LINKED` only after HQ's FIFO allocation commits. It does not receive the HQ sync event or its source details. Notification items omit the customer's phone and name.
+- The endpoints require the mobile-PDA, customer-preorder and preorder-role-workspace feature flags. The receipt-only scheduled task is configured by `apps/adapos-sync/register-preorder-receipt-task.ps1` for a 15-minute cadence, but the script creates it disabled unless explicitly enabled; this code does not confirm that it is installed/enabled on the live HQ host.
+
+The web workspace uses a separate 30-second `/api/customer-preorders/unread-count` badge poll. That badge and the PDA polling endpoint do not constitute real-time push delivery.
+
 ## Not included in this adapter
 
 - Creating a new SCCRM member from PDA and returning its ADA/branch sync receipt.
@@ -36,4 +48,4 @@ When an existing member is selected, include its `customerMemberId` in `POST /ca
 - Any ADA write, product creation, or stock mutation.
 - HQ fulfillment and purchasing access through PDA.
 
-New member creation is not exposed by this adapter: the existing SCCRM staff registration route requires a separate revocable staff-device credential, date of birth and general PDPA consent. The current PDA enrollment token is a different credential. The existing SCCRM source documents a background Ada/HQ-to-branch member delivery worker, but its deployed health still needs an operational check. Enabling this adapter alone does not make preorder production-ready.
+New member creation is not exposed by this adapter: the existing SCCRM staff registration route requires a separate revocable staff-device credential, date of birth and general PDPA consent. The current PDA enrollment token is a different credential. The existing SCCRM source documents a background Ada/HQ-to-branch member delivery worker, but its deployed health still needs an operational check. The PDA client has not integrated the case API or notification poll, the receipt-task live state is unknown, and enabling this adapter alone does not make preorder production-ready.
