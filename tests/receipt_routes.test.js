@@ -59,6 +59,10 @@ function createReceiptMockDb() {
         return { rowCount: 0, rows: [] };
       }
 
+      if (normalized.startsWith("select pg_advisory_xact_lock")) {
+        return { rowCount: 1, rows: [{}] };
+      }
+
       if (normalized.startsWith("insert into public.audit_logs")) {
         return {
           rowCount: 1,
