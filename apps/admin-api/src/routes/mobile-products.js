@@ -50,6 +50,50 @@ function createMobileProductsRouter({ config, db, requireMobileTokenMiddleware }
 
   router.use(requireMobileTokenMiddleware);
 
+  // Lightweight polling contract for the PDA client. The installed APK in
+  // this workspace has no matching source screen yet; keep the endpoint
+  // branch-scoped so a future client can consume it without exposing customer
+  // contact details or HQ-only receipt details to store devices.
+  router.get("/preorder-notifications", async (req, res, next) => {
+    if (!config.featureCustomerPreorders || !config.featurePreorderRoleWorkspace) {
+      return notFound(res, req);
+    }
+    const branchCode = String(req.mobile?.branchCode || "");
+    if (!/^\d{3}$/.test(branchCode)) return res.status(403).json({ error: "Forbidden", request_id: req.requestId });
+    const afterId = Number(req.query.afterId || 0);
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(100, requestedLimit) : 30;
+    if (!Number.isSafeInteger(afterId) || afterId < 0) return res.status(400).json({ error: "afterId is invalid", request_id: req.requestId });
+    const hqView = branchCode === "000";
+    try {
+      const result = await db.query(
+        `SELECT n.notification_id,n.notification_type,n.created_at,c.public_id,c.branch_code,c.intent,c.status,
+                CASE WHEN $3 THEN e.payload_json ELSE '{}'::jsonb END AS event_payload,
+                item_summary.items
+         FROM customer_relations.preorder_notifications n
+         JOIN customer_relations.preorder_cases c ON c.case_id=n.case_id
+         LEFT JOIN customer_relations.preorder_events e ON e.case_id=n.case_id AND e.activity_seq=n.activity_seq
+         LEFT JOIN LATERAL (
+           SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'name',COALESCE(i.display_name_snapshot,i.original_description,'สินค้า'),
+             'quantity',COALESCE(i.confirmed_qty,i.requested_qty),
+             'unit',i.unit_snapshot
+           ) ORDER BY i.position),'[]'::jsonb) AS items
+           FROM customer_relations.preorder_items i WHERE i.case_id=c.case_id
+         ) item_summary ON TRUE
+         WHERE n.notification_id>$1
+           AND (($3 AND n.recipient_role='admin' AND n.recipient_branch_code IS NULL)
+             OR (NOT $3 AND n.recipient_role='staff' AND n.recipient_branch_code=$2))
+         ORDER BY n.notification_id ASC LIMIT $4`,
+        [afterId, branchCode, hqView, limit],
+      );
+      res.set("Cache-Control", "private, no-store");
+      return res.json({ items: result.rows, nextAfterId: result.rows.at(-1)?.notification_id || afterId, pollingRecommendedSeconds: 30 });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   async function handleScan(req, res, next, barcode) {
     const normalizedBarcode = String(barcode || "").trim();
     if (!normalizedBarcode) {

@@ -112,8 +112,7 @@ function createCorsMiddleware(config) {
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id",
-      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id, X-API-Key",
+      "Content-Type, X-CSRF-Token, X-Requested-With, X-Request-Id, X-API-Key, X-Preorder-Workspace",
     );
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     appendVaryHeader(res, "Origin");

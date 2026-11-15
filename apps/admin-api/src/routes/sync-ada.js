@@ -1758,6 +1758,91 @@ async function upsertApprovedReceiptRecord(client, body, branchCode, record) {
 //     approved-receipts admin list reads and displays `source_synced_at`
 //     per row, but nothing in that reader (or elsewhere) compares rows'
 //     timestamps against each other or depends on their relative sequence.
+// The existing AdaAcc sync is read-only against AdaPOS. Once approved HQ
+// receipt lines reach the central Postgres projection, create one idempotent
+// preorder activity per matching open order item. This is an HQ work cue:
+// it does not mark stock physically counted or tell the branch the goods are
+// ready. Those actions still require the fulfillment workspace.
+async function notifyPreorderReceiptsAtHq(client, branchCode, records) {
+  const normalizedBranch = normalizeBranchCode(branchCode);
+  if (!normalizedBranch || !Array.isArray(records) || records.length === 0) return 0;
+  const branch = await client.query(
+    "SELECT is_hq FROM core.branches WHERE branch_code=$1",
+    [normalizedBranch],
+  );
+  if (branch.rows[0]?.is_hq !== true) return 0;
+
+  let notified = 0;
+  for (const record of records) {
+    const docNo = normalizeNullableText(pick(record, ["FTXihDocNo", "docNo"]));
+    if (!docNo) continue;
+    for (const line of record.lines || []) {
+      const seqNo = Number(pick(line, ["FNXidSeqNo", "seqNo"], 0));
+      const productCode = normalizeNullableText(pick(line, ["FTPdtCode", "productCode"]));
+      if (!Number.isInteger(seqNo) || seqNo <= 0 || !productCode) continue;
+      const sourceKey = `${normalizedBranch}|${docNo}|${seqNo}`;
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [sourceKey]);
+      const matches = await client.query(
+        `SELECT c.case_id,c.branch_code,c.status,i.item_id,i.position,
+                COALESCE(i.product_code_snapshot,s.company_code) AS product_code,
+                COALESCE(i.display_name_snapshot,i.original_description,s.display_name,'สินค้า') AS display_name,
+                GREATEST(0,COALESCE(i.confirmed_qty,i.requested_qty)-COALESCE(allocated.qty,0))::numeric AS remaining_qty
+         FROM customer_relations.preorder_cases c
+         JOIN customer_relations.preorder_items i ON i.case_id=c.case_id
+         LEFT JOIN public.skus s ON s.sku_id=COALESCE(i.sku_id,i.matched_sku_id)
+         LEFT JOIN LATERAL (
+           SELECT SUM(e.allocated_qty) AS qty FROM customer_relations.preorder_evidence_links e
+           WHERE e.item_id=i.item_id AND e.evidence_type='HQ_RECEIPT' AND e.unlinked_at IS NULL
+         ) allocated ON TRUE
+         WHERE c.intent='ORDER_REQUEST' AND c.status IN ('ORDERED','RECEIVED_AT_HQ')
+           AND lower(COALESCE(i.product_code_snapshot,s.company_code))=lower($1)
+           AND GREATEST(0,COALESCE(i.confirmed_qty,i.requested_qty)-COALESCE(allocated.qty,0))>0
+           AND NOT EXISTS (
+             SELECT 1 FROM customer_relations.preorder_events e
+             WHERE e.case_id=c.case_id AND e.event_type='HQ_RECEIPT_SYNCED'
+               AND e.payload_json->>'sourceKey'=$2 AND e.payload_json->>'itemId'=i.item_id::text
+           )
+         ORDER BY c.created_at ASC,c.case_id ASC,i.position ASC
+         FOR UPDATE OF c`,
+        [productCode, sourceKey],
+      );
+
+      for (const match of matches.rows) {
+        const seq = await client.query(
+          "SELECT GREATEST(COALESCE((SELECT MAX(activity_seq) FROM customer_relations.preorder_events WHERE case_id=$1),0),COALESCE((SELECT MAX(activity_seq) FROM customer_relations.preorder_messages WHERE case_id=$1),0))+1 AS seq",
+          [match.case_id],
+        );
+        const activitySeq = Number(seq.rows[0]?.seq || 1);
+        const payload = {
+          sourceKey,
+          docNo,
+          lineSeq: seqNo,
+          productCode,
+          itemId: Number(match.item_id),
+          displayName: match.display_name,
+          remainingQty: Number(match.remaining_qty),
+          priorityAt: "case_created_at_ascending",
+        };
+        await client.query(
+          "UPDATE customer_relations.preorder_cases SET version=version+1,last_activity_at=now(),updated_at=now() WHERE case_id=$1",
+          [match.case_id],
+        );
+        await client.query(
+          `INSERT INTO customer_relations.preorder_events(case_id,activity_seq,event_type,actor_role,from_status,to_status,payload_json)
+           VALUES($1,$2,'HQ_RECEIPT_SYNCED','ada_sync',$3,$3,$4::jsonb)`,
+          [match.case_id, activitySeq, match.status, JSON.stringify(payload)],
+        );
+        await client.query(
+          "INSERT INTO customer_relations.preorder_notifications(case_id,recipient_role,activity_seq,notification_type) VALUES($1,'admin',$2,'HQ_RECEIPT_SYNCED') ON CONFLICT(case_id,recipient_role,activity_seq) DO NOTHING",
+          [match.case_id, activitySeq],
+        );
+        notified += 1;
+      }
+    }
+  }
+  return notified;
+}
+
 async function upsertApprovedReceiptsBatch(client, body, branchCode, records) {
   if (records.length === 0) {
     return;
@@ -2824,6 +2909,7 @@ function createAdaSyncRouter(deps) {
       // Track C: set-based batch replaces the OLD per-record loop
       // (upsertApprovedReceiptRecord, kept above, unused, not deleted).
       await upsertApprovedReceiptsBatch(client, req.body, branchCode, records);
+      await notifyPreorderReceiptsAtHq(client, branchCode, records);
       await client.query("COMMIT");
       return res.json({ ok: true, upserted: records.length });
     } catch (e) {

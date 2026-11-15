@@ -112,15 +112,16 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
 
   async function list(auth, filters = {}) {
     const page = parsePage(filters.page, 1, 1000000); const pageSize = parsePage(filters.pageSize || filters.limit, 25, 100);
-    const built = buildCaseWhere(auth, filters); const count = await db.query(`SELECT COUNT(*)::int AS total FROM customer_relations.preorder_cases c WHERE ${built.where}`, built.params);
+    const workRole = workspaceRole(auth); const built = buildCaseWhere(auth, filters); const count = await db.query(`SELECT COUNT(*)::int AS total FROM customer_relations.preorder_cases c WHERE ${built.where}`, built.params);
     const params = [...built.params, pageSize, (page - 1) * pageSize];
+    const orderBy = workRole === "fulfillment" ? "c.created_at ASC,c.case_id ASC" : "c.last_activity_at DESC,c.case_id DESC";
     const rows = await db.query(`SELECT c.public_id,c.branch_code,c.intent,c.status,c.customer_name,c.customer_phone_normalized,c.first_admin_viewed_at,c.last_activity_at,c.version,c.created_at,
       item_summary.item_count,item_summary.item_summary,last_message.last_reply_at,latest_eta.estimated_date AS eta_date,latest_eta.basis AS eta_basis
       FROM customer_relations.preorder_cases c
       LEFT JOIN LATERAL (SELECT COUNT(*)::int AS item_count,string_agg(COALESCE(i.display_name_snapshot,i.original_description,'สินค้า'),' · ' ORDER BY i.position) AS item_summary FROM customer_relations.preorder_items i WHERE i.case_id=c.case_id) item_summary ON TRUE
       LEFT JOIN LATERAL (SELECT m.created_at AS last_reply_at FROM customer_relations.preorder_messages m WHERE m.case_id=c.case_id AND m.visibility='PUBLIC' AND m.is_ready=TRUE ORDER BY m.activity_seq DESC LIMIT 1) last_message ON TRUE
       LEFT JOIN LATERAL (SELECT e.estimated_date,e.basis FROM customer_relations.preorder_eta_projections e WHERE e.case_id=c.case_id ORDER BY e.version DESC LIMIT 1) latest_eta ON TRUE
-      WHERE ${built.where} ORDER BY c.last_activity_at DESC,c.case_id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+      WHERE ${built.where} ORDER BY ${orderBy} LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
     return { items: rows.rows.map(mapList), total: count.rows[0]?.total || 0, page, pageSize };
   }
 
@@ -148,7 +149,7 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
       db.query(`SELECT outcome_id,outcome_type,supplier_reference,public_note,${canViewInternal ? "admin_internal_note," : ""}reason_code,recorded_by,created_at FROM customer_relations.preorder_procurement_outcomes WHERE case_id=$1 ORDER BY created_at`, [row.case_id]),
       db.query(`SELECT evidence_link_id,item_id,evidence_type,allocated_qty,unit,source_synced_at,linked_at,source_allocated_qty,source_unit,target_unit,${canViewInternal ? "allocation_note,source_key,snapshot_json" : "jsonb_build_object('docDate',snapshot_json->>'docDate','productCode',snapshot_json->>'productCode','sourceUnit',snapshot_json->>'sourceUnit','phase',snapshot_json->>'phase','sourceMatchStatus',snapshot_json->>'sourceMatchStatus','inboundProcessState',snapshot_json->>'inboundProcessState') snapshot_json"} FROM customer_relations.preorder_evidence_links WHERE case_id=$1 AND unlinked_at IS NULL ORDER BY linked_at`, [row.case_id]),
       db.query("SELECT version,estimated_date,basis,source_evidence_date,is_override,override_reason,calculated_at FROM customer_relations.preorder_eta_projections WHERE case_id=$1 ORDER BY version DESC LIMIT 1", [row.case_id]),
-      db.query(`SELECT ${fulfillmentView ? "event_id,activity_seq,event_type,actor_role,from_status,to_status,created_at,payload_json" : "*"} FROM customer_relations.preorder_events WHERE case_id=$1 ORDER BY activity_seq`, [row.case_id]),
+      db.query(`SELECT ${fulfillmentView ? "event_id,activity_seq,event_type,actor_role,from_status,to_status,created_at,payload_json" : "*"} FROM customer_relations.preorder_events WHERE case_id=$1 ${workRole === "branch" ? "AND event_type<>'HQ_RECEIPT_SYNCED'" : ""} ORDER BY activity_seq`, [row.case_id]),
     ]);
     const activity = [
       ...timeline.rows.map((event) => ({ ...event, activityKind: "EVENT" })),
@@ -166,7 +167,7 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
     const safeTimeline = fulfillmentView
       ? timeline.rows.map(({ event_id, activity_seq, event_type, actor_role, from_status, to_status, created_at, payload_json }) => ({
         event_id, activity_seq, event_type, actor_role, from_status, to_status, created_at, activityKind: "EVENT",
-        ...(event_type === "HQ_PHYSICAL_RECEIPT_COUNTED" ? { payload_json: { quantity: Number(payload_json?.quantity), unit: String(payload_json?.unit || ""), observedAt: payload_json?.observedAt || null } } : {}),
+        ...(event_type === "HQ_PHYSICAL_RECEIPT_COUNTED" ? { payload_json: { quantity: Number(payload_json?.quantity), unit: String(payload_json?.unit || ""), observedAt: payload_json?.observedAt || null, lotNo: payload_json?.lotNo || null, manufacturedDate: payload_json?.manufacturedDate || null, expiryDate: payload_json?.expiryDate || null } } : {}),
       }))
       : activity;
     return { ...safeRow, items: items.rows, attachments: attachments.rows, messages: safeMessages, quotes: safeQuotes, decisions: safeDecisions, procurementOutcomes: safeProcurement, evidence: evidence.rows, eta: eta.rows[0] || null, timeline: safeTimeline };
@@ -193,7 +194,8 @@ function createCustomerPreorderService({ db, config, storageProvider }) {
     const scope = actorScope(auth); const workRole = workspaceRole(auth); const params = [auth.userId, workRole === "fulfillment" ? ["ORDERED", "RECEIVED_AT_HQ"] : (workRole === "purchasing" || (!workRole && auth.role === "admin")) ? ADMIN_ACTIONABLE : STAFF_ACTIONABLE]; let scopeSql = "";
     if (scope.branchCode) { params.push(scope.branchCode); scopeSql = `AND c.branch_code=$${params.length}`; }
     const messageVisibility = workRole === "fulfillment" ? "AND FALSE" : (workRole === "purchasing" || (!workRole && auth.role === "admin")) ? "" : "AND visibility='PUBLIC'";
-    const result = await db.query(`SELECT COUNT(*) FILTER (WHERE GREATEST(COALESCE(ev.max_seq,0),COALESCE(msg.max_seq,0))>COALESCE(rc.last_read_activity_seq,0))::int AS unread_count,COUNT(*) FILTER (WHERE c.status=ANY($2::text[]))::int AS actionable_count FROM customer_relations.preorder_cases c LEFT JOIN customer_relations.preorder_read_cursors rc ON rc.case_id=c.case_id AND rc.user_id=$1 LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_events WHERE case_id=c.case_id) ev ON TRUE LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_messages WHERE case_id=c.case_id AND is_ready=TRUE ${messageVisibility}) msg ON TRUE WHERE NOT EXISTS (SELECT 1 FROM customer_relations.preorder_attachments pending_attachment WHERE pending_attachment.case_id=c.case_id AND pending_attachment.message_id IS NULL AND pending_attachment.upload_state<>'ready') ${scopeSql}`, params);
+    const eventVisibility = workRole === "branch" ? "AND event_type<>'HQ_RECEIPT_SYNCED'" : "";
+    const result = await db.query(`SELECT COUNT(*) FILTER (WHERE GREATEST(COALESCE(ev.max_seq,0),COALESCE(msg.max_seq,0))>COALESCE(rc.last_read_activity_seq,0))::int AS unread_count,COUNT(*) FILTER (WHERE c.status=ANY($2::text[]))::int AS actionable_count FROM customer_relations.preorder_cases c LEFT JOIN customer_relations.preorder_read_cursors rc ON rc.case_id=c.case_id AND rc.user_id=$1 LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_events WHERE case_id=c.case_id ${eventVisibility}) ev ON TRUE LEFT JOIN LATERAL (SELECT MAX(activity_seq) max_seq FROM customer_relations.preorder_messages WHERE case_id=c.case_id AND is_ready=TRUE ${messageVisibility}) msg ON TRUE WHERE NOT EXISTS (SELECT 1 FROM customer_relations.preorder_attachments pending_attachment WHERE pending_attachment.case_id=c.case_id AND pending_attachment.message_id IS NULL AND pending_attachment.upload_state<>'ready') ${scopeSql}`, params);
     return { unreadCount: result.rows[0]?.unread_count || 0, actionableCount: result.rows[0]?.actionable_count || 0 };
   }
 
