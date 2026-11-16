@@ -215,6 +215,7 @@ function loadConfig(env = process.env) {
     defaultPeriodDays: parseIntWithFallback(env.DEFAULT_PERIOD_DAYS, 30),
     featureStockRequests: parseBool(env.FEATURE_STOCK_REQUESTS, false),
     featureCustomerPreorders: parseBool(env.FEATURE_CUSTOMER_PREORDERS, false),
+    appCenterPublisherToken: env.SC_APP_CENTER_PUBLISHER_TOKEN || "",
     r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
     r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
     r2Endpoint: env.R2_ENDPOINT || "",
