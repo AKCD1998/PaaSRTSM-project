@@ -1,5 +1,5 @@
 "use strict";
-// Dedicated branch-scoped001/005 readers. No web/mobile privileges, count writer,
+// Dedicated branch-scoped001/004/005 readers. No web/mobile privileges, count writer,
 // inventory mutation, staff impersonation or schema changes.
 const {Router}=require('express');
 const crypto=require('node:crypto');
@@ -22,12 +22,12 @@ function parseConfig(config){
  const derive=label=>crypto.createHmac('sha256',config.authJwtSecret).update('scpda:'+label).digest('base64url');
  const sessionKey=derive('reader-session-v1'),deviceKey=derive('device-certificate-v1');
  const list=JSON.parse(config.scpdaOperatorCredentialsJson||'null');
- if(!Array.isArray(list)||list.length<3||list.length>4)throw Error('Existing reader records and optional005 required');
+ if(!Array.isArray(list)||list.length<3||list.length>5)throw Error('Existing reader records and optional004/005 required');
  const operators=new Map();
  for(const r of list){if(!CODES.includes(r.operatorCode)||operators.has(r.operatorCode)||!/^\$2[aby]\$(12|13|14)\$[./A-Za-z0-9]{53}$/.test(r.hash||'')||!UUID.test(r.version||'')||!Number.isFinite(Date.parse(r.rotationDueAt))||r.branchCode!==undefined&&r.branchCode!==operatorBranch(r.operatorCode))throw Error('Invalid operator configuration');operators.set(r.operatorCode,{...r,branchCode:operatorBranch(r.operatorCode),fingerprint:crypto.createHmac('sha256',sessionKey).update(r.operatorCode+':'+r.hash+':'+r.version+(operatorBranch(r.operatorCode)==='001'?'':':'+operatorBranch(r.operatorCode))).digest('hex')});}
  if(['01001','02001','03001'].some(code=>!operators.has(code)))throw Error('Existing reader configuration missing');
  const invitations=JSON.parse(config.scpdaDeviceInvitationsJson||'[]');if(!Array.isArray(invitations)||invitations.length>20)throw Error('Invalid invitation list');
- for(const i of invitations)if(!['001','005'].includes(i.branchCode||'001')||!UUID.test(i.id||'')||!/^[a-f0-9]{64}$/.test(i.hash||'')||!Number.isFinite(Date.parse(i.expiresAt))||i.certificateTtlSeconds!==undefined&&(!Number.isInteger(i.certificateTtlSeconds)||i.certificateTtlSeconds<60||i.certificateTtlSeconds>180*86400))throw Error('Invalid invitation');
+ for(const i of invitations)if(!['001','004','005'].includes(i.branchCode||'001')||!UUID.test(i.id||'')||!/^[a-f0-9]{64}$/.test(i.hash||'')||!Number.isFinite(Date.parse(i.expiresAt))||i.certificateTtlSeconds!==undefined&&(!Number.isInteger(i.certificateTtlSeconds)||i.certificateTtlSeconds<60||i.certificateTtlSeconds>180*86400))throw Error('Invalid invitation');
  const revoked=JSON.parse(config.scpdaRevokedDeviceRefsJson||'[]');if(!Array.isArray(revoked)||revoked.some(r=>!/^[a-f0-9]{64}$/.test(r)))throw Error('Invalid revocations');
  return {sessionKey,deviceKey,operators,invitations,revoked:new Set(revoked)};
 }
@@ -48,10 +48,10 @@ function createScpdaReadRouter({config,db,now=Date.now}){
  async function audit(client,req,{actor='device',action,targetType,targetId,success=true,meta={}}){await client.query(`INSERT INTO public.audit_logs(actor_role,actor_id,action,target_type,target_id,success,meta,request_id,ip,user_agent)
  VALUES('system',$1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`,['scpda:'+actor,action,targetType,targetId,success,JSON.stringify({branchCode:req.scpdaBranchCode||'001',...meta}),req.requestId||null,req.ip||null,String(req.headers['user-agent']||'').slice(0,1024)]);}
  function certificate(claims){return jwt.sign({device_ref:claims.device_ref,device_id:claims.device_id,public_key:claims.public_key,iat:claims.iat,exp:claims.exp,jti:claims.jti,kind:'scpda-device',branch_code:claims.branch_code||'001',iss:ISSUER,aud:'scpda-device-'+(claims.branch_code||'001')},settings.deviceKey,{algorithm:'HS256'});}
- function deviceFrom(raw){let d;try{d=jwt.verify(string(raw,8192),settings.deviceKey,{algorithms:['HS256'],issuer:ISSUER,audience:['scpda-device-001','scpda-device-005'],clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'DEVICE_CERT_INVALID','ต้องเชื่อมเครื่องกับ SCPDA ก่อน');}
+ function deviceFrom(raw){let d;try{d=jwt.verify(string(raw,8192),settings.deviceKey,{algorithms:['HS256'],issuer:ISSUER,audience:['scpda-device-001','scpda-device-004','scpda-device-005'],clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'DEVICE_CERT_INVALID','ต้องเชื่อมเครื่องกับ SCPDA ก่อน');}
   if(d.kind!=='scpda-device'||!branchEnabled(config,d.branch_code)||d.aud!=='scpda-device-'+d.branch_code||!/^[a-f0-9]{64}$/.test(d.device_ref||'')||!UUID.test(d.device_id||'')||settings.revoked.has(d.device_ref)||digest(Buffer.from(d.public_key||'','base64'))!==d.device_ref)fail(401,'DEVICE_CERT_INVALID','เครื่องนี้ไม่ได้รับอนุญาต');publicKey(d.public_key);return d;}
  async function authenticate(req){let token=String(req.headers.authorization||'').match(/^Bearer ([A-Za-z0-9_.-]{1,8192})$/)?.[1],p;
-  try{p=jwt.verify(token||'',settings.sessionKey,{algorithms:['HS256'],issuer:ISSUER,audience:['scpda-read-001','scpda-read-005'],clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'LOGIN_REQUIRED','เข้าสู่ระบบ SCPDA อีกครั้ง');}
+  try{p=jwt.verify(token||'',settings.sessionKey,{algorithms:['HS256'],issuer:ISSUER,audience:['scpda-read-001','scpda-read-004','scpda-read-005'],clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'LOGIN_REQUIRED','เข้าสู่ระบบ SCPDA อีกครั้ง');}
   const op=settings.operators.get(p.sub);if(!op||p.kind!=='scpda-reader'||!branchEnabled(config,p.branch_code)||p.branch_code!==op.branchCode||p.aud!=='scpda-read-'+p.branch_code||p.role!=='reader'||p.cv!==op.fingerprint||!UUID.test(p.jti||'')||settings.revoked.has(p.device_ref))fail(401,'LOGIN_REQUIRED','เข้าสู่ระบบ SCPDA อีกครั้ง');
   const blocked=await db.query("SELECT 1 FROM public.audit_logs WHERE action='scpda.logout' AND target_type='scpda_session' AND target_id=$1 AND success=TRUE LIMIT 1",[p.jti]);if(blocked.rows.length)fail(401,'SESSION_ENDED','ออกจากระบบแล้ว กรุณาใส่รหัสผ่านอีกครั้ง');req.scpdaBranchCode=op.branchCode;return {claims:p,operator:op};
  }

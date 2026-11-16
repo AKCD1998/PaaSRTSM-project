@@ -3,7 +3,7 @@ const CONTRACT='scpda-stock-check-001-v1';
 const categories=new Set(['all','pharma','normal','common']);
 function queryOptions(query){
  const category=query.category||'all',search=String(query.search||'').trim();
- if(!categories.has(category)||search.length>200||query.branchCode&&!['001','005'].includes(query.branchCode))throw Object.assign(Error('ตรวจหมวด สาขา หรือคำค้นหา'),{status:400});
+ if(!categories.has(category)||search.length>200||query.branchCode&&!['001','004','005'].includes(query.branchCode))throw Object.assign(Error('ตรวจหมวด สาขา หรือคำค้นหา'),{status:400});
  const integer=(v,fallback,max)=>v===undefined?fallback:/^\d+$/.test(String(v))&&Number(v)<=max?Number(v):NaN;
  const limit=integer(query.limit,50,100),offset=integer(query.offset,0,1000000);
  if(!Number.isInteger(limit)||limit<1||!Number.isInteger(offset))throw Object.assign(Error('ตรวจจำนวนรายการต่อหน้า'),{status:400});
