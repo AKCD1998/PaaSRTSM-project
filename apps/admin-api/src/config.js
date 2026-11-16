@@ -226,6 +226,7 @@ function loadConfig(env = process.env) {
     preorderPendingUploadMaxAgeMinutes: parseIntWithFallback(env.PREORDER_PENDING_UPLOAD_MAX_AGE_MINUTES, 60),
     featureMobilePda: parseBool(env.FEATURE_MOBILE_PDA, false),
     featureScpdaRead001: parseBool(env.FEATURE_SCPDA_READ_001, false),
+    featureScpdaBranch005: parseBool(env.FEATURE_SCPDA_BRANCH_005, false),
     featureScpdaCounts001: parseBool(env.FEATURE_SCPDA_COUNTS_001, false),
     scpdaCountOperators001: env.SCPDA_COUNT_OPERATORS_001 || "",
     featureScpdaWeb001: parseBool(env.FEATURE_SCPDA_WEB_001, false),
