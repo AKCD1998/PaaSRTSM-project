@@ -1,0 +1,83 @@
+"use strict";
+const { randomUUID } = require('node:crypto');
+const KINDS = ['KY9','KY10','KY11'], BRANCHES = ['000','001','003','004','005'];
+function fail(status,message){throw Object.assign(new Error(message),{status});}
+function text(v,label,max=4000,required=true){if(v==null)v='';if(typeof v!=='string'||v.length>max)fail(400,`${label}ไม่ถูกต้อง`);v=v.trim();if(required&&!v)fail(400,`กรุณาระบุ${label}`);return v;}
+function choice(v,options,label){if(!options.includes(v))fail(400,`${label}ไม่ถูกต้อง`);return v;}
+function date(v,nullable=false){if(nullable&&(v==null||v===''))return null;const parsed=new Date(v+'T00:00:00Z');if(typeof v!=='string'||!/^20\d{2}-\d{2}-\d{2}$/.test(v)||!Number.isFinite(parsed.getTime())||parsed.toISOString().slice(0,10)!==v)fail(400,'วันที่ไม่ถูกต้อง');return v;}
+function uuid(v){if(typeof v!=='string'||!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(v))fail(400,'รหัสรายการไม่ถูกต้อง');return v;}
+function integer(v,min,max,label,nullable=false){if(nullable&&(v==null||v===''))return null;if(!Number.isSafeInteger(v)||v<min||v>max)fail(400,`${label}ไม่ถูกต้อง`);return v;}
+function requireAdmin(auth){if(auth?.role!=='admin'||!auth.userId)fail(403,'เฉพาะ admin');}
+function mergeRanges(ranges){const out=[];for(const [a,b] of [...ranges].sort((x,y)=>x[0]-y[0])){const last=out.at(-1);if(last&&a<=last[1]+1)last[1]=Math.max(last[1],b);else out.push([a,b]);}return out;}
+function parseRanges(value,total){
+ if(value==null||value==='')return null;
+ if(!Number.isSafeInteger(total))fail(400,'ต้องยืนยันจำนวนหน้าของไฟล์ก่อนระบุหน้าที่พิมพ์');
+ if(typeof value!=='string'||value.length>5000)fail(400,'ระบุเลขหน้า เช่น 1-5,8,10');
+ const entries=value.split(',');if(entries.length>1000)fail(400,'ช่วงหน้ามากเกินกำหนด');
+ return mergeRanges(entries.map(v=>{const m=v.trim().match(/^([1-9]\d*)(?:\s*-\s*([1-9]\d*))?$/);if(!m)fail(400,'รูปแบบเลขหน้าไม่ถูกต้อง');const a=Number(m[1]),b=Number(m[2]||m[1]);if(!Number.isSafeInteger(a)||!Number.isSafeInteger(b)||a>b||b>total)fail(400,'เลขหน้าเกินจำนวนหน้าหรือช่วงหน้าสลับกัน');return[a,b];}));
+}
+function rangeText(ranges){return ranges.map(([a,b])=>a===b?String(a):`${a}-${b}`).join(', ');}
+function parseDocument(body){
+ if(!body||typeof body!=='object'||Array.isArray(body))fail(400,'ข้อมูลเอกสารไม่ถูกต้อง');
+ const start=date(body.periodStart),end=date(body.periodEnd);if(end<start)fail(400,'วันที่สิ้นสุดต้องไม่ก่อนวันเริ่ม');
+ const pages=integer(body.pageCount,1,20000,'จำนวนหน้า',true),sha=text(body.sha256,'SHA',64,false).toLowerCase();if(sha&&!/^[a-f0-9]{64}$/.test(sha))fail(400,'SHA ต้องเป็นเลขฐานสิบหก 64 หลัก');
+ const sections=body.sections??[];if(!Array.isArray(sections)||sections.length>120)fail(400,'ข้อมูลแบ่งเดือนไม่ถูกต้อง');const months=new Set(),pageRanges=[];
+ for(const s of sections){if(!/^20\d{2}-(0[1-9]|1[0-2])$/.test(s.month)||months.has(s.month)||s.month<start.slice(0,7)||s.month>end.slice(0,7))fail(400,'เดือนย่อยไม่ถูกต้องหรือซ้ำ');months.add(s.month);integer(s.pageFrom,1,pages||0,'หน้าเริ่ม');integer(s.pageTo,s.pageFrom,pages||0,'หน้าสุดท้าย');pageRanges.push([s.pageFrom,s.pageTo]);}
+ for(let i=0;i<pageRanges.length;i++)for(let j=0;j<i;j++)if(pageRanges[i][0]<=pageRanges[j][1]&&pageRanges[j][0]<=pageRanges[i][1])fail(400,'หน้าเดือนย่อยทับซ้อนกัน');
+ const provenance=body.provenance??{};if(!provenance||typeof provenance!=='object'||Array.isArray(provenance)||JSON.stringify(provenance).length>20000)fail(400,'ที่มาเอกสารไม่ถูกต้อง');
+ return {sourceKey:text(body.sourceKey||randomUUID(),'รหัสแหล่งข้อมูล',240),kind:choice(body.reportKind,KINDS,'ประเภทรายงาน'),branch:choice(body.branchCode,BRANCHES,'สาขา'),start,end,version:text(body.version,'รุ่นเอกสาร',300),filename:text(body.filename,'ชื่อไฟล์',500),pages,sha:sha||null,reference:text(body.sourceReference,'แหล่งเก็บไฟล์',4000),sections,provenance,supersedes:body.supersedes?uuid(body.supersedes):null,reason:text(body.reason,'เหตุผลการลงทะเบียน')};
+}
+function parseConfirmation(body,doc){
+ if(!body||typeof body!=='object'||Array.isArray(body))fail(400,'ข้อมูลการพิมพ์ไม่ถูกต้อง');
+ if(body.physicalPrinted!==true)fail(400,'ต้องยืนยันว่าพิมพ์เป็นกระดาษแล้ว การสร้าง PDF หรือดาวน์โหลดไม่นับเป็นการพิมพ์');
+ const ranges=parseRanges(body.pages,doc.page_count),printedOn=date(body.printedOn,true);if(printedOn&&printedOn>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date()))fail(400,'วันที่พิมพ์ต้องไม่เป็นอนาคต');
+ if(ranges==null&&body.unknownPages!==true)fail(400,'ระบุหน้าที่พิมพ์ หรือเลือกยืนยันว่ายังไม่ทราบเลขหน้า');
+ return {ranges,printedOn,copies:integer(body.copies,1,1000,'จำนวนชุด',true),printer:text(body.printerName,'เครื่องพิมพ์',300,false)||null,evidenceType:choice(body.evidenceType,['user_confirmation','printer_receipt','photo'],'ประเภทหลักฐาน'),evidence:text(body.evidenceReference,'หลักฐานการพิมพ์',8000),reason:text(body.reason,'เหตุผลการบันทึก')};
+}
+function summarizeDocument(doc,events,month=''){
+ const voided=new Set(events.filter(e=>e.action==='voided').map(e=>e.voids_event_id)),active=events.filter(e=>e.action==='confirmed'&&!voided.has(e.id));
+ const all=mergeRanges(active.flatMap(e=>e.page_ranges||[]));if(all.some(([a,b])=>!Number.isSafeInteger(a)||!Number.isSafeInteger(b)||a<1||a>b||!doc.page_count||b>doc.page_count))fail(500,'ประวัติเลขหน้าไม่ตรงกับไฟล์เอกสาร');
+ const known=all.reduce((n,[a,b])=>n+b-a+1,0),scopeUnknown=active.some(e=>e.page_ranges==null);
+ const section=month?(doc.sections||[]).find(s=>s.month===month):null,multi=doc.period_start.slice(0,7)!==doc.period_end.slice(0,7),mapped=!(month&&multi&&!section);
+ const bounds=section?[section.pageFrom,section.pageTo]:[1,doc.page_count];const selected=mapped&&doc.page_count?all.map(([a,b])=>[Math.max(a,bounds[0]),Math.min(b,bounds[1])]).filter(([a,b])=>a<=b):[];
+ const count=mapped?selected.reduce((n,[a,b])=>n+b-a+1,0):null,total=mapped&&doc.page_count?bounds[1]-bounds[0]+1:null;
+ const globalStatus=doc.page_count&&known===doc.page_count?'confirmed_printed':known?'partially_confirmed':scopeUnknown?'confirmed_scope_unknown':'waiting_confirmation';
+ const status=mapped&&total?count===total?'confirmed_printed':count?'partially_confirmed':scopeUnknown?'confirmed_scope_unknown':'waiting_confirmation':globalStatus;
+ return {...doc,status,globalStatus,confirmedPages:count,scopeTotalPages:total,pendingPages:total==null?null:total-count,confirmedRanges:rangeText(selected),allConfirmedRanges:rangeText(all),scopeUnknown,monthPagesMapped:mapped,selectedSection:section,confirmationCount:active.length};
+}
+function createReportPrintRegister(db){
+ async function transaction(auth,fn){requireAdmin(auth);const c=await db.connect();try{await c.query('BEGIN');const value=await fn(c);await c.query('COMMIT');return value;}catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}}
+ async function document(c,id,lock=false){uuid(id);const d=(await c.query(`SELECT *,period_start::text,period_end::text FROM report_print_register.documents WHERE id=$1${lock?' FOR UPDATE':''}`,[id])).rows[0];if(!d)fail(404,'ไม่พบไฟล์เอกสาร');return d;}
+ async function list(auth,filters={}){
+  requireAdmin(auth);const args=[],where=[],bind=v=>{args.push(v);return'$'+args.length;};
+  if(filters.kind)where.push('report_kind='+bind(choice(filters.kind,KINDS,'ประเภทรายงาน')));
+  if(filters.branch)where.push('branch_code='+bind(choice(filters.branch,BRANCHES,'สาขา')));
+  if(filters.month){if(!/^20\d{2}-(0[1-9]|1[0-2])$/.test(filters.month))fail(400,'เดือนเอกสารไม่ถูกต้อง');const m=bind(filters.month);where.push(`period_start < (${m}||'-01')::date+interval '1 month' AND period_end >= (${m}||'-01')::date`);}
+  if(filters.version)where.push('version_label ILIKE '+bind('%'+text(filters.version,'รุ่น',150)+'%'));
+  const docs=(await db.query(`SELECT *,period_start::text,period_end::text FROM report_print_register.documents ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY report_kind,branch_code,period_start DESC,created_at DESC LIMIT 1001`,args)).rows;
+  if(docs.length>1000)fail(400,'พบเอกสารมากเกินไป กรุณาเลือกสาขา เดือน หรือรุ่น');
+  const events=docs.length?(await db.query('SELECT *,printed_on::text FROM report_print_register.events WHERE document_id=ANY($1::uuid[]) ORDER BY recorded_at,id',[docs.map(d=>d.id)])).rows:[];
+  let rows=docs.map(d=>summarizeDocument(d,events.filter(e=>e.document_id===d.id),filters.month));
+  if(filters.status){choice(filters.status,['waiting_confirmation','confirmed_printed','partially_confirmed','confirmed_scope_unknown'],'สถานะ');rows=rows.filter(d=>d.status===filters.status);}
+  const unbound=(await db.query('SELECT * FROM report_print_register.unmapped_evidence ORDER BY recorded_at DESC LIMIT 100')).rows.filter(e=>(!filters.kind||e.report_kind===filters.kind)&&(!filters.branch||e.branch_code===filters.branch)&&(!filters.month||e.month===filters.month));
+  return {documents:rows,unmappedEvidence:unbound,meaning:'Physical paper-print confirmations only. File creation, PDF rendering and downloads never confirm printing.'};
+ }
+ async function detail(auth,id){requireAdmin(auth);const d=await document(db,id);const events=(await db.query('SELECT *,printed_on::text FROM report_print_register.events WHERE document_id=$1 ORDER BY recorded_at DESC,id',[id])).rows;return{document:summarizeDocument(d,events),events};}
+ async function register(auth,body){const d=parseDocument(body);return transaction(auth,async c=>{
+  if(d.supersedes){const prev=await document(c,d.supersedes);if(prev.report_kind!==d.kind||prev.branch_code!==d.branch)fail(400,'ฉบับก่อนหน้าต้องเป็นรายงานประเภทเดียวกันและสาขาเดียวกัน');}
+  const id=randomUUID();try{await c.query(`INSERT INTO report_print_register.documents(id,source_key,report_kind,branch_code,period_start,period_end,version_label,filename,page_count,sha256,source_reference,sections,provenance,supersedes,registered_by,registration_reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16)`,[id,d.sourceKey,d.kind,d.branch,d.start,d.end,d.version,d.filename,d.pages,d.sha,d.reference,JSON.stringify(d.sections),JSON.stringify(d.provenance),d.supersedes,String(auth.userId),d.reason]);}catch(e){if(e.code==='23505')fail(409,'แหล่งข้อมูลนี้ลงทะเบียนแล้ว');throw e;}return{id};
+ });}
+ async function confirm(auth,id,body){return transaction(auth,async c=>{
+  const doc=await document(c,id,true),e=parseConfirmation(body,doc),eventId=randomUUID();
+  const requestKey=uuid(body.requestKey),prior=(await c.query('SELECT *,printed_on::text FROM report_print_register.events WHERE source_key=$1',[requestKey])).rows[0];
+  if(prior){if(prior.document_id!==id||prior.action!=='confirmed'||JSON.stringify(prior.page_ranges)!==JSON.stringify(e.ranges)||prior.printed_on!==e.printedOn||prior.copies!==e.copies||prior.printer_name!==e.printer||prior.evidence_type!==e.evidenceType||prior.evidence_reference!==e.evidence||prior.reason!==e.reason)fail(409,'คำขอนี้ถูกใช้กับข้อมูลอื่นแล้ว กรุณาโหลดใหม่');return{id:prior.id,reused:true};}
+  await c.query(`INSERT INTO report_print_register.events(id,document_id,source_key,action,page_ranges,printed_on,copies,printer_name,evidence_type,evidence_reference,reason,recorded_by) VALUES($1,$2,$3,'confirmed',$4::jsonb,$5,$6,$7,$8,$9,$10,$11)`,[eventId,id,requestKey,e.ranges==null?null:JSON.stringify(e.ranges),e.printedOn,e.copies,e.printer,e.evidenceType,e.evidence,e.reason,String(auth.userId)]);return{id:eventId};
+ });}
+ async function voidEvent(auth,id,eventId,body){uuid(eventId);const why=text(body.reason,'เหตุผลแก้ไขประวัติ');return transaction(auth,async c=>{
+  await document(c,id,true);const target=(await c.query("SELECT * FROM report_print_register.events WHERE id=$1 AND document_id=$2 AND action='confirmed'",[eventId,id])).rows[0];if(!target)fail(404,'ไม่พบการยืนยันของไฟล์นี้');
+  if((await c.query('SELECT id FROM report_print_register.events WHERE voids_event_id=$1',[eventId])).rows.length)fail(409,'รายการนี้ถูกยกเลิกแล้ว');
+  const key=randomUUID();await c.query("INSERT INTO report_print_register.events(id,document_id,action,voids_event_id,evidence_reference,reason,recorded_by) VALUES($1,$2,'voided',$3,$4,$5,$6)",[key,id,eventId,'ยกเลิกการยืนยันเดิมโดยคงประวัติ',why,String(auth.userId)]);return{id:key};
+ });}
+ return{list,detail,register,confirm,voidEvent};
+}
+module.exports={createReportPrintRegister,parseDocument,parseConfirmation,parseRanges,mergeRanges,rangeText,summarizeDocument};
