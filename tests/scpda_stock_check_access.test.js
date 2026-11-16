@@ -17,7 +17,8 @@ test('disabled and denied stock-check routes never query data',async()=>{
 test('catalog category and paging inputs cannot introduce another branch or unbounded pages',()=>{
  assert.deepEqual(queryOptions({}),{category:'all',search:'',limit:50,offset:0,branchCode:'001'});
  assert.equal(queryOptions({branchCode:'005'}).branchCode,'005');
- for(const q of [{category:'other'},{branchCode:'004'},{limit:101},{limit:0},{offset:-1}])assert.throws(()=>queryOptions(q));
+ assert.equal(queryOptions({branchCode:'004'}).branchCode,'004');
+ for(const q of [{category:'other'},{branchCode:'003'},{limit:101},{limit:0},{offset:-1}])assert.throws(()=>queryOptions(q));
 });
 test('count admission defaults to no operators and rejects non-admitted existing reader/counter tokens',async()=>{
  const records=['01001','02001','03001'].map(operatorCode=>({operatorCode,hash:bcrypt.hashSync('1111',12),version:crypto.randomUUID(),rotationDueAt:'2027-05-15T00:00:00Z'})),config={featureScpdaRead001:true,featureScpdaCounts001:true,authJwtSecret:'synthetic-count-admission-key',scpdaOperatorCredentialsJson:JSON.stringify(records)},settings=parseConfig(config),db={query:async()=>({rows:[]})};
@@ -39,4 +40,19 @@ test('005 requires its own feature, allowlist and branch-bound audience before q
  await assert.rejects(open.verify(req('001','scpda-read-001'),'reader'),e=>e.code==='COUNT_ACCESS_REQUIRED');
  await assert.rejects(open.verify(req('005','scpda-read-001'),'reader'),e=>e.code==='COUNT_ACCESS_REQUIRED');
  await assert.rejects(createCountAccess({config:{...config,featureScpdaBranch005:true,scpdaCountOperators001:'01001'},db}).verify(req(),'reader'),e=>e.code==='COUNT_OPERATOR_NOT_ADMITTED');
+});
+
+test('004 requires its own feature, allowlist and branch-bound audience before querying data',async()=>{
+ const records=['01001','02001','03001','01004'].map(operatorCode=>({operatorCode,hash:bcrypt.hashSync('fixture-only-password',12),version:crypto.randomUUID(),rotationDueAt:'2027-05-16T00:00:00Z'}));
+ const config={authJwtSecret:'synthetic-004-only-secret',featureScpdaRead001:true,featureScpdaCounts001:true,scpdaCountOperators001:'01001,01004',scpdaOperatorCredentialsJson:JSON.stringify(records)};
+ const settings=parseConfig(config),db={query:async()=>({rows:[]})};
+ const token=(branch,aud)=>jwt.sign({sub:'01004',role:'reader',kind:'scpda-reader',branch_code:branch,cv:settings.operators.get('01004').fingerprint,jti:crypto.randomUUID(),device_ref:'b'.repeat(64)},settings.sessionKey,{algorithm:'HS256',issuer:'sc-stockday',audience:aud,expiresIn:'1h'});
+ const req=(branch='004',aud='scpda-read-004')=>({headers:{authorization:'Bearer '+token(branch,aud)}});
+ await assert.rejects(createCountAccess({config,db}).verify(req(),'reader'),e=>e.code==='COUNT_ACCESS_REQUIRED');
+ await assert.rejects(createCountAccess({config:{...config,featureScpdaBranch005:true},db}).verify(req(),'reader'),e=>e.code==='COUNT_ACCESS_REQUIRED');
+ const open=createCountAccess({config:{...config,featureScpdaBranch004:true},db});
+ assert.equal((await open.verify(req(),'reader')).branchCode,'004');
+ await assert.rejects(open.verify(req('001','scpda-read-001'),'reader'),e=>e.code==='COUNT_ACCESS_REQUIRED');
+ await assert.rejects(open.verify(req('004','scpda-read-001'),'reader'),e=>e.code==='COUNT_ACCESS_REQUIRED');
+ await assert.rejects(createCountAccess({config:{...config,featureScpdaBranch004:true,scpdaCountOperators001:'01001'},db}).verify(req(),'reader'),e=>e.code==='COUNT_OPERATOR_NOT_ADMITTED');
 });
