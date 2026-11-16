@@ -200,6 +200,11 @@ function loadConfig(env = process.env) {
     cipdataSupabaseUrl: env.CIPDATA_SUPABASE_URL || "",
     cipdataSupabaseServiceRoleKey: env.CIPDATA_SUPABASE_SERVICE_ROLE_KEY || "",
     authJwtSecret: env.AUTH_JWT_SECRET || "",
+    codexBranchStockIdentity: {
+      clientId: (env.CODEX_BRANCH_STOCK_GOOGLE_CLIENT_ID || "").trim(),
+      subject: (env.CODEX_BRANCH_STOCK_GOOGLE_SUB || "").trim(),
+      email: (env.CODEX_BRANCH_STOCK_GOOGLE_EMAIL || "").trim().toLowerCase(),
+    },
     cookieName: env.COOKIE_NAME || "admin_session",
     cookieSecure,
     cookieSameSite,
