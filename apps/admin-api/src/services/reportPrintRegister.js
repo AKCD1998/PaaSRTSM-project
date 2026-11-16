@@ -54,7 +54,7 @@ function createReportPrintRegister(db){
   if(filters.branch)where.push('branch_code='+bind(choice(filters.branch,BRANCHES,'สาขา')));
   if(filters.month){if(!/^20\d{2}-(0[1-9]|1[0-2])$/.test(filters.month))fail(400,'เดือนเอกสารไม่ถูกต้อง');const m=bind(filters.month);where.push(`period_start < (${m}||'-01')::date+interval '1 month' AND period_end >= (${m}||'-01')::date`);}
   if(filters.version)where.push('version_label ILIKE '+bind('%'+text(filters.version,'รุ่น',150)+'%'));
-  const docs=(await db.query(`SELECT *,period_start::text,period_end::text FROM report_print_register.documents ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY report_kind,branch_code,period_start DESC,created_at DESC LIMIT 1001`,args)).rows;
+  const docs=(await db.query(`SELECT d.*,d.period_start::text,d.period_end::text FROM report_print_register.documents d ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY d.report_kind,d.branch_code,d.period_start DESC,d.created_at DESC LIMIT 1001`,args)).rows;
   if(docs.length>1000)fail(400,'พบเอกสารมากเกินไป กรุณาเลือกสาขา เดือน หรือรุ่น');
   const events=docs.length?(await db.query('SELECT *,printed_on::text FROM report_print_register.events WHERE document_id=ANY($1::uuid[]) ORDER BY recorded_at,id',[docs.map(d=>d.id)])).rows:[];
   let rows=docs.map(d=>summarizeDocument(d,events.filter(e=>e.document_id===d.id),filters.month));

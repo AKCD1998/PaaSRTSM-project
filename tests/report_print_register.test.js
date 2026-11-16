@@ -23,7 +23,7 @@ const dbUrl=process.env.KY9_DOCUMENTS_TEST_DATABASE_URL;
  const d={sourceKey:'synthetic-document',reportKind:'KY11',branchCode:'001',periodStart:'2026-07-01',periodEnd:'2026-09-30',version:'SYNTHETIC',filename:'test.pdf',pageCount:10,sourceReference:'isolated test',reason:'test register',sections:[{month:'2026-07',pageFrom:1,pageTo:4},{month:'2026-08',pageFrom:5,pageTo:7},{month:'2026-09',pageFrom:8,pageTo:10}],provenance:{pdfCreated:true,printedQuantity:1000}};
  const created=await send('post','',d).expect(200),id=created.body.id;
  await send('post','',d).expect(409);
- let result=await send('get','').expect(200);assert.equal(result.body.documents[0].status,'waiting_confirmation');assert.equal((await db.query('SELECT count(*)::int n FROM report_print_register.events')).rows[0].n,0);
+ let result=await send('get','').expect(r=>assert.equal(r.status,200,JSON.stringify(r.body)));assert.equal(result.body.documents[0].status,'waiting_confirmation');assert.equal((await db.query('SELECT count(*)::int n FROM report_print_register.events')).rows[0].n,0);
  const confirm={physicalPrinted:true,requestKey:randomUUID(),pages:'1-3',printedOn:null,copies:null,evidenceType:'user_confirmation',evidenceReference:'synthetic explicit paper confirmation',reason:'test evidence'};
  await send('post',`/${id}/confirmations`,{...confirm,physicalPrinted:false}).expect(400);
  await send('post',`/${id}/confirmations`,{...confirm,pages:'1-11'}).expect(400);
