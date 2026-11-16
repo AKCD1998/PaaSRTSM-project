@@ -33,6 +33,7 @@ const { createLoyaltyRouter } = require("./routes/loyalty");
 const { createMembersRouter } = require("./routes/members");
 const { createPosDeviceAdminRouter } = require("./routes/pos-device-admin");
 const { createKy9DocumentsRouter } = require("./routes/ky9-documents");
+const { createReportPrintRegisterRouter } = require("./routes/report-print-register");
 const { createPjkDocumentsRouter } = require("./routes/pjk-documents");
 const { createSccrmMemberDirectoryRouter } = require("./routes/sccrm-member-directory");
 const { createOrderingRouter } = require("./routes/ordering");
@@ -216,6 +217,7 @@ function createApp(overrides = {}) {
   app.use("/api/scpda", createScpdaReadRouter({ config, db }));
   app.use("/api/admin/pos-devices", createPosDeviceAdminRouter({ config }));
   app.use("/api/admin/ky9-documents", createKy9DocumentsRouter({ config, db }));
+  app.use("/api/admin/report-print-register", createReportPrintRegisterRouter({ config, db }));
   app.use("/api/admin/pjk-documents", createPjkDocumentsRouter({ config, db }));
   app.use("/api/admin/sccrm-members", createSccrmMemberDirectoryRouter({ config }));
   app.use("/sccrm", createCrmWebRouter());
