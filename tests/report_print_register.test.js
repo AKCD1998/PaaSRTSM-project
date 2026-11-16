@@ -8,7 +8,7 @@ const cookie=(role='admin')=>`test_print_session=${signSessionToken({sub:'synthe
 function appWith(db){const app=express();app.use(express.json());app.use(cookieParser());app.use(base,createReportPrintRegisterRouter({config,db}));app.use((e,_req,res,_next)=>res.status(e.status||500).json({error:e.message}));return app;}
 test('print registry requires admin on reads and CSRF on every write before touching DB',async()=>{
  const app=appWith({query(){assert.fail('unauthorized query');},connect(){assert.fail('unauthorized connection');}}),id=randomUUID();
- for(const [verb,suffix] of [['get',''],['get','/'+id],['post',''],['post',`/${id}/confirmations`],['post',`/${id}/confirmations/${randomUUID()}/void`]]){
+ for(const [verb,suffix] of [['get',''],['get','/'+id],['post',''],['post','/imports/preview'],['post','/imports'],['post',`/${id}/confirmations`],['post',`/${id}/confirmations/${randomUUID()}/void`]]){
   await request(app)[verb](base+suffix).expect(401);
   for(const role of ['branch','staff','superadmin'])await request(app)[verb](base+suffix).set('Cookie',cookie(role)).set('X-CSRF-Token',csrf).send({}).expect(403);
   if(verb==='post')await request(app)[verb](base+suffix).set('Cookie',cookie()).send({}).expect(403);
@@ -42,4 +42,11 @@ const dbUrl=process.env.KY9_DOCUMENTS_TEST_DATABASE_URL;
  await db.query('INSERT INTO report_print_register.unmapped_evidence(id,source_key,report_kind,branch_code,month,summary,evidence_reference,recorded_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[randomUUID(),'synthetic-photo','KY9','005','2026-09','paper photo, version unknown','synthetic image','test']);
  result=await send('get','?kind=KY9&month=2026-09').expect(200);assert.equal(result.body.documents.length,0);assert.equal(result.body.unmappedEvidence.length,1);
  await send('get','?month=2569-09').expect(400);
+ const importedDoc={...d,sourceKey:'synthetic-imported',branchCode:'003',version:'IMPORTED'};
+ const seed={schema:'sc.report-print-register.private-seed.v1',documents:[importedDoc],confirmations:[{...confirm,sourceKey:'synthetic-import-confirmation',documentSourceKey:importedDoc.sourceKey,pages:'1-10'}],unmappedEvidence:[]};
+ const preview=(await send('post','/imports/preview',{seed}).expect(200)).body;assert.equal(preview.paperConfirmations,1);
+ await send('post','/imports',{seed,previewDigest:preview.digest}).expect(400);
+ const imported=(await send('post','/imports',{seed,previewDigest:preview.digest,confirmImport:true}).expect(200)).body;assert.equal(imported.documentsAdded,1);assert.equal(imported.confirmationsAdded,1);
+ const repeated=(await send('post','/imports',{seed,previewDigest:preview.digest,confirmImport:true}).expect(200)).body;assert.equal(repeated.documentsAdded,0);assert.equal(repeated.confirmationsAdded,0);
+ await send('post','/imports',{seed:{...seed,documents:[{...importedDoc,filename:'changed.pdf'}]},previewDigest:preview.digest,confirmImport:true}).expect(409);
 });

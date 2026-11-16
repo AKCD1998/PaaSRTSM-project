@@ -1,5 +1,6 @@
 "use strict";
-const { randomUUID } = require('node:crypto');
+const { randomUUID,createHash } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const KINDS = ['KY9','KY10','KY11'], BRANCHES = ['000','001','003','004','005'];
 function fail(status,message){throw Object.assign(new Error(message),{status});}
 function text(v,label,max=4000,required=true){if(v==null)v='';if(typeof v!=='string'||v.length>max)fail(400,`${label}ไม่ถูกต้อง`);v=v.trim();if(required&&!v)fail(400,`กรุณาระบุ${label}`);return v;}
@@ -78,6 +79,39 @@ function createReportPrintRegister(db){
   if((await c.query('SELECT id FROM report_print_register.events WHERE voids_event_id=$1',[eventId])).rows.length)fail(409,'รายการนี้ถูกยกเลิกแล้ว');
   const key=randomUUID();await c.query("INSERT INTO report_print_register.events(id,document_id,action,voids_event_id,evidence_reference,reason,recorded_by) VALUES($1,$2,'voided',$3,$4,$5,$6)",[key,id,eventId,'ยกเลิกการยืนยันเดิมโดยคงประวัติ',why,String(auth.userId)]);return{id:key};
  });}
- return{list,detail,register,confirm,voidEvent};
+ function inspectImport(seed){
+  if(seed?.schema!=='sc.report-print-register.private-seed.v1'||!Array.isArray(seed.documents)||seed.documents.length>200||!Array.isArray(seed.confirmations)||seed.confirmations.length>500||!Array.isArray(seed.unmappedEvidence)||seed.unmappedEvidence.length>100)fail(400,'รูปแบบไฟล์ทะเบียนไม่ถูกต้องหรือมีรายการมากเกินกำหนด');
+  const seen=new Set();
+  for(const raw of seed.documents){const d=parseDocument(raw);if(seen.has(d.sourceKey))fail(400,'รหัสไฟล์ซ้ำในชุดนำเข้า');seen.add(d.sourceKey);if(raw.supersedesSourceKey)text(raw.supersedesSourceKey,'รหัสรุ่นก่อน',240);}
+  for(const raw of seed.confirmations){text(raw.sourceKey,'รหัสหลักฐาน',240);text(raw.documentSourceKey,'รหัสไฟล์ของหลักฐาน',240);const d=seed.documents.find(d=>d.sourceKey===raw.documentSourceKey);if(!d)fail(400,'หลักฐานต้องอ้างถึงไฟล์ในชุดนำเข้านี้');parseConfirmation(raw,{page_count:d.pageCount});}
+  for(const e of seed.unmappedEvidence){text(e.sourceKey,'รหัสภาพหลักฐาน',240);choice(e.reportKind,KINDS,'ประเภทหลักฐาน');choice(e.branchCode,BRANCHES,'สาขาของหลักฐาน');if(!/^20\d{2}-(0[1-9]|1[0-2])$/.test(e.month))fail(400,'เดือนหลักฐานไม่ถูกต้อง');text(e.summary,'สรุปภาพหลักฐาน',8000);text(e.evidenceReference,'แหล่งหลักฐาน',8000);}
+  return{digest:createHash('sha256').update(JSON.stringify(seed)).digest('hex'),documents:seed.documents.length,paperConfirmations:seed.confirmations.length,unmappedEvidence:seed.unmappedEvidence.length};
+ }
+ async function previewImport(auth,body){requireAdmin(auth);return inspectImport(body.seed);}
+ async function importHistory(auth,body){
+  const preview=inspectImport(body.seed);if(body.confirmImport!==true)fail(400,'กรุณาทบทวนและยืนยันการนำเข้าทะเบียน');if(body.previewDigest!==preview.digest)fail(409,'ไฟล์นำเข้าเปลี่ยนแล้ว กรุณาตรวจตัวอย่างอีกครั้ง');
+  return transaction(auth,async c=>{
+   await c.query("SELECT pg_advisory_xact_lock(hashtext('report-print-register:history-import'))");const ids=new Map(),seed=body.seed;let documentsAdded=0,confirmationsAdded=0,evidenceAdded=0;
+   for(const raw of seed.documents){
+    let prior=null;if(raw.supersedesSourceKey){prior=(await c.query('SELECT id FROM report_print_register.documents WHERE source_key=$1',[raw.supersedesSourceKey])).rows[0]?.id;if(!prior)fail(400,'นำเข้ารุ่นก่อนหน้าก่อนรุ่นใหม่ที่อ้างถึง');}
+    const d=parseDocument({...raw,supersedes:prior||raw.supersedes}),id=randomUUID();
+    if(d.supersedes){const prev=await document(c,d.supersedes);if(prev.report_kind!==d.kind||prev.branch_code!==d.branch)fail(400,'รุ่นก่อนหน้าต้องเป็นประเภทและสาขาเดียวกัน');}
+    const inserted=await c.query(`INSERT INTO report_print_register.documents(id,source_key,report_kind,branch_code,period_start,period_end,version_label,filename,page_count,sha256,source_reference,sections,provenance,supersedes,registered_by,registration_reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16) ON CONFLICT(source_key) DO NOTHING RETURNING id`,[id,d.sourceKey,d.kind,d.branch,d.start,d.end,d.version,d.filename,d.pages,d.sha,d.reference,JSON.stringify(d.sections),JSON.stringify(d.provenance),d.supersedes,String(auth.userId),d.reason]);documentsAdded+=inserted.rowCount;
+    const v=(await c.query('SELECT *,period_start::text,period_end::text FROM report_print_register.documents WHERE source_key=$1',[d.sourceKey])).rows[0];
+    if(v.report_kind!==d.kind||v.branch_code!==d.branch||v.period_start!==d.start||v.period_end!==d.end||v.filename!==d.filename||v.page_count!==d.pages||v.sha256!==d.sha||v.version_label!==d.version||v.source_reference!==d.reference||v.supersedes!==d.supersedes||!isDeepStrictEqual(v.sections,d.sections)||!isDeepStrictEqual(v.provenance,d.provenance))fail(409,'รหัสแหล่งข้อมูลเดิมมีเนื้อหาต่างกัน ต้องลงทะเบียนเป็นรุ่นใหม่');ids.set(d.sourceKey,v.id);
+   }
+   for(const raw of seed.confirmations){
+    const rawDoc=seed.documents.find(d=>d.sourceKey===raw.documentSourceKey),e=parseConfirmation(raw,{page_count:rawDoc.pageCount}),id=randomUUID(),docId=ids.get(raw.documentSourceKey);
+    const result=await c.query(`INSERT INTO report_print_register.events(id,document_id,source_key,action,page_ranges,printed_on,copies,printer_name,evidence_type,evidence_reference,reason,recorded_by) VALUES($1,$2,$3,'confirmed',$4::jsonb,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(source_key) DO NOTHING RETURNING id`,[id,docId,raw.sourceKey,e.ranges==null?null:JSON.stringify(e.ranges),e.printedOn,e.copies,e.printer,e.evidenceType,e.evidence,e.reason,String(auth.userId)]);confirmationsAdded+=result.rowCount;
+    const v=(await c.query('SELECT *,printed_on::text FROM report_print_register.events WHERE source_key=$1',[raw.sourceKey])).rows[0];if(v.document_id!==docId||v.action!=='confirmed'||!isDeepStrictEqual(v.page_ranges,e.ranges)||v.printed_on!==e.printedOn||v.copies!==e.copies||v.printer_name!==e.printer||v.evidence_type!==e.evidenceType||v.evidence_reference!==e.evidence||v.reason!==e.reason)fail(409,'หลักฐานเดิมมีเนื้อหาต่างกัน กรุณาบันทึกเป็นรายการใหม่');
+   }
+   for(const e of seed.unmappedEvidence){
+    const inserted=await c.query('INSERT INTO report_print_register.unmapped_evidence(id,source_key,report_kind,branch_code,month,summary,evidence_reference,recorded_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(source_key) DO NOTHING RETURNING id',[randomUUID(),e.sourceKey,e.reportKind,e.branchCode,e.month,e.summary,e.evidenceReference,String(auth.userId)]);evidenceAdded+=inserted.rowCount;
+    const v=(await c.query('SELECT * FROM report_print_register.unmapped_evidence WHERE source_key=$1',[e.sourceKey])).rows[0];if(v.report_kind!==e.reportKind||v.branch_code!==e.branchCode||v.month!==e.month||v.summary!==e.summary||v.evidence_reference!==e.evidenceReference)fail(409,'ภาพหลักฐานเดิมมีข้อมูลต่างกัน');
+   }
+   return{...preview,documentsAdded,confirmationsAdded,evidenceAdded};
+  });
+ }
+ return{list,detail,register,confirm,voidEvent,previewImport,importHistory};
 }
 module.exports={createReportPrintRegister,parseDocument,parseConfirmation,parseRanges,mergeRanges,rangeText,summarizeDocument};

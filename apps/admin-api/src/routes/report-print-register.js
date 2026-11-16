@@ -10,6 +10,8 @@ function createReportPrintRegisterRouter({config,db}){
  router.get('/',run(req=>service.list(req.auth,req.query)));
  router.get('/:id',run(req=>service.detail(req.auth,req.params.id)));
  router.use(requireCsrf);
+ router.post('/imports/preview',run(req=>service.previewImport(req.auth,req.body)));
+ router.post('/imports',run(req=>service.importHistory(req.auth,req.body)));
  router.post('/',run(req=>service.register(req.auth,req.body)));
  router.post('/:id/confirmations',run(req=>service.confirm(req.auth,req.params.id,req.body)));
  router.post('/:id/confirmations/:eventId/void',run(req=>service.voidEvent(req.auth,req.params.id,req.params.eventId,req.body)));
