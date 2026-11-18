@@ -103,8 +103,10 @@ function createCorsMiddleware(config) {
     const normalizedOrigin = normalizeOrigin(origin);
     // Separately approved browser capability: this Site, these bearer routes.
     // Does not add the Site to the general web-session/admin CORS allowlist.
-    const scpdaWeb = config.featureScpdaWeb001 === true
+    const scpdaWeb = (config.featureScpdaWeb001 === true
       && normalizedOrigin === "https://sc-stockday-pda-lab.scgroup1989-it.chatgpt.site"
+      || config.featureScpdaDaily005 === true
+      && normalizedOrigin === "https://sc-stockday-ordering.onrender.com")
       && /^\/api\/scpda(?:\/|$)/.test(req.path);
     const allowOrigin = scpdaWeb || config.corsAllowAllOrigins || config.corsAllowedOrigins.has(normalizedOrigin);
     if (!allowOrigin) {
@@ -568,6 +570,7 @@ function createApp(overrides = {}) {
 
 async function startServer() {
   const { app, config, db } = createApp();
+  const stopSelfieArchive=require('./services/scpdaSelfieArchive').startArchiveWorker({config,db});
   const server = app.listen(config.port, () => {
     // eslint-disable-next-line no-console
     console.log(`admin-api listening on port ${config.port}`);
@@ -609,6 +612,7 @@ async function startServer() {
   const focusCloseTimer = startFocusCloseSchedule({ db, logger: console });
 
   const shutdown = async () => {
+    stopSelfieArchive();
     if (focusCloseTimer) clearInterval(focusCloseTimer);
     if (assetCleanupTimer) clearInterval(assetCleanupTimer);
     if (preorderAttachmentCleanupTimer) clearInterval(preorderAttachmentCleanupTimer);
