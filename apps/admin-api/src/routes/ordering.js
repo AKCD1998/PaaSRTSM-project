@@ -1765,7 +1765,7 @@ function createOrderingRouter(deps) {
           datasets: r.datasets || null,
           latestHeartbeatAt: r.latest_heartbeat_at || null,
           heartbeatCount: Number(r.hb_count ?? 0),
-          recovery: r.recovery_status === "partial" || r.recovery_status === "complete"
+          recovery: (r.recovery_status === "partial" || r.recovery_status === "complete")
             ? {
                 status: r.recovery_status,
                 recoveredBySyncRunId: r.recovered_by_sync_run_id == null ? null : Number(r.recovered_by_sync_run_id),
