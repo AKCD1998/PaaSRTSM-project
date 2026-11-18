@@ -739,6 +739,162 @@ function buildStockSnapshotKey(snapshotAt, branchCode, warehouseCode, productCod
   ].join("|");
 }
 
+const STOCK_SNAPSHOT_RECOVERY_SOURCE_TABLE = "TCNMPdt+TCNTPdtStkCard (reconstructed)";
+
+function parseStockSnapshotRecoveryCompletion(body) {
+  const branchCode = normalizeText(body?.branchCode);
+  const coverageDate = normalizeText(body?.coverageDate);
+  const note = normalizeText(body?.note);
+  const snapshots = body?.snapshots;
+  const recoveredDatasets = body?.recoveredDatasets;
+  const evidence = body?.evidence;
+
+  if (!/^\d{3}$/.test(branchCode) || !/^\d{4}-\d{2}-\d{2}$/.test(coverageDate) || !note) {
+    return { error: "branchCode, coverageDate, and note are required." };
+  }
+  const parsedDate = new Date(`${coverageDate}T00:00:00.000Z`);
+  if (!Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== coverageDate) {
+    return { error: "coverageDate must be a valid YYYY-MM-DD date." };
+  }
+  if (!Array.isArray(snapshots) || snapshots.length < 1 || snapshots.length > 4) {
+    return { error: "snapshots must contain between one and four verified snapshots." };
+  }
+  if (!Array.isArray(recoveredDatasets) || recoveredDatasets.length < 1
+      || recoveredDatasets.some((dataset) => !normalizeText(dataset))) {
+    return { error: "recoveredDatasets must contain dataset names." };
+  }
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    return { error: "evidence must be a JSON object." };
+  }
+
+  const normalizedSnapshots = [];
+  const seen = new Set();
+  for (const snapshot of snapshots) {
+    const snapshotAt = normalizeText(snapshot?.snapshotAt);
+    const recordCount = Number(snapshot?.recordCount);
+    const stockHash = normalizeText(snapshot?.stockHash).toLowerCase();
+    if (!snapshotAt || !Number.isFinite(Date.parse(snapshotAt))
+        || !Number.isInteger(recordCount) || recordCount < 1 || !/^[a-f0-9]{32}$/.test(stockHash)) {
+      return { error: "Each snapshot requires snapshotAt, a positive recordCount, and an MD5 stockHash." };
+    }
+    if (seen.has(snapshotAt)) {
+      return { error: "snapshots must not contain duplicate snapshotAt values." };
+    }
+    seen.add(snapshotAt);
+    normalizedSnapshots.push({ snapshotAt, recordCount, stockHash });
+  }
+
+  return {
+    value: {
+      branchCode,
+      coverageDate,
+      note,
+      snapshots: normalizedSnapshots,
+      recoveredDatasets: [...new Set(recoveredDatasets.map((dataset) => normalizeText(dataset)))],
+      evidence,
+    },
+  };
+}
+
+function completeStockSnapshotRecoveryHandler(db) {
+  return async (req, res, next) => {
+    const { error, value } = parseStockSnapshotRecoveryCompletion(req.body);
+    if (error) return res.status(400).json({ message: error });
+
+    const client = await acquireIngestionDbClient(db, res, "sync-ada:stock-snapshot-recovery-complete");
+    if (!client) return;
+    let transactionStarted = false;
+    try {
+      await client.query("BEGIN");
+      transactionStarted = true;
+
+      const noteResult = await client.query(
+        `
+          SELECT recovery_status
+          FROM ingest.sync_run_recovery_notes
+          WHERE branch_code = $1 AND coverage_date = $2::date
+          FOR UPDATE
+        `,
+        [value.branchCode, value.coverageDate],
+      );
+      if (noteResult.rowCount === 0) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+        return res.status(404).json({ message: "No recovery note exists for this branch and date." });
+      }
+
+      for (const snapshot of value.snapshots) {
+        const verifyResult = await client.query(
+          `
+            SELECT
+              COUNT(*)::int AS record_count,
+              md5(string_agg(
+                product_code || '|' || to_char(qty_on_hand, 'FM999999999999990.0000'),
+                E'\\n' ORDER BY product_code
+              )) AS stock_hash,
+              bool_and((snapshot_at AT TIME ZONE 'Asia/Bangkok')::date = $3::date) AS date_matches
+            FROM ada.stock_snapshots
+            WHERE branch_code = $1
+              AND snapshot_at = $2::timestamptz
+              AND source_table = $4
+          `,
+          [
+            value.branchCode,
+            snapshot.snapshotAt,
+            value.coverageDate,
+            STOCK_SNAPSHOT_RECOVERY_SOURCE_TABLE,
+          ],
+        );
+        const verified = verifyResult.rows[0] || {};
+        if (Number(verified.record_count) !== snapshot.recordCount
+            || verified.stock_hash !== snapshot.stockHash
+            || verified.date_matches !== true) {
+          await client.query("ROLLBACK");
+          transactionStarted = false;
+          return res.status(409).json({
+            message: "Recovered stock rows do not match the supplied count, date, and hash.",
+            snapshotAt: snapshot.snapshotAt,
+          });
+        }
+      }
+
+      const updateResult = await client.query(
+        `
+          UPDATE ingest.sync_run_recovery_notes
+          SET recovery_status = 'complete',
+              recovered_datasets = ARRAY(
+                SELECT DISTINCT dataset
+                FROM unnest(COALESCE(recovered_datasets, '{}'::text[]) || $3::text[]) AS dataset
+                ORDER BY dataset
+              ),
+              missing_datasets = '{}'::text[],
+              evidence = COALESCE(evidence, '{}'::jsonb) || $4::jsonb,
+              note = $5,
+              recorded_at = now()
+          WHERE branch_code = $1 AND coverage_date = $2::date
+          RETURNING branch_code, coverage_date, recovery_status, recovered_datasets,
+                    missing_datasets, recorded_at
+        `,
+        [
+          value.branchCode,
+          value.coverageDate,
+          value.recoveredDatasets,
+          JSON.stringify(value.evidence),
+          value.note,
+        ],
+      );
+      await client.query("COMMIT");
+      transactionStarted = false;
+      return res.json({ recovery: updateResult.rows[0] || null, verifiedSnapshots: value.snapshots.length });
+    } catch (e) {
+      if (transactionStarted) await client.query("ROLLBACK");
+      return next(e);
+    } finally {
+      client.release();
+    }
+  };
+}
+
 function pick(record, keys, fallback = null) {
   for (const key of keys) {
     if (record[key] != null && record[key] !== "") {
@@ -2859,6 +3015,7 @@ function createAdaSyncRouter(deps) {
     }
   });
   router.post("/stock-snapshots", stockSnapshotsBatchHandler(db));
+  router.post("/stock-snapshot-recovery/complete", completeStockSnapshotRecoveryHandler(db));
   // Track C Slice 4 (2026-08-09): set-based batch UPSERT for /transfers,
   // replacing the two per-record loops (headers, lines) this route used to
   // run. Same request/response contract ({acceptedHeaders, acceptedLines}),
