@@ -284,6 +284,7 @@ function loadConfig(env = process.env) {
     transferDeltaEvidenceToken: env.TRANSFER_DELTA_EVIDENCE_TOKEN || "",
     crmMirrorBaseUrl: env.CRM_MIRROR_BASE_URL || "",
     crmMirrorInternalToken: env.CRM_MIRROR_INTERNAL_TOKEN || "",
+    crmMirrorTimeoutMs: parseIntWithFallback(env.CRM_MIRROR_TIMEOUT_MS, 30_000),
     crmAdaLinkAdminToken: env.SCCRM_ADA_LINK_ADMIN_TOKEN || "",
     erpProductCatalogInternalToken: env.ERP_PRODUCT_CATALOG_INTERNAL_TOKEN || "",
     staffBranchAllowlists: parseMultiValueMap(env.STAFF_BRANCH_ALLOWLISTS || "", {
