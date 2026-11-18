@@ -1701,6 +1701,7 @@ function createOrderingRouter(deps) {
                                      AND COALESCE(r.any_running, false) = false
                                      AND COALESCE(r.any_stale,   false) = false THEN 'pending'
             WHEN COALESCE(r.any_success, false) THEN 'success'
+            WHEN rn.recovery_status = 'complete' THEN 'success'
             WHEN rn.recovery_status = 'partial' THEN 'partial'
             WHEN COALESCE(r.any_failed,  false) THEN 'failed'
             WHEN COALESCE(r.any_running, false) THEN 'running'
@@ -1764,7 +1765,7 @@ function createOrderingRouter(deps) {
           datasets: r.datasets || null,
           latestHeartbeatAt: r.latest_heartbeat_at || null,
           heartbeatCount: Number(r.hb_count ?? 0),
-          recovery: r.status === "partial" && r.recovery_status === "partial"
+          recovery: r.recovery_status === "partial" || r.recovery_status === "complete"
             ? {
                 status: r.recovery_status,
                 recoveredBySyncRunId: r.recovered_by_sync_run_id == null ? null : Number(r.recovered_by_sync_run_id),
