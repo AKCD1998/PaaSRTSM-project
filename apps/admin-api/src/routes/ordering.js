@@ -1585,6 +1585,8 @@ function createOrderingRouter(deps) {
   // GET /api/sync/nightly-log?days=14
   // Admin UI's "ประวัติ Sync" calendar grid: per branch, per night, what happened.
   // - "success"  - ingest.sync_runs has a success row for that branch/date
+  // - "partial"  - a later successful run restored transaction data, but the
+  //                 exact-date branch stock snapshot is still unavailable
   // - "failed"   - ingest.sync_runs has a failed/running row, OR heartbeat exists but no run
   // - "running"  - ingest.sync_runs has a running row started recently (still plausibly in-flight)
   // - "stale"    - ingest.sync_runs has a running row started too long ago to still be
@@ -1662,6 +1664,24 @@ function createOrderingRouter(deps) {
           JOIN ingest.sync_run_datasets d ON d.sync_run_id = lr.sync_run_id
           GROUP BY lr.branch_code, lr.run_date
         ),
+        recovery_notes AS (
+          SELECT
+            n.branch_code,
+            n.coverage_date AS run_date,
+            n.recovery_status,
+            n.recovered_by_sync_run_id,
+            recovered_run.started_at AS recovered_by_started_at,
+            n.original_failed_run_ids,
+            n.recovered_datasets,
+            n.missing_datasets,
+            n.evidence,
+            n.note AS recovery_note,
+            n.recorded_at
+          FROM ingest.sync_run_recovery_notes n
+          LEFT JOIN ingest.sync_runs recovered_run
+            ON recovered_run.sync_run_id = n.recovered_by_sync_run_id
+          WHERE n.coverage_date >= (CURRENT_DATE - ($1::int - 1))
+        ),
         heartbeats_agg AS (
           SELECT
             branch_code,
@@ -1681,6 +1701,7 @@ function createOrderingRouter(deps) {
                                      AND COALESCE(r.any_running, false) = false
                                      AND COALESCE(r.any_stale,   false) = false THEN 'pending'
             WHEN COALESCE(r.any_success, false) THEN 'success'
+            WHEN rn.recovery_status = 'partial' THEN 'partial'
             WHEN COALESCE(r.any_failed,  false) THEN 'failed'
             WHEN COALESCE(r.any_running, false) THEN 'running'
             WHEN COALESCE(r.any_stale,   false) THEN 'stale'
@@ -1698,13 +1719,23 @@ function createOrderingRouter(deps) {
           lr.message         AS latest_message,
           lrd.datasets       AS datasets,
           h.latest_heartbeat_at,
-          h.hb_count
+          h.hb_count,
+          rn.recovery_status,
+          rn.recovered_by_sync_run_id,
+          rn.recovered_by_started_at,
+          rn.original_failed_run_ids,
+          rn.recovered_datasets,
+          rn.missing_datasets,
+          rn.evidence AS recovery_evidence,
+          rn.recovery_note,
+          rn.recorded_at AS recovery_recorded_at
         FROM date_series d
         CROSS JOIN known_branches b
         LEFT JOIN runs_agg            r   ON r.branch_code = b.branch_code AND r.run_date = d.d
         LEFT JOIN latest_run          lr  ON lr.branch_code = b.branch_code AND lr.run_date = d.d
         LEFT JOIN latest_run_datasets lrd ON lrd.branch_code = b.branch_code AND lrd.run_date = d.d
         LEFT JOIN heartbeats_agg      h   ON h.branch_code = b.branch_code AND h.hb_date  = d.d
+        LEFT JOIN recovery_notes      rn  ON rn.branch_code = b.branch_code AND rn.run_date = d.d
         ORDER BY b.branch_code, d.d DESC
       `;
 
@@ -1733,6 +1764,19 @@ function createOrderingRouter(deps) {
           datasets: r.datasets || null,
           latestHeartbeatAt: r.latest_heartbeat_at || null,
           heartbeatCount: Number(r.hb_count ?? 0),
+          recovery: r.status === "partial" && r.recovery_status === "partial"
+            ? {
+                status: r.recovery_status,
+                recoveredBySyncRunId: r.recovered_by_sync_run_id == null ? null : Number(r.recovered_by_sync_run_id),
+                recoveredByStartedAt: r.recovered_by_started_at || null,
+                originalFailedRunIds: r.original_failed_run_ids || [],
+                recoveredDatasets: r.recovered_datasets || [],
+                missingDatasets: r.missing_datasets || [],
+                evidence: r.recovery_evidence || {},
+                note: r.recovery_note || "",
+                recordedAt: r.recovery_recorded_at || null,
+              }
+            : null,
         };
       }
 
