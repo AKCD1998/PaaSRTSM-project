@@ -22,9 +22,11 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
  CREATE TABLE public.barcodes(sku_id bigint,barcode text);INSERT INTO public.barcodes VALUES(1,'0001234567890');
  CREATE TABLE ada.branch_stock_snapshots(product_code text,product_name_thai text,product_name_eng text,barcode text,unit text,qty_branch_001 numeric,qty_branch_004 numeric,qty_branch_005 numeric,synced_at timestamptz);
  INSERT INTO ada.branch_stock_snapshots VALUES('QA-001','ยาทดสอบ','','0001234567890','เม็ด',7,8,11,now());`);
- for(const file of ['083_add_scpda_lot_observations.sql','084_enable_scpda_branch005.sql','087_enable_scpda_branch004.sql','090_add_scpda004_count_areas.sql','091_add_scpda_daily_companion.sql','091_add_scpda_daily_companion.sql'])await db.query(fs.readFileSync('migrations/'+file,'utf8'));
- const areaInvitationId=crypto.randomUUID(),areaCode=crypto.randomBytes(24).toString('base64url'),code=crypto.randomBytes(24).toString('base64url'),invitationId=crypto.randomUUID(),h=await bcrypt.hash('fixturePassword',12),ops=['01001','02001','03001','01004','01004SHPEE','01005','02005'].map(operatorCode=>({operatorCode,branchCode:operatorCode.endsWith('005')?'005':['01004','01004SHPEE'].includes(operatorCode)?'004':'001',hash:h,version:crypto.randomUUID(),rotationDueAt:'2027-05-18T00:00:00Z'}));
- const config={featureScpda004Areas:true,featureScpdaRead001:true,featureScpdaCounts001:true,featureScpdaBranch004:true,featureScpdaBranch005:true,featureScpdaDaily005:true,scpdaPwaVersionCode:17,scpdaPwaOrigin:'https://sc-stockday-ordering.onrender.com',scpdaDriveClientId:'synthetic-only',scpdaDriveClientSecret:'synthetic-only',scpdaDriveRefreshToken:'synthetic-only',scpdaCountOperators001:'01001,01004,01004SHPEE,01005,02005',authJwtSecret:'synthetic-only-sc-test-signing-key',scpdaOperatorCredentialsJson:JSON.stringify(ops),scpdaDeviceInvitationsJson:JSON.stringify([{id:invitationId,hash:sha(code),expiresAt:'2026-12-01T00:00:00Z',branchCode:'005'},{id:areaInvitationId,operatorCode:'01004SHPEE',branchCode:'004',hash:sha(areaCode),expiresAt:'2026-12-01T00:00:00Z'}])};
+ for(const file of ['083_add_scpda_lot_observations.sql','084_enable_scpda_branch005.sql','087_enable_scpda_branch004.sql','090_add_scpda004_count_areas.sql','091_add_scpda_daily_companion.sql','091_add_scpda_daily_companion.sql','092_enable_scpda004_daily_companions.sql','092_enable_scpda004_daily_companions.sql'])await db.query(fs.readFileSync('migrations/'+file,'utf8'));
+ const dailyShopeeInvitationId=crypto.randomUUID(),dailyShopeeCode=crypto.randomBytes(24).toString('base64url');
+ const frontInvitationId=crypto.randomUUID(),frontCode=crypto.randomBytes(24).toString('base64url');
+ const areaInvitationId=crypto.randomUUID(),areaCode=crypto.randomBytes(24).toString('base64url'),code=crypto.randomBytes(24).toString('base64url'),invitationId=crypto.randomUUID(),h=await bcrypt.hash('fixturePassword',12),ops=['01001','02001','03001','01004','01004SHPEE','02004','02004SHPEE','01005','02005'].map(operatorCode=>({operatorCode,branchCode:operatorCode.endsWith('005')?'005':['01004','01004SHPEE','02004','02004SHPEE'].includes(operatorCode)?'004':'001',hash:h,version:crypto.randomUUID(),rotationDueAt:'2027-05-18T00:00:00Z'}));
+ const config={featureScpda004Areas:true,featureScpdaRead001:true,featureScpdaCounts001:true,featureScpdaBranch004:true,featureScpdaBranch005:true,featureScpdaDaily005:true,scpdaPwaVersionCode:17,scpdaPwaOrigin:'https://sc-stockday-ordering.onrender.com',scpdaDriveClientId:'synthetic-only',scpdaDriveClientSecret:'synthetic-only',scpdaDriveRefreshToken:'synthetic-only',scpdaCountOperators001:'01001,01004,01004SHPEE,02004,02004SHPEE,01005,02005',authJwtSecret:'synthetic-only-sc-test-signing-key',scpdaOperatorCredentialsJson:JSON.stringify(ops),scpdaDeviceInvitationsJson:JSON.stringify([{id:dailyShopeeInvitationId,operatorCode:'01004SHPEE',branchCode:'004',hash:sha(dailyShopeeCode),expiresAt:'2026-12-01T00:00:00Z'},{id:frontInvitationId,operatorCode:'01004',branchCode:'004',hash:sha(frontCode),expiresAt:'2026-12-01T00:00:00Z'},{id:invitationId,hash:sha(code),expiresAt:'2026-12-01T00:00:00Z',branchCode:'005'},{id:areaInvitationId,operatorCode:'01004SHPEE',branchCode:'004',hash:sha(areaCode),expiresAt:'2026-12-01T00:00:00Z'}])};
  const app=express();app.set('trust proxy',1);app.use(express.json({limit:'1mb'}));app.use('/api/scpda/counts',createScpdaCountsRouter({config,db,now}));app.use('/api/scpda',createScpdaReadRouter({config,db,now}));
  const server=app.listen(0,'127.0.0.1');await new Promise(ok=>server.once('listening',ok));const origin='http://127.0.0.1:'+server.address().port;
  async function req(path,{body,token,ip='203.0.113.5',expected}={}){const r=await fetch(origin+'/api/scpda'+path,{method:body===undefined?'GET':'POST',headers:{'X-Forwarded-For':ip,...(body!==undefined?{'Content-Type':'application/json'}:{}),...(token?{Authorization:'Bearer '+token}:{})},...(body!==undefined?{body:JSON.stringify(body)}:{})});const data=await r.json();if(expected!==undefined)assert.equal(r.status,expected,JSON.stringify(data));return {status:r.status,data};}
@@ -43,7 +45,7 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
   const grant=(await req('/counts/access/authorize',{token:r.token,body:{deviceCertificate:cert,challengeId:a.challengeId,signature:d.sign(['SCPDA-COUNT-ACCESS-V1',a.challengeId,a.nonce,'01004SHPEE',a.deviceRef,a.parentSessionId].join('\n'))},expected:200})).data;
   const cap=(await req('/counts/capabilities',{token:grant.countToken,expected:200})).data;assert.equal(cap.countScope.id,'004-shopee');assert.equal(cap.canRecordInternalPick,true);
   const stock=(await req('/stock?search=QA-001',{token:r.token,expected:200})).data;assert.equal(stock.branchCode,'004');assert.equal(stock.records[0].quantity,8);
-  const constraints=(await db.query("SELECT pg_get_constraintdef(oid) d FROM pg_constraint WHERE conrelid='ordering.scpda_observations'::regclass AND conname='scpda_observations_operator_code_check'")).rows[0].d;assert.ok(constraints.includes('01004SHPEE'));assert.ok(constraints.includes('02005'));
+
  });
  await t.test('primary needs daily selfie; old version cannot create the QR',async()=>{const bootstrap=await loginPrimary();await req('/session',{token:bootstrap,expected:401});const c=(await req('/daily/primary/challenge',{token:bootstrap,body:{},expected:200})).data;const id=JSON.parse(Buffer.from(bootstrap.split('.')[1],'base64url')).jti;const r=await req('/daily/primary/start',{token:bootstrap,body:{deviceCertificate:primary.certificate,challengeId:c.challengeId,versionCode:17,selfie:image,signature:primary.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,id,imageHash,17].join('\n'))},expected:200});parentToken=r.data.token;assert.equal(r.data.expiresAt,'2026-11-18T17:00:00.000Z');await req('/session',{token:parentToken,expected:200});assert.equal((await qr(16)).status,409);grant=(await qr()).data;assert.ok(grant.url.includes('#enroll='));});
  await t.test('network denial and bad password do not consume grant or bind an installation',async()=>{assert.equal((await enroll(child,'198.51.100.2')).status,403);assert.equal((await enroll(child,undefined,'badPassword')).status,401);assert.equal((await db.query('select count(*) n from ordering.scpda_operator_devices')).rows[0].n,'0');});
@@ -56,5 +58,84 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
  await t.test('midnight expires read, count and resume; evidence survives',async()=>{clock=Date.parse('2026-11-18T17:00:00Z');await req('/session',{token:childToken,expected:401});await req('/counts/history',{token:countToken,expected:401});const c=(await req('/daily/resume/challenge',{body:{sessionId:childSession},expected:200})).data;await req('/daily/resume',{body:{sessionId:childSession,challengeId:c.challengeId,signature:child.sign(['SCPDA-DAILY-RESUME-V1',c.challengeId,c.nonce,childSession].join('\n'))},expected:401});assert.equal((await db.query('select count(*) n from ordering.scpda_observations where receipt_id=$1',[receiptId])).rows[0].n,'1');});
  await t.test('Drive timeout retries reserved file IDs; images disappear after 90 days while work evidence remains',async()=>{const files=new Map();let fail=true;const drive={verify:async()=>{},reserveId:async()=>crypto.randomUUID(),put:async row=>{files.set(row.drive_file_id,row.image_sha256);if(fail){fail=false;throw Error('synthetic lost response');}},remove:async row=>files.delete(row.drive_file_id)};await assert.rejects(archiveBatch({db,drive,now}));await archiveBatch({db,drive,now});assert.equal(files.size,2);const rows=(await db.query('select state,image_bytes,drive_file_id from ordering.scpda_selfie_archives')).rows;assert.ok(rows.every(r=>r.state==='uploaded'&&r.image_bytes===null&&files.has(r.drive_file_id)));clock+=90*86400000;await archiveBatch({db,drive,now});assert.equal(files.size,0);assert.equal((await db.query("select count(*) n from ordering.scpda_selfie_archives where state='deleted' and image_bytes is null")).rows[0].n,'2');assert.equal((await db.query('select count(*) n from ordering.scpda_observations')).rows[0].n,'1');});
  await t.test('audit evidence contains no photo, PIN, QR secret or session bearer',async()=>{const logs=JSON.stringify((await db.query('select meta from public.audit_logs')).rows);for(const value of [grant.secret,image,'fixturePassword',childToken])assert.equal(logs.includes(value),false);});
+
+ await t.test('004 flag is independent, with front and Shopee policies',async()=>{
+  assert.equal((await req('/daily/policy?branchCode=004',{expected:200})).data.enabled,false);
+  assert.equal((await req('/daily/policy',{expected:200})).data.enabled,true);
+  config.featureScpdaDaily004=true;clock=Date.parse('2026-11-19T09:00:00+07:00');
+  const policy=(await req('/daily/policy?operatorCode=01004SHPEE',{expected:200})).data;
+  assert.equal(policy.branchCode,'004');assert.equal(policy.primaryOperatorCode,'01004SHPEE');assert.equal(policy.operatorCode,'02004SHPEE');
+  await req('/daily/policy?branchCode=005&operatorCode=01004',{expected:400});
+ });
+ const teams=[];
+ for(const [primaryCode,childCode,scope,invitationId,code]of [['01004','02004','004-front',frontInvitationId,frontCode],['01004SHPEE','02004SHPEE','004-shopee',dailyShopeeInvitationId,dailyShopeeCode]]){
+  await t.test(primaryCode+' QR binds only '+childCode+' and retains '+scope,async()=>{
+   const d=identity();const cert=(await req('/device/pair',{body:{invitationId,code,publicKey:d.publicKey,deviceId:d.deviceId},expected:201})).data.deviceCertificate;
+   const auth=(await req('/auth/challenge',{body:{deviceCertificate:cert},expected:200})).data;
+   const login=(await req('/auth/login',{body:{operatorCode:primaryCode,pin:'fixturePassword',deviceCertificate:cert,challengeId:auth.challengeId,signature:d.sign(['SCPDA-LOGIN-V1',auth.challengeId,auth.nonce,primaryCode,auth.deviceRef].join('\n'))},expected:200})).data;
+   await req('/session',{token:login.token,expected:401});
+   const c=(await req('/daily/primary/challenge',{token:login.token,body:{},expected:200})).data,jti=JSON.parse(Buffer.from(login.token.split('.')[1],'base64url')).jti;
+   const started=(await req('/daily/primary/start',{token:login.token,body:{deviceCertificate:cert,selfie:image,versionCode:17,challengeId:c.challengeId,signature:d.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,jti,imageHash,17].join('\n'))},expected:200})).data;
+   const me=(await req('/session',{token:started.token,expected:200})).data;assert.equal(me.user.countScope.id,scope);assert.equal(me.dailySession,true);
+   const q=(await req('/daily/qr/challenge',{token:started.token,body:{},expected:200})).data;
+   const grant=(await req('/daily/qr',{token:started.token,body:{operatorCode:childCode==='02004'?'02004SHPEE':'02004',deviceCertificate:cert,versionCode:17,challengeId:q.challengeId,signature:d.sign(['SCPDA-COMPANION-QR-V1',q.challengeId,q.nonce,started.dailySessionId,17].join('\n'))},expected:201})).data;
+   assert.equal(grant.operatorCode,childCode);assert.ok(grant.url.endsWith('&operator='+childCode));
+   const child=identity(),other=identity();
+   const payload=device=>{const body={grantId:grant.grantId,secret:grant.secret,publicKey:device.publicKey,deviceId:device.deviceId,versionCode:17,selfie:image,pin:'fixturePassword',operatorCode:childCode};body.signature=device.sign(['SCPDA-COMPANION-ENROLL-V1',body.grantId,body.secret,body.deviceId,imageHash,17].join('\n'));return body;};
+   await req('/daily/companion/enroll',{body:{...payload(child),operatorCode:childCode==='02004'?'02004SHPEE':'02004'},expected:403});
+   await req('/daily/companion/enroll',{body:payload(child),ip:'198.51.100.22',expected:403});
+   const results=await Promise.all([req('/daily/companion/enroll',{body:payload(child)}),req('/daily/companion/enroll',{body:payload(other)})]);
+   assert.deepEqual(results.map(r=>r.status).sort(),[201,409]);const i=results.findIndex(r=>r.status===201),winner=i===0?child:other;
+   const admitted=results[i].data;assert.equal(admitted.user.operatorCode,childCode);assert.equal(admitted.branchCode,'004');assert.equal(admitted.user.countScope.id,scope);assert.equal(admitted.user.canRecordInternalPick,false);
+   const access=(await req('/counts/access/challenge',{token:admitted.token,body:{deviceCertificate:admitted.deviceCertificate},expected:200})).data;
+   const counter=(await req('/counts/access/authorize',{token:admitted.token,body:{deviceCertificate:admitted.deviceCertificate,challengeId:access.challengeId,signature:winner.sign(['SCPDA-COUNT-ACCESS-V1',access.challengeId,access.nonce,childCode,access.deviceRef,access.parentSessionId].join('\n'))},expected:200})).data;
+   assert.equal(counter.countScope.id,scope);assert.equal(counter.canRecordInternalPick,false);
+   const input={id:crypto.randomUUID(),capturedByOperator:childCode,skuId:'1',productCode:'QA-001',barcode:'0001234567890',unitLabel:'เม็ด',category:'pharma',round:1,completeProduct:false,observedAt:new Date(clock).toISOString(),countScopeId:scope,lots:[{code:'004-LOT',quantity:'3',manufacturedOn:'2026-01-01',expiresOn:'2028-01-31'}]};
+   await req('/counts',{token:counter.countToken,body:{...input,countScopeId:scope==='004-front'?'004-shopee':'004-front'},expected:403});
+   const missing={...input};delete missing.countScopeId;await req('/counts',{token:counter.countToken,body:missing,expected:400});
+   const count=(await req('/counts',{token:counter.countToken,body:input,expected:201})).data;
+   assert.equal(count.event.countScopeId,scope);assert.equal(count.event.serverAcceptedAsCurrentStock,false);
+   assert.equal((await req('/counts',{token:counter.countToken,body:input,expected:200})).data.receiptId,count.receiptId);
+   await req('/counts/internal-picks/history',{token:counter.countToken,expected:403});
+   await req('/daily/qr/challenge',{token:admitted.token,body:{},expected:403});
+   await req('/counts/history',{token:counter.countToken,ip:'198.51.100.22',expected:403});
+   const resume=(await req('/daily/resume/challenge',{body:{sessionId:admitted.dailySessionId},expected:200})).data;
+   const resumed=(await req('/daily/resume',{body:{sessionId:admitted.dailySessionId,challengeId:resume.challengeId,signature:winner.sign(['SCPDA-DAILY-RESUME-V1',resume.challengeId,resume.nonce,admitted.dailySessionId].join('\n'))},expected:200})).data;
+   assert.equal(resumed.user.operatorCode,childCode);assert.equal(resumed.user.countScope.id,scope);
+   const photo=(await db.query('SELECT file_name FROM ordering.scpda_selfie_archives WHERE session_id=$1',[admitted.dailySessionId])).rows[0];assert.ok(photo.file_name.includes('_004_'+childCode+'_'));
+   teams.push({primaryCode,primaryDevice:d,primaryCert:cert,primaryToken:started.token,primarySession:started.dailySessionId,childCode,scope,token:admitted.token,counter:counter.countToken,session:admitted.dailySessionId});
+  });
+ }
+
+ await t.test('each primary can add several permanent device slots; database accounts get only its own count scope',async()=>{
+  clock+=61000;const bootstrap=await loginPrimary(),c=(await req('/daily/primary/challenge',{token:bootstrap,body:{},expected:200})).data,jti=JSON.parse(Buffer.from(bootstrap.split('.')[1],'base64url')).jti;
+  const parent=(await req('/daily/primary/start',{token:bootstrap,body:{deviceCertificate:primary.certificate,selfie:image,versionCode:17,challengeId:c.challengeId,signature:primary.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,jti,imageHash,17].join('\n'))},expected:200})).data;
+  for(const team of [...teams,{primaryCode:'01005',primaryDevice:primary,primaryCert:primary.certificate,primaryToken:parent.token,primarySession:parent.dailySessionId,scope:null}]){
+   clock+=61000;const issued=[];
+   const getQr=async target=>{const challenge=(await req('/daily/qr/challenge',{token:team.primaryToken,body:{},expected:200})).data;return req('/daily/qr',{token:team.primaryToken,body:{target,deviceCertificate:team.primaryCert,versionCode:17,challengeId:challenge.challengeId,signature:team.primaryDevice.sign(['SCPDA-COMPANION-QR-V2',challenge.challengeId,challenge.nonce,team.primarySession,17,target].join('\n'))}});};
+   for(let n=0;n<3;n++){
+    const qr=(await getQr('new'));assert.equal(qr.status,201,JSON.stringify(qr.data));const g=qr.data;assert.ok(!issued.includes(g.operatorCode));issued.push(g.operatorCode);assert.equal(g.initialPassword,'sc'+g.operatorCode);
+    const d=identity(),body={operatorCode:g.operatorCode,grantId:g.grantId,secret:g.secret,publicKey:d.publicKey,deviceId:d.deviceId,versionCode:17,selfie:image,pin:g.initialPassword};body.signature=d.sign(['SCPDA-COMPANION-ENROLL-V1',body.grantId,body.secret,body.deviceId,imageHash,17].join('\n'));
+    const admitted=(await req('/daily/companion/enroll',{body,expected:201})).data;assert.equal(admitted.user.operatorCode,g.operatorCode);assert.equal(admitted.user.countScope?.id||null,team.scope);assert.notEqual(admitted.user.canRecordInternalPick,true);
+    const a=(await req('/counts/access/challenge',{token:admitted.token,body:{deviceCertificate:admitted.deviceCertificate},expected:200})).data;
+    const count=(await req('/counts/access/authorize',{token:admitted.token,body:{deviceCertificate:admitted.deviceCertificate,challengeId:a.challengeId,signature:d.sign(['SCPDA-COUNT-ACCESS-V1',a.challengeId,a.nonce,g.operatorCode,a.deviceRef,a.parentSessionId].join('\n'))},expected:200})).data;
+    const input={id:crypto.randomUUID(),capturedByOperator:g.operatorCode,skuId:'1',productCode:'QA-001',barcode:'0001234567890',unitLabel:'เม็ด',category:'pharma',round:1,completeProduct:false,observedAt:new Date(clock).toISOString(),...(team.scope?{countScopeId:team.scope}:{}),lots:[{code:'MULTI',quantity:'1',manufacturedOn:null,expiresOn:null}]};
+    const receipt=(await req('/counts',{token:count.countToken,body:input,expected:201})).data;assert.equal(receipt.event.operatorCode,g.operatorCode);assert.equal(receipt.event.countScopeId||null,team.scope);
+   }
+   const list=(await req('/daily/companions',{token:team.primaryToken,expected:200})).data.records;assert.ok(issued.every(code=>list.some(row=>row.operatorCode===code&&row.paired)));assert.ok(list.length>=4);
+   assert.equal((await getQr(team.primaryCode==='01004'?'03004SHPEE':'03004')).status,403);
+   const original=(await getQr(issued[0]));assert.equal(original.status,201);assert.equal(original.data.operatorCode,issued[0]);assert.equal(original.data.initialPassword,undefined);
+  }
+  const serialized=JSON.stringify((await db.query('SELECT meta FROM public.audit_logs')).rows);assert.equal(serialized.includes('sc03004'),false);
+ });
+ await t.test('004 histories stay team/account scoped; repeated migration preserves evidence and005; midnight denies both teams',async()=>{
+  for(const team of teams){const h=(await req('/counts/history',{token:team.counter,expected:200})).data;assert.equal(h.records.length,1);assert.ok(h.records.every(r=>r.event.operatorCode===team.childCode&&r.event.countScopeId===team.scope));}
+  const before=(await db.query('SELECT count(*) n FROM ordering.scpda_observations')).rows[0].n;
+  await db.query(fs.readFileSync('migrations/092_enable_scpda004_daily_companions.sql','utf8'));
+  assert.equal((await db.query('SELECT count(*) n FROM ordering.scpda_observations')).rows[0].n,before);
+  assert.equal((await db.query("SELECT count(*) n FROM ordering.scpda_operator_devices WHERE operator_code='02005'")).rows[0].n,'1');
+  assert.deepEqual((await db.query('SELECT qty_branch_001,qty_branch_004,qty_branch_005 FROM ada.branch_stock_snapshots')).rows[0],{qty_branch_001:'7',qty_branch_004:'8',qty_branch_005:'11'});
+  clock=Date.parse('2026-11-19T17:00:00Z');for(const team of teams){await req('/session',{token:team.token,expected:401});await req('/counts/history',{token:team.counter,expected:401});}
+ });
  }finally{await new Promise(ok=>server.close(ok));await db.end();}
 });
