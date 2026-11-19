@@ -229,6 +229,7 @@ function loadConfig(env = process.env) {
     featureScpdaRead001: parseBool(env.FEATURE_SCPDA_READ_001, false),
     featureScpdaBranch004: parseBool(env.FEATURE_SCPDA_BRANCH_004, false),
     featureScpdaBranch005: parseBool(env.FEATURE_SCPDA_BRANCH_005, false),
+    featureScpda004Areas: parseBool(env.FEATURE_SCPDA_004_AREAS, false),
     featureScpdaCounts001: parseBool(env.FEATURE_SCPDA_COUNTS_001, false),
     scpdaCountOperators001: env.SCPDA_COUNT_OPERATORS_001 || "",
     featureScpdaWeb001: parseBool(env.FEATURE_SCPDA_WEB_001, false),
