@@ -7,6 +7,7 @@ const decimal=n=>{const s=n.toString().padStart(4,'0');return (s.slice(0,-3)+'.'
 const min=(...v)=>v.reduce((a,b)=>a<b?a:b),max=(...v)=>v.reduce((a,b)=>a>b?a:b);
 function projectFefo({baseline,unitProof,coverage,movements=[],asOf}){
  const reasons=[],at=Date.parse(asOf),start=Date.parse(baseline?.observedAt);
+ if(baseline?.countScopeId)reasons.push('area-movement-coverage-required');
  if(!baseline?.accepted||!baseline.completeProduct)reasons.push('complete-reviewed-baseline-required');
  if(!unitProof?.verified||!unitProof.ruleVersion||!unitProof.unitCode||unitProof.unitLabel!==baseline?.unitLabel)reasons.push('stock-unit-unverified');
  if(!Number.isFinite(at)||!Number.isFinite(start)||start>at)reasons.push('observation-time-invalid');

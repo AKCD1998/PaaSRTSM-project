@@ -1,0 +1,52 @@
+{
+  "source": "R16-896e89d",
+  "body": {
+    "id": "781802c7-8c57-4ad3-b15c-a1e7aa745643",
+    "capturedByOperator": "01004",
+    "skuId": "1",
+    "productCode": "QA-001",
+    "barcode": "0001234567890",
+    "unitLabel": "กล่อง",
+    "category": "pharma",
+    "round": 1,
+    "completeProduct": false,
+    "observedAt": "2026-11-19T01:00:00.000Z",
+    "lots": [
+      {
+        "code": "LEGACY",
+        "quantity": "7",
+        "manufacturedOn": "2026-01-01",
+        "expiresOn": "2028-01-31"
+      }
+    ],
+    "correctionOf": null,
+    "correctionReason": null,
+    "lateReason": null
+  },
+  "normalized": {
+    "id": "781802c7-8c57-4ad3-b15c-a1e7aa745643",
+    "capturedByOperator": "01004",
+    "skuId": "1",
+    "productCode": "QA-001",
+    "barcode": "0001234567890",
+    "unitLabel": "กล่อง",
+    "category": "pharma",
+    "round": 1,
+    "completeProduct": false,
+    "observedAt": "2026-11-19T01:00:00.000Z",
+    "lots": [
+      {
+        "key": "6787cb0e2f3579ee9bb8dfd3ce9c636dfa677c5d1cede94588c375aaaf26ff6e",
+        "code": "LEGACY",
+        "quantity": "7",
+        "manufacturedOn": "2026-01-01",
+        "expiresOn": "2028-01-31"
+      }
+    ],
+    "quantity": "7",
+    "correctionOf": null,
+    "correctionReason": null,
+    "lateReason": null
+  },
+  "hash": "67995f6c2f3269d8e496d027720b8ea26432f88adc4610685ed789f0a3030740"
+}
