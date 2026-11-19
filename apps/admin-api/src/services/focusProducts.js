@@ -223,7 +223,7 @@ async function fetchProductNames(db, productCodes) {
   return map;
 }
 
-// Sold qty per branch for a batch of products sharing one date range, from raw
+// Net sold qty per branch for products sharing one date range, from raw
 // AdaPOS evidence — one query per distinct date range rather than one per row,
 // since sequential per-row queries (the original design) took minutes once
 // dozens of focus rows existed. Returns Map<productCode, {branchCode: qty}>.
@@ -233,14 +233,20 @@ async function fetchSoldQtyBatch(db, productCodes, dateFrom, dateTo) {
     `SELECT
        sl.product_code,
        sh.branch_code,
-       SUM(COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1), COALESCE(sl.qty, 0)))::numeric AS sold_qty
+       SUM(CASE
+         WHEN sh.raw_payload->>'FTShdDocType' = '9' THEN -ABS(qty.base)
+         ELSE qty.base
+       END)::numeric AS sold_qty
      FROM ada.sales_lines sl
      JOIN ada.sales_headers sh
        ON sh.branch_code = sl.branch_code
       AND sh.doc_no = sl.doc_no
+     CROSS JOIN LATERAL (
+       SELECT COALESCE(sl.qty_base, COALESCE(sl.qty, 0) * COALESCE(sl.stock_factor, 1)) AS base
+     ) qty
      WHERE sl.product_code = ANY($1::text[])
        AND sh.doc_date BETWEEN $2::date AND $3::date
-       AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') = '1'
+       AND COALESCE(NULLIF(sh.raw_payload->>'FTShdDocType', ''), '1') IN ('1', '9')
        AND COALESCE(NULLIF(sh.raw_payload->>'FTShdStaPaid', ''), sh.paid_status, '') = '3'
      GROUP BY sl.product_code, sh.branch_code`,
     [productCodes, dateFrom, dateTo],
