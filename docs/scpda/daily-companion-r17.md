@@ -64,3 +64,17 @@ The connected Drive profile is admin@scgroup1989.com and the selected log folder
 Before activating: use a company-owned dedicated OAuth client, authorize through Google's UI, keep client secret/refresh token only in Render's secret configuration, run the read-only Drive verifier, and test one synthetic archive before any employee photo. For a Workspace-only application choose Internal audience when available. Do not assume an External/Testing refresh grant remains valid indefinitely. Google consent must disclose the actual requested Drive permissions; access to a pre-existing folder must be granted to this new client, not inferred from its folder ID. Never ask the user to paste an authorization code, access token or refresh token into chat.
 
 Local checks on19 November:23 daily/provider/CORS/HTTP/PG checks passed with seven-account coexistence;32 other SCPDA regression checks passed,6 optional integration checks skipped. PWA18 exported from the signed R18 APK with the matching current browser host and no production activation. Existing R18 deployment/accounts/App Center publication are untouched by this candidate.
+
+## Live OAuth verification —19 November2026
+
+The user completed Google OAuth and saved the three SCPDA Drive variables on the existing PaaSRTSM-project service using Save only. The exact candidate provider refreshed the grant and verified admin@scgroup1989.com plus the fixed private folder. A single884-byte synthetic blue JPEG was uploaded, downloaded byte-for-byte with matching SHA256, and permanently deleted; provider readback confirmed deletion. No employee photo, production daily session, count, pick or Ada write was used. See `docs/scpda/drive-verification-2026-11-19.md`. Publishing status/grant durability still requires confirmation before employee admission.
+
+Operator verification is read-only by default:
+
+```sh
+node scripts/verify_scpda_drive_connection.js
+# Explicit synthetic roundtrip, with OAuth supplied by protected runtime config:
+node scripts/verify_scpda_drive_connection.js --roundtrip
+```
+
+The roundtrip always attempts to remove only its own reserved, metadata-matched probe file even after upload/read failure. If cleanup fails, the nonsecret file ID remains in the report for operator recovery. No token is a command-line argument or report field.
