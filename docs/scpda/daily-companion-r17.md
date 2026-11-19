@@ -1,3 +1,19 @@
+# SCPDA daily access — R21 multiple devices and004 teams
+
+The existing005 daily/Drive pilot is live from PR70. R21 adds004 and multiple device slots; its004 flag remains off until the matching Android/PWA21 release is published.
+
+## R21: 004 teams and multiple companion devices
+
+Daily admission now supports primary 01004 (004-front), 01004SHPEE (004-shopee), and the existing 01005 pilot. FEATURE_SCPDA_DAILY_004 is separate from FEATURE_SCPDA_DAILY_005; branch004 and004-areas must also be enabled. Existing credentials/invitations/bindings are preserved.
+
+The primary's QR menu lists existing device accounts and offers Add companion. New accounts use a transaction/advisory lock and a unique per-team ordinal in ordering.scpda_companion_accounts, rather than editing shared environment credentials for each employee. Codes progress 02004,03004… for front, 02004SHPEE,03004SHPEE… for Shopee, and02005/03005… for005; configured legacy slots are retained. Up to9999 ordinal is supported. Unbound unused slots are reused on QR retry; bound/revoked device identities are never reassigned. New-slot initial credentials are returned only to the authenticated primary, outside QR/audit logs. QR creation V2 signs its selected existing/new target. Server derives branch/team from the authenticated primary, never a client-selected scope.
+
+Every companion keeps a permanent installation binding, daily selfie, separate work/receipt history and midnight Asia/Bangkok expiry. 004 companion counts must include their assigned front or Shopee scope; packed coverage remains explicit. New companions inherit only count admission from an already admitted primary and do not gain internal-pick or product-writer privileges. Existing managers retain their pick permissions. Counts remain observations for review; no source balance, Ada stock or Shopee sale is adjusted.
+
+Release order: migration092/backend code with004 admission off; matching Android/PWA21 publication; then set SCPDA_PWA_VERSION_CODE=21 and FEATURE_SCPDA_DAILY_004=true while preserving005/area settings. Android users update and sign in again before QR. The existing private Google Drive90-day archive and temporary same-public-IP policy remain unchanged. Actual phone acceptance is separate from isolated Java/PWA/Postgres checks.
+
+## Historical R17/R18 preparation notes
+
 # SCPDA daily companion pilot — candidate, not activated
 
 19 November 2026 continuation. Scope: primary **01005 / branch005**, companion **02005**.
@@ -79,12 +95,3 @@ node scripts/verify_scpda_drive_connection.js --roundtrip
 
 The roundtrip always attempts to remove only its own reserved, metadata-matched probe file even after upload/read failure. If cleanup fails, the nonsecret file ID remains in the report for operator recovery. No token is a command-line argument or report field.
 
-## R21: 004 teams and multiple companion devices
-
-Daily admission now supports primary 01004 (004-front), 01004SHPEE (004-shopee), and the existing 01005 pilot. FEATURE_SCPDA_DAILY_004 is separate from FEATURE_SCPDA_DAILY_005; branch004 and004-areas must also be enabled. Existing credentials/invitations/bindings are preserved.
-
-The primary's QR menu lists existing device accounts and offers Add companion. New accounts use a transaction/advisory lock and a unique per-team ordinal in ordering.scpda_companion_accounts, rather than editing shared environment credentials for each employee. Codes progress 02004,03004… for front, 02004SHPEE,03004SHPEE… for Shopee, and02005/03005… for005; configured legacy slots are retained. Up to9999 ordinal is supported. Unbound unused slots are reused on QR retry; bound/revoked device identities are never reassigned. New-slot initial credentials are returned only to the authenticated primary, outside QR/audit logs. QR creation V2 signs its selected existing/new target. Server derives branch/team from the authenticated primary, never a client-selected scope.
-
-Every companion keeps a permanent installation binding, daily selfie, separate work/receipt history and midnight Asia/Bangkok expiry. 004 companion counts must include their assigned front or Shopee scope; packed coverage remains explicit. New companions inherit only count admission from an already admitted primary and do not gain internal-pick or product-writer privileges. Existing managers retain their pick permissions. Counts remain observations for review; no source balance, Ada stock or Shopee sale is adjusted.
-
-Release order: migration092/backend code with004 admission off; matching Android/PWA21 publication; then set SCPDA_PWA_VERSION_CODE=21 and FEATURE_SCPDA_DAILY_004=true while preserving005/area settings. Android users update and sign in again before QR. The existing private Google Drive90-day archive and temporary same-public-IP policy remain unchanged. Actual phone acceptance is separate from isolated Java/PWA/Postgres checks.
