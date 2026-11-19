@@ -2,6 +2,7 @@
 const {branchEnabled,enabledBranches,countContract,stockColumn}=require('../services/scpdaBranches');
 const {Router}=require('express');
 const {createCountAccess}=require('../services/scpdaCountAccess');
+const picks=require('../services/scpda004Picks');
 const ledger=require('../services/scpdaObservationLedger');
 function run(fn){return async(req,res)=>{try{await fn(req,res);}catch(e){res.status(e instanceof ledger.CountError?e.status:503).json({error:e instanceof ledger.CountError?e.message:'ระบบผลนับยังไม่พร้อม',code:e instanceof ledger.CountError?e.code:'COUNT_UNAVAILABLE',...(e instanceof ledger.CountError&&e.details?{details:e.details}:{})});}};}
 const envelope=(x,branch='001')=>({contract:countContract(branch),branchCode:branch,officialStockWrites:false,...x});
@@ -10,8 +11,10 @@ function createScpdaCountsRouter({config,db,now=Date.now}){
  r.get('/admission',run(async(req,res)=>{const who=await access.verify(req,'reader');res.json(envelope({canRequestCountAccess:true,deviceProofRequired:true},who.branchCode));}));
  r.post('/access/challenge',run(async(req,res)=>{const result=await access.challenge(req);res.json(envelope(result,result.branchCode));}));
  r.post('/access/authorize',run(async(req,res)=>{const result=await access.authorize(req);res.json(envelope(result,result.branchCode));}));
- r.get('/capabilities',run(async(req,res)=>{const who=await access.verify(req,'counter');res.json(envelope({canSubmit:true,operatorCode:who.operatorCode,unitConversionVerified:false,humanOverrideEnabled:false},who.branchCode));}));
- r.post('/check',run(async(req,res)=>{const who=await access.verify(req,'counter');res.json(envelope(await ledger.evaluate(db,ledger.normalize(req.body,now()),who.branchCode),who.branchCode));}));
+ r.get('/capabilities',run(async(req,res)=>{const who=await access.verify(req,'counter');res.json(envelope({canSubmit:true,operatorCode:who.operatorCode,countScope:who.countScope,canRecordInternalPick:who.canRecordInternalPick,unitConversionVerified:false,humanOverrideEnabled:false},who.branchCode));}));
+ r.get('/internal-picks/history',run(async(req,res)=>{const who=await access.verify(req,'counter');res.json(envelope({records:await picks.history({config,db,who})},who.branchCode));}));
+ r.post('/internal-picks',run(async(req,res)=>{const who=await access.verify(req,'counter'),receipt=await picks.submit({config,db,who,body:req.body,now:now()});res.status(receipt.replayed?200:201).json(envelope({receipt},who.branchCode));}));
+ r.post('/check',run(async(req,res)=>{const who=await access.verify(req,'counter');res.json(envelope(await ledger.evaluate(db,ledger.qualifyCountScope(who,ledger.normalize(req.body,now())),who.branchCode),who.branchCode));}));
  r.post('/',run(async(req,res)=>{const who=await access.verify(req,'counter'),receipt=await ledger.submit(db,who,req.body,now());res.status(receipt.replayed?200:201).json(receipt);}));
  r.get('/events/:id',run(async(req,res)=>{const who=await access.verify(req,'counter');if(!/^[a-f0-9-]{36}$/i.test(req.params.id))throw new ledger.CountError(400,'EVENT_INVALID','รหัสไม่ถูกต้อง');const row=(await db.query('SELECT * FROM ordering.scpda_observations WHERE event_id=$1 AND branch_code=$2 AND operator_code=$3',[req.params.id,who.branchCode,who.operatorCode])).rows[0];if(!row)throw new ledger.CountError(404,'COUNT_NOT_FOUND','ยังไม่พบใบรับ');res.json(ledger.receipt(row));}));
  r.get('/history',run(async(req,res)=>{const who=await access.verify(req,'counter');res.json(envelope({records:await ledger.history(db,{operatorCode:who.operatorCode,branchCode:who.branchCode})},who.branchCode));}));

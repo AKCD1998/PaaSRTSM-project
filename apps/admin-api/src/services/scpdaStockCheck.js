@@ -1,4 +1,5 @@
 'use strict';
+const {SCOPES}=require('./scpda004Scopes');
 const CONTRACT='scpda-stock-check-001-v1';
 const categories=new Set(['all','pharma','normal','common']);
 function queryOptions(query){
@@ -26,7 +27,7 @@ const catalog=`WITH canonical AS (
 function publicCount(r){
  if(!r.event_id)return null;
  const e=r.evidence;
- return {eventId:r.event_id,receiptId:r.receipt_id,quantity:Number(e.quantity),unit:r.unit_label,operatorCode:r.operator_code,round:r.round_no,completeProduct:r.complete_product,observedAt:r.observed_at,receivedAt:r.received_at,reviewStatus:r.review_status,
+ return {eventId:r.event_id,receiptId:r.receipt_id,quantity:Number(e.quantity),unit:r.unit_label,operatorCode:r.operator_code,round:r.round_no,completeProduct:r.complete_product,observedAt:r.observed_at,receivedAt:r.received_at,reviewStatus:r.review_status,...(e.countScope?{countScope:e.countScope,packedCoverage:e.packedCoverage||null,completenessMeaning:'declared-area-only'}:{}),
   lots:(e.lots||[]).map(l=>({code:l.code,quantity:Number(l.quantity),manufacturedOn:l.manufacturedOn,expiresOn:l.expiresOn}))};
 }
 async function listProducts(db,options){
@@ -36,6 +37,17 @@ async function listProducts(db,options){
   db.query(catalog+` SELECT * FROM filtered ${filter} ORDER BY received_at DESC NULLS LAST,name ASC NULLS LAST,product_code ASC LIMIT $5 OFFSET $6`,[...params,limit,offset]),
   db.query(catalog+` SELECT count(*)::integer AS total FROM filtered ${filter}`,params)
  ]);
- return {contract:CONTRACT,branchCode,order:'pda-received-desc-unsubmitted-last',officialStockWrites:false,records:page.rows.map(r=>({productCode:r.product_code,skuId:r.sku_id==null?null:String(r.sku_id),name:r.name||r.product_code,barcode:r.barcode||null,category:r.category||null,latestCount:publicCount(r)})),pagination:{total:total.rows[0].total,limit,offset}};
+ const scoped=new Map();
+ if(branchCode==='004'&&page.rows.length){
+  const areaRows=(await db.query(`SELECT DISTINCT ON (e.product_code,e.count_scope) e.*,r.action AS review_status
+   FROM ordering.scpda_observations e LEFT JOIN LATERAL(SELECT action FROM ordering.scpda_review_events r WHERE r.event_id=e.event_id ORDER BY r.revision DESC LIMIT 1)r ON TRUE
+   WHERE e.branch_code='004' AND e.product_code=ANY($1::text[]) ORDER BY e.product_code,e.count_scope,e.received_at DESC,e.event_id DESC`,[page.rows.map(r=>r.product_code)])).rows;
+  for(const row of areaRows){if(!scoped.has(row.product_code))scoped.set(row.product_code,{});scoped.get(row.product_code)[row.count_scope||'unscoped']=publicCount(row);}
+ }
+ return {contract:CONTRACT,branchCode,order:'pda-received-desc-unsubmitted-last',officialStockWrites:false,records:page.rows.map(r=>{
+  const record={productCode:r.product_code,skuId:r.sku_id==null?null:String(r.sku_id),name:r.name||r.product_code,barcode:r.barcode||null,category:r.category||null,latestCount:publicCount(r)};
+  if(branchCode==='004'){const byScope=scoped.get(r.product_code)||{};record.latestCount=byScope.unscoped||null;record.latestPdaReceivedAt=r.received_at||null;record.areaCounts=Object.values(SCOPES).map(scope=>({scopeId:scope.id,label:scope.label,latestCount:byScope[scope.id]||null}));record.combinedCount={quantity:null,status:'awaiting-reconciliation',coverage:record.areaCounts.every(a=>a.latestCount)?'both-areas-observed':'incomplete',reason:'area-times-units-and-movements-not-yet-reconciled'};}
+  return record;
+ }),pagination:{total:total.rows[0].total,limit,offset}};
 }
 module.exports={CONTRACT,queryOptions,listProducts};

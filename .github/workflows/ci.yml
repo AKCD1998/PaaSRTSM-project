@@ -26,6 +26,7 @@ jobs:
           --health-retries 10
 
     env:
+      SCPDA004_AREAS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/scpda004_areas_test_ci
       APP_CENTER_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_app_center_test_ci
       CP4_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
       HOURLY_EVIDENCE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sc_hourly_evidence_test_ci
@@ -70,9 +71,20 @@ jobs:
           PGPASSWORD: postgres
         run: createdb --host=127.0.0.1 --port=5432 --username=postgres sc_app_center_test_ci
 
+      - name: Create isolated SCPDA004 areas test database
+        env:
+          PGPASSWORD: postgres
+        run: createdb --host=127.0.0.1 --port=5432 --username=postgres scpda004_areas_test_ci
+
       - name: Run test suite
         # The archive integration test has its own disposable database.
         run: npm test -- --test-concurrency=1
+
+      - name: Remove isolated SCPDA004 areas test database
+        if: always()
+        env:
+          PGPASSWORD: postgres
+        run: dropdb --if-exists --host=127.0.0.1 --port=5432 --username=postgres scpda004_areas_test_ci
 
       - name: Remove isolated hourly evidence test database
         if: always()

@@ -1,0 +1,15 @@
+# SCPDA004 physical count areas — R18
+
+Branch004 remains one Ada branch. The existing01004 account covers the front sales floor and its warehouse;01004SHPEE covers the rear Shopee area, including packed orders still physically present. Server policy maps each full account code to its count scope. This is not a second branch, balance or order reservation ledger.
+
+`FEATURE_SCPDA_004_AREAS` defaults off. Keep existing reader/count/branch004 flags, credentials, device keys and count allowlist; add the Shopee actor explicitly. Its new enrollment invitation can bind the device certificate to01004SHPEE. Existing01004 certificates and unsent legacy observations remain compatible. No credential is stored in source.
+
+Migration090 is additive and rerunnable. It reserves nullable scope on observations/projections and creates immutable internal-pick evidence.089 belongs to the separate inactive daily/Drive candidate; its future constraints must retain01004SHPEE. Existing count UUIDs and normalized hashes remain unchanged without scope. Old counts stay unspecified; correction cannot relabel an area.
+
+Scoped completeness means only the declared area. Complete Shopee counts require explicit packed-goods coverage. Independent rounds/timestamps/units are never summed automatically. Website branch004 results expose both area observations and keep the combined quantity unknown until movement and unit reconciliation is available. FEFO will not use a scoped baseline with branch-wide movement coverage.
+
+Authenticated count-purpose endpoints add `POST /api/scpda/counts/internal-picks` and `GET /api/scpda/counts/internal-picks/history`. A pick moves the stated evidence from the front warehouse to Shopee packing/shelf, with zero branch net change. UUID replay returns the same receipt; changed replay fails409. This records an operation, not an Ada movement, stock adjustment, interbranch transfer, reservation or shipment. The existing SC-official Shopee commitment authority remains separate and must not be double deducted.
+
+Validation: isolated HTTP/PostgreSQL tests exercise scoped counts, dates, actor/device binding, spoof rejection, packed coverage, legacy replay, linked corrections, pick idempotency/immutability, permissions, migration rerun and unchanged reference balances. Exact Android APK HTML through shipping JVM authentication and actual React admin confirms receipts,001/005 compatibility, account switching and offline pick retry. Physical Android camera/Keystore acceptance remains a phone-owner check.
+
+Rollout: deploy migration/backend before enabling scope flag or provisioning the long account alias, deploy the compatible web, preserve all existing account/invitation records, then publish signed Android code18. Rollback by disabling the area flag without deleting evidence or rotating existing accounts; queued scoped records remain on the phone for later retry. Keep additive schema. An old backend must not receive the new credential list until it supports the alias.
