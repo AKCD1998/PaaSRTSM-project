@@ -1,7 +1,11 @@
 # SCPDA daily companion pilot — candidate, not activated
 
-18 November 2026. Scope: primary **01005 / branch005**, companion **02005**.
-Existing001/004 users and existing005 operation stay on R16 until activation.
+19 November 2026 continuation. Scope: primary **01005 / branch005**, companion **02005**.
+The candidate now includes live R18: preserve001/004-front/004-Shopee and005.
+
+The user authorizes a dedicated Google Cloud project/client under admin@scgroup1989.com. Drive account/folder access is verified, but no Cloud project-management credential/browser connection or backend Drive OAuth grant is available. No project/client/grant has been created by this continuation.
+
+The released R18 APK already carries the daily UI; prepare its matching version18 PWA rather than publishing older17. Migration091 supersedes the never-applied candidate089 and retains01004SHPEE constraints. An isolated seven-account test verifies004 read/count/pick capability survives while005 daily admission is enabled.
 
 ## Agreed user behavior
 
@@ -38,10 +42,10 @@ The OAuth grant must support reading the selected existing folder, creating file
 
 ## Activation sequence (not performed)
 
-1. Re-fetch main and re-check migration numbering.089 was unused when this candidate was prepared. Apply/replay the additive migration on the Linux deployment path, preserving observation records.
-2. Finish real Drive connection and verification. Preserve the folder's private permissions. Add the prepared bcrypt02005 record through the existing credential configuration, preserving all five earlier records.
+1. Re-fetch main and re-check migration numbering.The original089 candidate was never applied; current migration is091 above live090. Apply/replay the additive migration on the Linux deployment path, preserving observation records.
+2. Finish real Drive connection and verification. Preserve the folder's private permissions. Add the prepared bcrypt02005 record through the existing credential configuration, preserving all six earlier records.
 3. Add02005 to the explicit count admission list; do not derive product/admin privileges from this operator.
-4. Build/sign Android with the existing SCPDA signer. Publish the matching Android/PWA bundle, then set `SCPDA_PWA_VERSION_CODE=17`; keep both clients on that immutable release. Old Android versions cannot create a QR.
+4. Build/sign Android with the existing SCPDA signer. Publish the matching Android/PWA bundle, then set `SCPDA_PWA_VERSION_CODE=18`; keep both clients on that immutable release. Old Android versions cannot create a QR.
 5. Only then enable `FEATURE_SCPDA_DAILY_005=true`. Test installation, scan, Wi-Fi change, morning selfie, cold reopen, count receipt, midnight expiry and private Drive archival on the actual iPhone and shop Android.
 6. Roll out other branches only after that pilot. Do not activate001/004 or the separate Ada product writer by inference.
 
@@ -52,3 +56,11 @@ Synthetic loopback PostgreSQL/HTTP fixtures exercise competing phones, replay, p
 The shipping Java session passed primary login, count negotiation, cold session reconstruction and QR generation against that isolated API. Chromium decoded a real QR through fake camera frames, completed selfie login using a synthetic image, read the real fixture catalog, submitted a count and resumed across browser restart. These results are not physical Android/iPhone acceptance or a live Google Drive test.
 
 No Ada write, product TEST, stock adjustment, production account change, migration, release publication or deployment was performed for this candidate.
+
+## Google account connection checkpoint —19 November
+
+The connected Drive profile is admin@scgroup1989.com and the selected log folder remains owner-only underเภสัชอู๋. That connector authorization cannot be exported/reused as the backend OAuth grant or as Cloud Resource Manager authorization. The executor has no gcloud login/ADC or Google-related runtime binding; bounded Drive metadata discovery found no OAuth/client-secret setup artifact. No credential value was printed.
+
+Before activating: use a company-owned dedicated OAuth client, authorize through Google's UI, keep client secret/refresh token only in Render's secret configuration, run the read-only Drive verifier, and test one synthetic archive before any employee photo. For a Workspace-only application choose Internal audience when available. Do not assume an External/Testing refresh grant remains valid indefinitely. Google consent must disclose the actual requested Drive permissions; access to a pre-existing folder must be granted to this new client, not inferred from its folder ID. Never ask the user to paste an authorization code, access token or refresh token into chat.
+
+Local checks on19 November:23 daily/provider/CORS/HTTP/PG checks passed with seven-account coexistence;32 other SCPDA regression checks passed,6 optional integration checks skipped. PWA18 exported from the signed R18 APK with the matching current browser host and no production activation. Existing R18 deployment/accounts/App Center publication are untouched by this candidate.

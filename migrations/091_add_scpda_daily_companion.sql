@@ -58,10 +58,10 @@ CREATE INDEX IF NOT EXISTS scpda_selfie_archives_work_idx
  ON ordering.scpda_selfie_archives(state,delete_after);
 ALTER TABLE ordering.scpda_observations DROP CONSTRAINT IF EXISTS scpda_observations_operator_code_check;
 ALTER TABLE ordering.scpda_observations ADD CONSTRAINT scpda_observations_operator_code_check
- CHECK(operator_code IN ('01001','02001','03001','01004','01005','02005'));
+ CHECK(operator_code IN ('01001','02001','03001','01004','01004SHPEE','01005','02005'));
 ALTER TABLE ordering.scpda_observations DROP CONSTRAINT IF EXISTS scpda_observations_operator_branch_check;
 ALTER TABLE ordering.scpda_observations ADD CONSTRAINT scpda_observations_operator_branch_check
  CHECK((branch_code='001' AND operator_code IN ('01001','02001','03001')) OR
- (branch_code='004' AND operator_code='01004') OR
+ (branch_code='004' AND operator_code IN ('01004','01004SHPEE')) OR
  (branch_code='005' AND operator_code IN ('01005','02005')));
 COMMIT;
