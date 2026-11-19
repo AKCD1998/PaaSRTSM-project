@@ -1,7 +1,8 @@
 'use strict';
-const OPERATOR_BRANCHES=Object.freeze({'01001':'001','02001':'001','03001':'001','01004':'004','01004SHPEE':'004','01005':'005','02005':'005'});
+const OPERATOR_BRANCHES=Object.freeze({'01001':'001','02001':'001','03001':'001','01004':'004','01004SHPEE':'004','02004':'004','02004SHPEE':'004','01005':'005','02005':'005'});
 const BRANCH_COLUMNS=Object.freeze({'001':'qty_branch_001','004':'qty_branch_004','005':'qty_branch_005'});
-const operatorBranch=code=>OPERATOR_BRANCHES[code]||null;
+const companionParts=code=>typeof code==='string'?code.match(/^(0[2-9]|[1-9]\d{1,3})(004|005)(SHPEE)?$/):null;
+const operatorBranch=code=>{if(OPERATOR_BRANCHES[code])return OPERATOR_BRANCHES[code];const m=companionParts(code);return m&&!(m[2]==='005'&&m[3])?m[2]:null;};
 const branchEnabled=(config,branch)=>branch==='001'||branch==='004'&&config.featureScpdaBranch004===true||branch==='005'&&config.featureScpdaBranch005===true;
 const enabledBranches=config=>Object.keys(BRANCH_COLUMNS).filter(branch=>branchEnabled(config,branch));
 const readContract=branch=>'scpda-read-'+branch+'-v1';

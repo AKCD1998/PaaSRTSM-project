@@ -105,6 +105,7 @@ function createCorsMiddleware(config) {
     // Does not add the Site to the general web-session/admin CORS allowlist.
     const scpdaWeb = (config.featureScpdaWeb001 === true
       && normalizedOrigin === "https://sc-stockday-pda-lab.scgroup1989-it.chatgpt.site"
+      || config.featureScpdaDaily004 === true
       || config.featureScpdaDaily005 === true
       && normalizedOrigin === "https://sc-stockday-ordering.onrender.com")
       && /^\/api\/scpda(?:\/|$)/.test(req.path);
