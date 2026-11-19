@@ -5,6 +5,7 @@ const {Router}=require('express');
 const crypto=require('node:crypto');
 const jwt=require('jsonwebtoken');
 const bcrypt=require('bcryptjs');
+const {scpdaClientIp}=require('../services/scpdaClientIp');
 const {checkDaily,dailyRequired,isCompanion}=require('../services/scpdaDailyPolicy');
 const {resolveOperator}=require('../services/scpdaCompanions');
 const {mountDailyRoutes}=require('../services/scpdaDailyRoutes');
@@ -48,9 +49,9 @@ function createScpdaReadRouter({config,db,now=Date.now}){
  router.use((req,res,next)=>{res.set('Cache-Control','no-store');if(!config.featureScpdaRead001)return res.status(404).json({error:'SCPDA access is not enabled',code:'SCPDA_DISABLED'});if(!settings)return res.status(503).json({error:'SCPDA configuration is unavailable',code:'SCPDA_UNCONFIGURED'});next();});
  const run=fn=>async(req,res)=>{try{await fn(req,res);}catch(e){const known=e instanceof AccessError||Number.isInteger(e.status)&&typeof e.code==='string';res.status(known?e.status:503).json({error:known?e.message:'ระบบ SCPDA ยังไม่พร้อม กรุณาลองใหม่',code:known?e.code:'SCPDA_UNAVAILABLE'});}};
  const envelope=(data,branch='001')=>({contract:readContract(branch),branchCode:branch,...data});
- function burst(req,verifiedOperator=null){const t=now();for(const [k,r]of bursts)if(r.until<=t)bursts.delete(k);const key=(req.ip||'unknown')+(verifiedOperator?':'+verifiedOperator:''),row=bursts.get(key)||{n:0,until:t+60000};if(bursts.size>=5000&&!bursts.has(key)||++row.n>(verifiedOperator?60:30))fail(429,'RETRY_LATER','ลองหลายครั้ง กรุณารอสักครู่');bursts.set(key,row);}
+ function burst(req,verifiedOperator=null){const t=now();for(const [k,r]of bursts)if(r.until<=t)bursts.delete(k);const key=scpdaClientIp(req)+(verifiedOperator?':'+verifiedOperator:''),row=bursts.get(key)||{n:0,until:t+60000};if(bursts.size>=5000&&!bursts.has(key)||++row.n>(verifiedOperator?60:30))fail(429,'RETRY_LATER','ลองหลายครั้ง กรุณารอสักครู่');bursts.set(key,row);}
  async function audit(client,req,{actor='device',action,targetType,targetId,success=true,meta={}}){await client.query(`INSERT INTO public.audit_logs(actor_role,actor_id,action,target_type,target_id,success,meta,request_id,ip,user_agent)
- VALUES('system',$1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`,['scpda:'+actor,action,targetType,targetId,success,JSON.stringify({branchCode:req.scpdaBranchCode||'001',...meta}),req.requestId||null,req.ip||null,String(req.headers['user-agent']||'').slice(0,1024)]);}
+ VALUES('system',$1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`,['scpda:'+actor,action,targetType,targetId,success,JSON.stringify({branchCode:req.scpdaBranchCode||'001',...meta}),req.requestId||null,scpdaClientIp(req),String(req.headers['user-agent']||'').slice(0,1024)]);}
  function certificate(claims){return jwt.sign({device_ref:claims.device_ref,device_id:claims.device_id,public_key:claims.public_key,iat:claims.iat,exp:claims.exp,jti:claims.jti,...(claims.operator_code?{operator_code:claims.operator_code}:{}),kind:'scpda-device',branch_code:claims.branch_code||'001',iss:ISSUER,aud:'scpda-device-'+(claims.branch_code||'001')},settings.deviceKey,{algorithm:'HS256'});}
  function deviceFrom(raw){let d;try{d=jwt.verify(string(raw,8192),settings.deviceKey,{algorithms:['HS256'],issuer:ISSUER,audience:['scpda-device-001','scpda-device-004','scpda-device-005'],clockTimestamp:Math.floor(now()/1000)});}catch{fail(401,'DEVICE_CERT_INVALID','ต้องเชื่อมเครื่องกับ SCPDA ก่อน');}
   if(d.kind!=='scpda-device'||!branchEnabled(config,d.branch_code)||d.aud!=='scpda-device-'+d.branch_code||!/^[a-f0-9]{64}$/.test(d.device_ref||'')||!UUID.test(d.device_id||'')||settings.revoked.has(d.device_ref)||digest(Buffer.from(d.public_key||'','base64'))!==d.device_ref)fail(401,'DEVICE_CERT_INVALID','เครื่องนี้ไม่ได้รับอนุญาต');publicKey(d.public_key);return d;}

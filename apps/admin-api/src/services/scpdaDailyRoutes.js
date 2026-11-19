@@ -97,7 +97,7 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
     await audit(client,req,{actor:op.operatorCode,action:'scpda.login_failed',targetType:'scpda_grant',targetId:body.grantId,success:false});return null;
    }
    const primary=(await client.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1 FOR SHARE',[grant.primary_session_id])).rows[0];
-   if(!primary||primary.operator_code!==pair.primaryOperatorCode||primary.branch_code!==pair.branchCode||primary.revoked_at||+new Date(primary.expires_at)<=now()||primary.network_hash!==networkHash(req,config.authJwtSecret))reject(403,'STORE_NETWORK_REQUIRED','เชื่อม Wi-Fi ร้านเดียวกับเครื่องหลัก');
+   if(!primary||primary.operator_code!==pair.primaryOperatorCode||primary.branch_code!==pair.branchCode||primary.revoked_at||+new Date(primary.expires_at)<=now()||primary.network_hash!==networkHash(req,config.authJwtSecret))reject(403,'STORE_NETWORK_REQUIRED','ระบบยืนยันเครือข่ายไม่ตรงกับเครื่องหลัก ให้สร้าง QR ใหม่แล้วลองอีกครั้ง');
    if(grant.consumed_session_id){if(grant.consumed_device_ref!==ref)reject(409,'QR_USED','QR นี้ใช้ไปแล้ว');const old=(await client.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1',[grant.consumed_session_id])).rows[0];if(!old||old.revoked_at||old.credential_version!==op.fingerprint||old.device_id!==body.deviceId)reject(409,'QR_USED','QR นี้ใช้ไปแล้ว');return old;}
    const binding=(await client.query("SELECT * FROM ordering.scpda_operator_devices WHERE operator_code=$1 FOR UPDATE",[op.operatorCode])).rows[0];
    if(binding&&(binding.revoked_at||binding.device_ref!==ref||binding.device_id!==body.deviceId))reject(409,'OPERATOR_ALREADY_BOUND',op.operatorCode+' ผูกกับเครื่องอื่นแล้ว ติดต่อผู้ดูแล');
