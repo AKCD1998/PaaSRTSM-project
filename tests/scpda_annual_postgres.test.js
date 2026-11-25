@@ -45,6 +45,7 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
   try {
     await db.query('CREATE SCHEMA IF NOT EXISTS ordering');
     await db.query(await fs.readFile(path.join(__dirname, '../migrations/093_add_scpda_annual_count.sql'), 'utf8'));
+    await db.query(await fs.readFile(path.join(__dirname, '../migrations/094_queue_scpda_annual_pages.sql'), 'utf8'));
     const pageMap = JSON.parse((await fs.readFile(mapFile, 'utf8')).replace(/^\uFEFF/, ''));
     const event = await prepareEvent({ label: 'Fixture 005', branch: branchCode, warehouse: '001', pageMap, files });
     assert.equal(event.pages.length, 74);
@@ -86,6 +87,22 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
     const waiting = await annual.overview(db, { branchCode, operator: other, manager: false });
     assert.equal(waiting.assigned, null);
     assert.equal(waiting.free.some(page => page.category === 'normal' && page.pageNo === 11), false);
+    // A second page queues on the same installation without replacing page11.
+    const another = { ...chosen, pageNo: 1, operator };
+    await annual.assignPage(db, another);
+    let queued = await annual.overview(db, { branchCode, operator, manager: false });
+    assert.equal(queued.assigned.pageNo, 11);
+    assert.deepEqual(queued.assignedPages.map(page => page.pageNo), [11, 1]);
+    assert.equal(queued.assignedPages.some(page => page.items || page.counts), false);
+    const selected = await testActor('get','/annual?category=normal&pageNo=1',operator).expect(200);
+    assert.equal(selected.body.assigned.pageNo, 1);
+    await testActor('get','/annual?category=normal&pageNo=1',other).expect(404);
+    await testActor('get','/annual?category=normal&pageNo=2',operator).expect(404);
+    await annual.assignPage(db, another); // replay does not add duplicate queue entries
+    await db.query(await fs.readFile(path.join(__dirname, '../migrations/093_add_scpda_annual_count.sql'), 'utf8'));
+    await db.query(await fs.readFile(path.join(__dirname, '../migrations/094_queue_scpda_annual_pages.sql'), 'utf8'));
+    queued = await annual.overview(db, { branchCode, operator, manager: false });
+    assert.deepEqual(queued.assignedPages.map(page => page.pageNo), [11, 1]);
     const firstRow = assigned.items[0].row;
     const draft = { ...chosen, operator, revision: 0, mutationId: randomUUID(), submit: false,
       counts: { [firstRow]: [{ quantityMilli: 2000 }, null, null] } };
@@ -101,12 +118,26 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
         [{ quantityMilli: 0 }, { quantityMilli: 1250 }, null, { quantityMilli: 2000, place: 'หลังร้าน B & C' }] :
         [{ quantityMilli: 0 }, null, null]]));
     }
+    const primaryPage = { branchCode, eventId, category: 'common', pageNo: 1 };
+    await testActor('post','/annual/participant','01005').send({ eventId, displayName: 'เครื่องแม่ทดสอบ' }).expect(200);
+    await testActor('post','/annual/assign','01005').send({ ...primaryPage, operator: '01005', approve: false }).expect(200);
+    const mine = await testActor('get','/annual?view=mine','01005').expect(200);
+    assert.equal(mine.body.manager, false); assert.equal(mine.body.canManage, true);
+    assert.equal(mine.body.assigned.pageNo, 1);
+    const ownReceipt = await testActor('post','/annual/save','01005').send({ ...primaryPage, revision: 0, mutationId: randomUUID(), counts: filled(mine.body.assigned), submit: true }).expect(200);
+    assert.equal(ownReceipt.body.state, 'submitted');
+    const team = await testActor('get','/annual',operator).expect(200);
+    assert.equal(team.body.team.find(page => page.operator === '01005').displayName, 'เครื่องแม่ทดสอบ');
+    assert.equal(team.body.team.some(page => page.items || page.counts), false);
+    await testActor('get','/annual?category=common&pageNo=1',operator).expect(404);
+    assert.ok((await db.query("SELECT actor_name FROM ordering.scpda_annual_count_audit WHERE event_id=$1 AND operator_code='01005'",[eventId])).rows.every(row => row.actor_name === 'เครื่องแม่ทดสอบ'));
     const submit = { ...draft, revision: 1, mutationId: randomUUID(), submit: true, counts: filled(assigned) };
     const receipt = await annual.savePage(db, submit);
     assert.equal(receipt.state, 'submitted');
+    assert.equal((await annual.overview(db, { branchCode, operator, manager: false })).assigned.pageNo, 1);
     assert.equal((await annual.savePage(db, submit)).receiptId, receipt.receiptId);
     await assert.rejects(annual.savePage(db, { ...submit, mutationId: randomUUID() }), { code: 'ANNUAL_PAGE_CHANGED' });
-    for (const page of event.pages.filter(page => page.category !== 'normal' || page.pageNo !== 11)) {
+    for (const page of event.pages.filter(page => !(page.category === 'normal' && page.pageNo === 11) && !(page.category === 'common' && page.pageNo === 1))) {
       const job = { branchCode, eventId, operator, category: page.category, pageNo: page.pageNo };
       await annual.assignPage(db, job);
       await annual.savePage(db, { ...job, revision: 0, mutationId: randomUUID(), counts: filled(page), submit: true });

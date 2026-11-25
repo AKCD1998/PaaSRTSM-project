@@ -169,6 +169,41 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
   const candidate={...config,scpdaDailyVersionPolicyJson:JSON.stringify({'005':{accepted:[22,23],qr:[22]}})};
   await assert.rejects(requirePublishedVersion(db,candidate,'005',23),{code:'APP_UPDATE_REQUIRED'});
  });
+
+ await t.test('79-of80 annual draft survives midnight; same005 actor resumes next day without a submitted receipt',async()=>{
+  for(const file of ['093_add_scpda_annual_count.sql','094_queue_scpda_annual_pages.sql'])await db.query(fs.readFileSync('migrations/'+file,'utf8'));
+  const eventId=crypto.randomUUID(),items=Array.from({length:80},(_,i)=>({row:i+3,ordinal:i+1,code:'QA-'+i,name:'ยาฝึก'+i,barcode:'QA-'+i,unit:'เม็ด'}));
+  await db.query("INSERT INTO ordering.scpda_annual_events(id,branch_code,warehouse_code,label,source_files) VALUES($1,'005','001','Synthetic overnight draft','{}')",[eventId]);
+  await db.query("INSERT INTO ordering.scpda_annual_pages(event_id,category,page_no,items,assignee) VALUES($1,'common',1,$2,'01005')",[eventId,JSON.stringify(items)]);
+  const counts=Object.fromEntries(items.slice(0,79).map(item=>[item.row,[{quantityMilli:1000},null,null]]));
+  const input={eventId,category:'common',pageNo:1,revision:0,mutationId:crypto.randomUUID(),counts,submit:false};
+  const saved=(await req('/annual/save',{token:parentToken,body:input,expected:200})).data;
+  assert.ok(Number.isFinite(Date.parse(saved.savedAt)));assert.equal(saved.receiptId,null);
+  const originalClock=clock;clock+=86400000;
+  await req('/annual?view=mine',{token:parentToken,expected:401});
+  assert.equal(Object.keys((await db.query('SELECT counts FROM ordering.scpda_annual_pages WHERE event_id=$1',[eventId])).rows[0].counts).length,79);
+  const boot=await loginPrimary(),c=(await req('/daily/primary/challenge',{token:boot,body:{},expected:200})).data,jti=JSON.parse(Buffer.from(boot.split('.')[1],'base64url')).jti;
+  const nextDay=(await req('/daily/primary/start',{token:boot,body:{deviceCertificate:primary.certificate,selfie:image,versionCode:22,challengeId:c.challengeId,signature:primary.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,jti,imageHash,22].join('\n'))},expected:200})).data;
+  const work=(await req('/annual?view=mine',{token:nextDay.token,expected:200})).data;
+  assert.equal(work.assigned.countedRows,79);assert.equal(work.assigned.totalRows,80);assert.deepEqual(work.assigned.counts,counts);assert.equal(work.assigned.receiptId,null);
+  clock=originalClock;
+ });
+ await t.test('one installation can hold005 and004 temporary branch accounts without merging their sessions or rights',async()=>{
+  clock+=61000;
+  grant=(await qr(22)).data;
+  const body005={operatorCode:'02005',grantId:grant.grantId,secret:grant.secret,publicKey:child.publicKey,deviceId:child.deviceId,versionCode:22,selfie:image,pin:'fixturePassword'};
+  body005.signature=child.sign(['SCPDA-COMPANION-ENROLL-V1',grant.grantId,grant.secret,child.deviceId,imageHash,22].join('\n'));
+  const five=(await req('/daily/companion/enroll',{body:body005,expected:201})).data;
+  const team=teams[0],q=(await req('/daily/qr/challenge',{token:team.primaryToken,body:{},expected:200})).data;
+  const g=(await req('/daily/qr',{token:team.primaryToken,body:{target:'new',deviceCertificate:team.primaryCert,versionCode:17,challengeId:q.challengeId,signature:team.primaryDevice.sign(['SCPDA-COMPANION-QR-V2',q.challengeId,q.nonce,team.primarySession,17,'new'].join('\n'))},expected:201})).data;
+  const body004={...body005,operatorCode:g.operatorCode,grantId:g.grantId,secret:g.secret,pin:g.initialPassword};body004.signature=child.sign(['SCPDA-COMPANION-ENROLL-V1',g.grantId,g.secret,child.deviceId,imageHash,22].join('\n'));
+  const four=(await req('/daily/companion/enroll',{body:body004,expected:201})).data;
+  assert.equal((await req('/session',{token:five.token,expected:200})).data.branchCode,'005');
+  assert.equal((await req('/session',{token:four.token,expected:200})).data.branchCode,'004');
+  await req('/annual',{token:four.token,expected:403});
+  assert.equal((await req('/session',{token:five.token,expected:200})).data.user.countScope,undefined);
+  assert.equal((await req('/session',{token:four.token,expected:200})).data.user.countScope.id,'004-front');
+ });
  await t.test('004 histories stay team/account scoped; repeated migration preserves evidence and005; midnight denies both teams',async()=>{
   for(const team of teams){const h=(await req('/counts/history',{token:team.counter,expected:200})).data;assert.equal(h.records.length,1);assert.ok(h.records.every(r=>r.event.operatorCode===team.childCode&&r.event.countScopeId===team.scope));}
   const before=(await db.query('SELECT count(*) n FROM ordering.scpda_observations')).rows[0].n;

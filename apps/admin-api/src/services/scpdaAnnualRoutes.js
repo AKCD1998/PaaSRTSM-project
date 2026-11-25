@@ -30,8 +30,10 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
   }
   router.get('/annual', run(async (req, res) => {
     const who = await actor(req);
-    const result = await annual.overview(db, who);
-    if (who.manager && result.event) {
+    const hasSelection = req.query?.category !== undefined || req.query?.pageNo !== undefined;
+    const selected = hasSelection ? { category: req.query.category, pageNo: Number(req.query.pageNo) } : undefined;
+    const result = await annual.overview(db, { ...who, selected, workOnly: req.query?.view === 'mine' });
+    if (result.manager && result.event) {
       const operators = await listCompanions(config, settings, db, who.operator);
       result.helpers = operators.filter(device => device.paired).map(device => device.operatorCode);
     }
@@ -45,15 +47,19 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
   router.post('/annual/assign', run(async (req, res) => {
     const who = await actor(req, 'manager');
     const { category, pageNo, operator, approve } = req.body || {};
-    const permitted = (await listCompanions(config, settings, db, who.operator))
+    const permitted = operator === who.operator || (await listCompanions(config, settings, db, who.operator))
       .some(device => device.operatorCode === operator && device.paired);
     if (!permitted || typeof approve !== 'boolean') annual.reject(400, 'ANNUAL_ASSIGNEE_INVALID', 'เลือกเครื่องลูกที่ผูกแล้ว');
     reply(res, await annual.assignPage(db, { branchCode: who.branchCode, eventId: eventId(req), category, pageNo, operator, approve }));
   }));
   router.post('/annual/save', run(async (req, res) => {
-    const who = await actor(req, 'helper');
+    const who = await actor(req);
     const { category, pageNo, revision, mutationId, counts, submit } = req.body || {};
     reply(res, await annual.savePage(db, { ...who, eventId: eventId(req), category, pageNo, revision, mutationId, counts, submit }));
+  }));
+  router.post('/annual/participant', run(async (req,res) => {
+    const who = await actor(req);
+    reply(res, await annual.nameParticipant(db, { ...who, eventId: eventId(req), displayName: req.body?.displayName }));
   }));
   router.post('/annual/export', run(async (req, res) => {
     const who = await actor(req, 'manager');

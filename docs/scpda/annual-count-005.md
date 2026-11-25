@@ -36,3 +36,15 @@ Import delivery may run as a short-lived Render one-off job using the live build
 Rollback: turn off only `FEATURE_SCPDA_ANNUAL_005`, preserving sessions, ordinary counts, assigned pages and receipts. Do not delete the event or remove21 from004 compatibility during rollout.
 
 R22 resumes with `SCPDA-DAILY-RESUME-V2`, signing the installed build as well as challenge/session. After the existing daily session, network, permanent binding and logout checks pass, the server admits the published compatible build without changing the daily session ID, expiry or selfie. Existing R21 V1 resume remains accepted.
+
+## R23 — multiple pages, partial drafts and primary self-counting
+
+Migration094 removes the old per-operator one-page uniqueness rule, retains the per-page owner, adds a stable assignment order (including an old-writer-compatible trigger) and preserves every existing count/revision/receipt. Replaying093 after094 skips its obsolete unique index. R22 readers still receive the oldest open page through `assigned`; R23 can select an owned page through `category/pageNo` and gets own-page queue summaries. Foreign/unassigned details remain404.
+
+Primary01005 can assign itself, use `view=mine` and save its own page; only the primary can assign/export. All event members see assignment/progress summaries and optional participant display names, never other people's count/item details. Names are labels, not role evidence; count-change audit snapshots the current name.
+
+Non-submit saves return durable `savedAt`; they accept incomplete pages and never mark them submitted. Day expiry affects authentication, not the event row or IndexedDB outbox. UI explicitly separates save/pause from complete-page submission. The isolated fixture verifies79of80rows across expired-day denial and a new authenticated day.
+
+Personal devices may be admitted to another supported branch through its existing primary QR/password/day/network proof. Client profiles preserve separate admission certificates/day markers for each branch/operator while retaining the installation key. Only the selected profile supplies the reader/count session; switching re-verifies it and never restores passwords or bearer tokens. User explicitly permits ordinary branch functions during the visit. This does not silently enable001 QR or other branches absent from the existing server policy.
+
+Release order: compatibility backend/migration live, publish signed APK, deploy matching PWA, then preferred-version switch. Keep existing21/22 clients admitted during the current count. Never reimport/reset the live005event to upgrade.
