@@ -9,6 +9,7 @@ const {scpdaClientIp}=require('../services/scpdaClientIp');
 const {checkDaily,dailyRequired,isCompanion}=require('../services/scpdaDailyPolicy');
 const {resolveOperator}=require('../services/scpdaCompanions');
 const {mountDailyRoutes}=require('../services/scpdaDailyRoutes');
+const {mountAnnualRoutes}=require('../services/scpdaAnnualRoutes');
 const {operatorScope,canRecordInternalPick}=require('../services/scpda004Scopes');
 const {validScpdaCredential}=require('../services/scpdaCredential');
 const {queryProducts,queryProductDetail,buildFiltersFromQuery}=require('./products');
@@ -87,6 +88,7 @@ function createScpdaReadRouter({config,db,now=Date.now}){
   res.json(envelope({records:rows.map(r=>({productCode:r.product_code,productNameThai:r.product_name_thai||'',productNameEng:r.product_name_eng||'',barcode:r.barcode||'',unit:r.unit||'',branchCode:who.operator.branchCode,...(who.operator.branchCode==='001'?{qtyBranch001:r.quantity==null?null:Number(r.quantity)}:{quantity:r.quantity==null?null:Number(r.quantity)}),syncedAt:r.synced_at,stockNullsPreserved:true})),pagination:{limit:200,offset:0,total},stockSource:'full-sync',stockObservedAt:null},who.operator.branchCode));
  }));
  mountDailyRoutes({router,config,db,settings,now,run,authenticate,deviceFrom,publicUser,envelope,burst,audit});
+ mountAnnualRoutes({router,config,db,settings,run,authenticate,envelope});
  router.use((_req,res)=>res.status(405).json({error:'SCPDA supports product and stock reads only',code:'READ_ONLY'}));
  return router;
 }

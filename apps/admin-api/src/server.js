@@ -611,10 +611,12 @@ async function startServer() {
   });
 
   const focusCloseTimer = startFocusCloseSchedule({ db, logger: console });
+  const scpdaAnnualAuditTimer = require('./services/scpdaAnnualCount').startAuditExpiry({ db, config, logger: console });
 
   const shutdown = async () => {
     stopSelfieArchive();
     if (focusCloseTimer) clearInterval(focusCloseTimer);
+    if (scpdaAnnualAuditTimer) clearInterval(scpdaAnnualAuditTimer);
     if (assetCleanupTimer) clearInterval(assetCleanupTimer);
     if (preorderAttachmentCleanupTimer) clearInterval(preorderAttachmentCleanupTimer);
     if (focusLinePackageCleanupTimer) clearInterval(focusLinePackageCleanupTimer);
