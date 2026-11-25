@@ -120,10 +120,19 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
   if(!UUID.test(body.sessionId||''))reject(401,'DAILY_LOGIN_REQUIRED','เข้าสู่ระบบสำหรับวันนี้');
   const row=(await db.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1',[body.sessionId])).rows[0];
   if(!row)reject(401,'DAILY_LOGIN_REQUIRED','เข้าสู่ระบบสำหรับวันนี้');enabled(pairFor(row.operator_code));req.scpdaBranchCode=row.branch_code;const op=await resolveOperator(config,settings,db,row.operator_code);if(!op||settings.revoked.has(row.device_ref))reject(401,'DEVICE_REVOKED','เครื่องนี้ถูกยกเลิกแล้ว');
-  verify(keyFor(row.public_key),['SCPDA-DAILY-RESUME-V1',body.challengeId,c.nonce,body.sessionId].join('\n'),body.signature);
+  const upgrades=body.versionCode!==undefined;
+  verify(keyFor(row.public_key),(upgrades?['SCPDA-DAILY-RESUME-V2',body.challengeId,c.nonce,body.sessionId,body.versionCode]:['SCPDA-DAILY-RESUME-V1',body.challengeId,c.nonce,body.sessionId]).join('\n'),body.signature);
   const claims={jti:row.session_id,sub:row.operator_code,device_ref:row.device_ref,app_version:row.app_version,cv:op.fingerprint};
   await checkDaily({config,db,req,claims,now:now()});
   if((await db.query("SELECT 1 FROM public.audit_logs WHERE action='scpda.logout' AND target_type='scpda_session' AND target_id=$1 AND success=TRUE LIMIT 1",[row.session_id])).rows.length)reject(401,'SESSION_ENDED','ออกจากระบบแล้ว');
+  if(upgrades){
+   await requirePublishedVersion(db,config,row.branch_code,body.versionCode);
+   if(body.versionCode!==row.app_version){
+    const updated=(await db.query('UPDATE ordering.scpda_daily_sessions SET app_version=$2 WHERE session_id=$1 AND app_version=$3 AND revoked_at IS NULL RETURNING session_id',[row.session_id,body.versionCode,row.app_version])).rows[0];
+    if(!updated)reject(409,'DAILY_SESSION_CHANGED','เซสชันเปลี่ยนแล้ว กรุณาลองใหม่');
+    row.app_version=body.versionCode;
+   }
+  }
   // Refreshes only this day's capability; never extends the midnight expiry.
   res.json({...sessionReply(row,op),...(isCompanion(row.operator_code)?{deviceCertificate:certReply(row)}:{})});
  }));

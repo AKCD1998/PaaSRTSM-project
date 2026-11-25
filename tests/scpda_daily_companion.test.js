@@ -154,10 +154,13 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
    assert.equal(admitted.user.annualCountAvailable,undefined);
   }
   clock+=61000;
-  const bootstrap=await loginPrimary(),c=(await req('/daily/primary/challenge',{token:bootstrap,body:{},expected:200})).data;
-  const jti=JSON.parse(Buffer.from(bootstrap.split('.')[1],'base64url')).jti;
+  const sessionId=JSON.parse(Buffer.from(parentToken.split('.')[1],'base64url')).jti;
+  const before=(await db.query('SELECT count(*) n FROM ordering.scpda_selfie_archives')).rows[0].n;
+  const c=(await req('/daily/resume/challenge',{body:{sessionId},expected:200})).data;
   config.featureScpdaAnnual005=true;
-  const upgraded=(await req('/daily/primary/start',{token:bootstrap,body:{deviceCertificate:primary.certificate,selfie:image,versionCode:22,challengeId:c.challengeId,signature:primary.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,jti,imageHash,22].join('\n'))},expected:200})).data;
+  const upgraded=(await req('/daily/resume',{body:{sessionId,versionCode:22,challengeId:c.challengeId,signature:primary.sign(['SCPDA-DAILY-RESUME-V2',c.challengeId,c.nonce,sessionId,22].join('\n'))},expected:200})).data;
+  assert.equal((await db.query('SELECT count(*) n FROM ordering.scpda_selfie_archives')).rows[0].n,before);
+  assert.equal(upgraded.expiresAt,'2026-11-19T17:00:00.000Z');
   assert.equal(upgraded.user.annualCountAvailable,true);
   parentToken=upgraded.token;
   assert.equal((await qr(22)).status,201);
