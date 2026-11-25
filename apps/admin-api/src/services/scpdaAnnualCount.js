@@ -50,6 +50,7 @@ function pageSummary(page) {
     category: page.category,
     pageNo: page.page_no,
     totalRows: page.items.length,
+    submissionNo: page.submission_no || 0,
     countedRows: Object.keys(page.counts).length,
     state: page.submitted_at ? 'submitted' : page.assignee ? 'assigned' : 'free',
   };
@@ -100,7 +101,7 @@ async function availableToOperator(client, eventId, operator, page) {
 
 }
 
-async function overview(db, { branchCode, operator, manager, selected, workOnly = false }) {
+async function overview(db, { branchCode, operator, manager, selected, workOnly = false, includeSubmitted = false }) {
   if (selected) validatePageKey(selected.category, selected.pageNo);
   const { rows: [event] } = await db.query(
     'SELECT id,label,warehouse_code FROM ordering.scpda_annual_events WHERE branch_code=$1 AND closed_at IS NULL',
@@ -111,6 +112,9 @@ async function overview(db, { branchCode, operator, manager, selected, workOnly 
     'SELECT * FROM ordering.scpda_annual_pages WHERE event_id=$1 ORDER BY category,page_no',
     [event.id],
   );
+  const { rows: versions } = await db.query('SELECT category,page_no,max(submission_no)::int AS n FROM ordering.scpda_annual_submissions WHERE event_id=$1 GROUP BY category,page_no',[event.id]);
+  const versionNumbers = new Map(versions.map(row => [row.category+':'+row.page_no,row.n]));
+  for (const page of pages) page.submission_no = versionNumbers.get(page.category+':'+page.page_no) || 0;
   const { rows: people } = await db.query('SELECT operator_code,display_name FROM ordering.scpda_annual_participants WHERE event_id=$1',[event.id]);
   const names = new Map(people.map(person => [person.operator_code, person.display_name]));
   const team = pages.filter(page => page.assignee).map(page => ({ ...pageSummary(page), operator: page.assignee, displayName: names.get(page.assignee) || null, primary: page.assignee === '01005' }));
@@ -128,7 +132,7 @@ async function overview(db, { branchCode, operator, manager, selected, workOnly 
     (+new Date(a.assigned_at || 0) - +new Date(b.assigned_at || 0)) || a.category.localeCompare(b.category) || a.page_no-b.page_no);
   const chosen = selected && owned.find(page => page.category === selected.category && page.page_no === selected.pageNo);
   if (selected && !chosen) reject(404, 'ANNUAL_PAGE_MISSING', 'ไม่พบใบนับที่มอบหมายให้คุณ');
-  const assigned = chosen && !chosen.submitted_at ? chosen : queue[0];
+  const assigned = chosen && (!chosen.submitted_at || includeSubmitted) ? chosen : queue[0];
   const { rows: [pending] } = await db.query(
     'SELECT category,page_no AS "pageNo" FROM ordering.scpda_annual_requests WHERE event_id=$1 AND operator_code=$2',
     [event.id, operator],
@@ -263,4 +267,4 @@ function startAuditExpiry({ db, config, logger }) {
   return setInterval(expire, 24 * 60 * 60 * 1000).unref();
 }
 
-module.exports = { nameParticipant, assignPage, completedCategory, normalizeCounts, overview, reject, requestPage, savePage, startAuditExpiry, uuid };
+module.exports = { inEvent, currentPage, pageResult, validatePageKey, nameParticipant, assignPage, completedCategory, normalizeCounts, overview, reject, requestPage, savePage, startAuditExpiry, uuid };

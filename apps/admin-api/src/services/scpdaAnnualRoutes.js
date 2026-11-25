@@ -2,6 +2,8 @@
 
 const annual = require('./scpdaAnnualCount');
 const bcrypt = require('bcryptjs');
+const crypto = require('node:crypto');
+const amendments = require('./scpdaAnnualAmendments');
 const { generateWorkbook } = require('./scpdaAnnualWorkbook');
 const { dailyRequired, pairFor } = require('./scpdaDailyPolicy');
 const { listCompanions } = require('./scpdaCompanions');
@@ -22,18 +24,27 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
     if ((requiredRole === 'manager' && !manager) || (requiredRole === 'helper' && manager)) {
       annual.reject(403, 'ANNUAL_ROLE_DENIED', 'บัญชีนี้ไม่มีสิทธิ์ทำรายการ');
     }
-    return { operator: code, branchCode: '005', manager };
+    return { operator: code, branchCode: '005', manager, deviceRef: claims.device_ref, credentialVersion: claims.cv, appVersion: claims.app_version };
   }
   function eventId(req) {
     const value = req.body?.eventId;
     if (!annual.uuid.test(value ?? '')) annual.reject(400, 'ANNUAL_EVENT_INVALID', 'อีเวนท์ไม่ถูกต้อง');
     return value;
   }
+  async function confirmSubmission(req) {
+      const { confirmationPassword } = req.body || {};
+      const hash = config.scpdaAnnualSubmitConfirmationHash;
+      if (!hash) return;
+      if (!/^\$2[aby]\$(12|13|14)\$[./A-Za-z0-9]{53}$/.test(hash)) annual.reject(503, 'ANNUAL_CONFIRM_UNAVAILABLE', 'ระบบยืนยันการส่งยังไม่พร้อม');
+      if (typeof confirmationPassword !== 'string' || !confirmationPassword) annual.reject(403, 'ANNUAL_CONFIRM_REQUIRED', 'ใส่รหัสยืนยันก่อนส่งจบหน้า · ใช้แอป R24 ขึ้นไป');
+      if (confirmationPassword.length > 72 || !await bcrypt.compare(confirmationPassword, hash)) annual.reject(403, 'ANNUAL_CONFIRM_PASSWORD_INVALID', 'รหัสยืนยันการส่งไม่ถูกต้อง');
+  }
+  const reviewKey = () => crypto.createHmac('sha256', settings.sessionKey).update('annual-amend-review-v1').digest('hex');
   router.get('/annual', run(async (req, res) => {
     const who = await actor(req);
     const hasSelection = req.query?.category !== undefined || req.query?.pageNo !== undefined;
     const selected = hasSelection ? { category: req.query.category, pageNo: Number(req.query.pageNo) } : undefined;
-    const result = await annual.overview(db, { ...who, selected, workOnly: req.query?.view === 'mine' });
+    const result = await annual.overview(db, { ...who, selected, workOnly: req.query?.view === 'mine', includeSubmitted: who.appVersion >= 25 });
     if (result.manager && result.event) {
       const operators = await listCompanions(config, settings, db, who.operator);
       result.helpers = operators.filter(device => device.paired).map(device => device.operatorCode);
@@ -57,14 +68,22 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
     const who = await actor(req);
     const { category, pageNo, revision, mutationId, counts, submit, confirmationPassword } = req.body || {};
     if (submit && config.scpdaAnnualSubmitConfirmationHash) burst(req, who.operator);
-    const authorizeSubmit = async () => {
-      const hash = config.scpdaAnnualSubmitConfirmationHash;
-      if (!hash) return;
-      if (!/^\$2[aby]\$(12|13|14)\$[./A-Za-z0-9]{53}$/.test(hash)) annual.reject(503, 'ANNUAL_CONFIRM_UNAVAILABLE', 'ระบบยืนยันการส่งยังไม่พร้อม');
-      if (typeof confirmationPassword !== 'string' || !confirmationPassword) annual.reject(403, 'ANNUAL_CONFIRM_REQUIRED', 'ใส่รหัสยืนยันก่อนส่งจบหน้า · ใช้แอป R24 ขึ้นไป');
-      if (confirmationPassword.length > 72 || !await bcrypt.compare(confirmationPassword, hash)) annual.reject(403, 'ANNUAL_CONFIRM_PASSWORD_INVALID', 'รหัสยืนยันการส่งไม่ถูกต้อง');
-    };
+    const authorizeSubmit = () => confirmSubmission(req);
     reply(res, await annual.savePage(db, { ...who, eventId: eventId(req), category, pageNo, revision, mutationId, counts, submit, authorizeSubmit }));
+  }));
+  router.post('/annual/amend-preview', run(async (req,res) => {
+    const who = await actor(req); burst(req,who.operator);
+    const { category,pageNo,counts } = req.body || {};
+    reply(res,await amendments.preview(db,{...who,eventId:eventId(req),category,pageNo,counts},reviewKey()));
+  }));
+  router.post('/annual/amend', run(async (req,res) => {
+    const who = await actor(req); burst(req,who.operator);
+    const { category,pageNo,counts,baseReceiptId,baseRevision,mutationId,previewToken } = req.body || {};
+    reply(res,await amendments.amend(db,{...who,eventId:eventId(req),category,pageNo,counts,baseReceiptId,baseRevision,mutationId,previewToken},reviewKey(),() => confirmSubmission(req)));
+  }));
+  router.post('/annual/history', run(async (req,res) => {
+    const who = await actor(req), { category,pageNo } = req.body || {};
+    reply(res,await amendments.history(db,{...who,eventId:eventId(req),category,pageNo}));
   }));
   router.post('/annual/participant', run(async (req,res) => {
     const who = await actor(req);
