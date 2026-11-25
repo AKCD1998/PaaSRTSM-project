@@ -36,7 +36,7 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
   const target = new URL(fixtureUrl);
   assert.equal(target.hostname, '127.0.0.1');
   assert.equal(target.username, 'scpda_fixture');
-  const db = new Pool({ connectionString: fixtureUrl });
+  const db = new Pool({ connectionString: fixtureUrl, ssl: false });
   const branchCode = '005';
   const groups = { common: 'สามัญ', normal: 'ปกติ', pharma: 'เภสัช' };
   const files = Object.fromEntries(Object.entries(groups).map(([key, label]) =>
@@ -55,7 +55,7 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
     const config = { featureScpdaAnnual005: false, featureScpdaDaily005: true, featureScpdaBranch005: true };
     mountAnnualRoutes({
       router: app, config, db, settings: { operators: new Map() },
-      authenticate: async req => ({ operator: { operatorCode: req.get('fixture-operator'), branchCode: req.get('fixture-branch') } }),
+      authenticate: async req => ({ operator: { operatorCode: req.get('fixture-operator'), branchCode: req.get('fixture-branch') }, claims: { app_version: Number(req.get('fixture-version') || 22) } }),
       envelope: (data, branchCode) => ({ contract: 'scpda-read-005-v1', branchCode, ...data }),
       run: handler => (req, res, next) => handler(req, res).catch(next),
     });
@@ -64,6 +64,7 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
       request(app)[method](route).set('fixture-operator', actor).set('fixture-branch', branch);
     await testActor('get','/annual','02005').expect(404, { code: 'ANNUAL_DISABLED' });
     config.featureScpdaAnnual005 = true;
+    await testActor('get','/annual','02005').set('fixture-version',21).expect(409, { code: 'ANNUAL_UPDATE_REQUIRED' });
     await testActor('get','/annual','02004','004').expect(403, { code: 'ANNUAL_SCOPE_DENIED' });
     await testActor('post','/annual/export','02005').send({ eventId }).expect(403, { code: 'ANNUAL_ROLE_DENIED' });
     const chosen = { branchCode, eventId, category: 'normal', pageNo: 11 };

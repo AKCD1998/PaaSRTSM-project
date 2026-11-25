@@ -239,7 +239,6 @@ async function completedCategory(db, { branchCode, eventId, category }) {
 }
 
 function startAuditExpiry({ db, config, logger }) {
-  if (!config.featureScpdaAnnual005) return null;
   const expire = () => db.query("DELETE FROM ordering.scpda_annual_count_audit WHERE recorded_at < now() - interval '60 days'")
     .catch(error => logger.error('SCPDA annual audit expiry failed', { code: error.code }));
   void expire();

@@ -37,7 +37,7 @@ function parseConfig(config){
  const revoked=JSON.parse(config.scpdaRevokedDeviceRefsJson||'[]');if(!Array.isArray(revoked)||revoked.some(r=>!/^[a-f0-9]{64}$/.test(r)))throw Error('Invalid revocations');
  return {sessionKey,deviceKey,operators,invitations,revoked:new Set(revoked)};
 }
-function publicUser(operator,now,config){return {id:operator.operatorCode,operatorCode:operator.operatorCode,role:'reader',branchCode:operator.branchCode,rotationDueAt:operator.rotationDueAt,rotationDue:Date.parse(operator.rotationDueAt)<=now,...(operatorScope(config,operator.operatorCode)?{countScope:operatorScope(config,operator.operatorCode),canRecordInternalPick:canRecordInternalPick(config,operator.operatorCode)}:{})};}
+function publicUser(operator,now,config){return {id:operator.operatorCode,operatorCode:operator.operatorCode,role:'reader',branchCode:operator.branchCode,rotationDueAt:operator.rotationDueAt,rotationDue:Date.parse(operator.rotationDueAt)<=now,...(operator.branchCode==='005'&&config.featureScpdaAnnual005?{annualCountAvailable:true}:{}),...(operatorScope(config,operator.operatorCode)?{countScope:operatorScope(config,operator.operatorCode),canRecordInternalPick:canRecordInternalPick(config,operator.operatorCode)}:{})};}
 function publicProduct(p){return {sku_id:p.sku_id,company_code:p.company_code,display_name:p.display_name,
  barcodes:(p.barcodes||[]).map(b=>({barcode:b.barcode,is_primary:b.is_primary})),
  unit_prices:(p.unit_prices||[]).map(u=>({unit:u.unit,retail_price:u.retail_price,currency:u.currency,updated_at:u.updated_at,source_updated_at:u.source_updated_at})),

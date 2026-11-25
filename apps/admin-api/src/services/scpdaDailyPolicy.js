@@ -1,6 +1,7 @@
 'use strict';
 const crypto = require('node:crypto');
 const {scpdaClientIp}=require('./scpdaClientIp');
+const {acceptsVersion}=require('./scpdaDailyVersions');
 const {CountError}=require('./scpdaObservationLedger');
 const DAY = 86400000;
 const reject = (status, code, message) => { throw new CountError(status,code,message); };
@@ -36,7 +37,7 @@ async function checkDaily({config,db,req,claims,parentId,now=Date.now()}) {
  WHERE d.session_id=$1`,[id])).rows[0];
  if(!row||row.branch_code!==pairFor(claims.sub)?.branchCode||row.operator_code!==claims.sub||row.device_ref!==claims.device_ref||row.credential_version!==claims.cv||row.revoked_at||+new Date(row.expires_at)<=now)
   reject(401,'DAILY_LOGIN_REQUIRED','เข้าสู่ระบบและถ่ายเซลฟี่สำหรับวันนี้');
- if(row.app_version!==config.scpdaPwaVersionCode||claims.app_version!==row.app_version)reject(409,'APP_UPDATE_REQUIRED','อัปเดต SCPDA เป็นรุ่นล่าสุดก่อน');
+ if(!acceptsVersion(config,row.branch_code,row.app_version)||claims.app_version!==row.app_version)reject(409,'APP_UPDATE_REQUIRED','อัปเดต SCPDA เป็นรุ่นล่าสุดก่อน');
  const current=networkHash(req,config.authJwtSecret);
  if(isCompanion(row.operator_code)){
   if(!row.primary_session_id||row.primary_operator_code!==pairFor(claims.sub).primaryOperatorCode||row.primary_branch_code!==row.branch_code||row.primary_revoked_at||+new Date(row.primary_expires_at)<=now||row.primary_network_hash!==current)

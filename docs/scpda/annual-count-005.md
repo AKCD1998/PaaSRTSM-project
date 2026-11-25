@@ -24,3 +24,13 @@ Run the same command with `--apply` only against the intended database with `SCP
 4. Enable `FEATURE_SCPDA_ANNUAL_005=true` on the API. Turning it off closes the annual API while retaining the database records and client drafts.
 
 For an isolated Postgres check, set `SCPDA_ANNUAL_TEST_URL` to a loopback fixture owned by `scpda_fixture`, `SCPDA_ANNUAL_TEST_FORMS` to the workbook directory, and `SCPDA_ANNUAL_TEST_PAGE_MAP` to the matching page map, then run `node --test tests/scpda_annual_postgres.test.js`.
+
+## R22 release and compatibility
+
+Keep the event flag off until the signed APK and matching PWA are published and the approved blank event is imported. Annual endpoints require an authenticated daily session from build 22 or later; other branches remain out of scope. The server advertises `annualCountAvailable` only for branch005 while the flag is on.
+
+`SCPDA_DAILY_VERSION_POLICY_JSON` is an explicit branch rollout list, not a minimum-version bypass. For the R22 rollout use `{ "004": { "accepted": [21,22], "qr": [21,22] }, "005": { "accepted": [21,22], "qr": [22] } }` with preferred `SCPDA_PWA_VERSION_CODE=22`. Every new login checks the exact requested build is published. Existing004 R21 sessions, ordinary counts and QR remain usable;005 R21 can use ordinary counting but must upgrade to create QR/use annual pages. Known compatible QR and companion builds use the same signed V1 enrollment protocol. Without this configuration the original exact-latest behavior is retained. Do not broaden the list to untested builds.
+
+Import delivery may run as a short-lived Render one-off job using the live build and its existing private R2/Postgres configuration. `scripts/import_scpda_annual_bundle.js` validates the supplied ZIP SHA-256, validates the three blank worksheets against their frozen page map, and uses the existing transactional importer. No forms or real event rows belong in Git. Dry-run is the default; `--apply --use-service-db` is explicit for the authorized job. A second open005 event is rejected without changing the first. Delete the temporary private R2 object after confirming the committed event; do not put staff or fixture counts into this job.
+
+Rollback: turn off only `FEATURE_SCPDA_ANNUAL_005`, preserving sessions, ordinary counts, assigned pages and receipts. Do not delete the event or remove21 from004 compatibility during rollout.

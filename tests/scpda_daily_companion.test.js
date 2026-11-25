@@ -111,6 +111,7 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
  await t.test('each primary can add several permanent device slots; database accounts get only its own count scope',async()=>{
   clock+=61000;const bootstrap=await loginPrimary(),c=(await req('/daily/primary/challenge',{token:bootstrap,body:{},expected:200})).data,jti=JSON.parse(Buffer.from(bootstrap.split('.')[1],'base64url')).jti;
   const parent=(await req('/daily/primary/start',{token:bootstrap,body:{deviceCertificate:primary.certificate,selfie:image,versionCode:17,challengeId:c.challengeId,signature:primary.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,jti,imageHash,17].join('\n'))},expected:200})).data;
+  parentToken=parent.token;
   for(const team of [...teams,{primaryCode:'01005',primaryDevice:primary,primaryCert:primary.certificate,primaryToken:parent.token,primarySession:parent.dailySessionId,scope:null}]){
    clock+=61000;const issued=[];
    const getQr=async target=>{const challenge=(await req('/daily/qr/challenge',{token:team.primaryToken,body:{},expected:200})).data;return req('/daily/qr',{token:team.primaryToken,body:{target,deviceCertificate:team.primaryCert,versionCode:17,challengeId:challenge.challengeId,signature:team.primaryDevice.sign(['SCPDA-COMPANION-QR-V2',challenge.challengeId,challenge.nonce,team.primarySession,17,target].join('\n'))}});};
@@ -128,6 +129,42 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
    const original=(await getQr(issued[0]));assert.equal(original.status,201);assert.equal(original.data.operatorCode,issued[0]);assert.equal(original.data.initialPassword,undefined);
   }
   const serialized=JSON.stringify((await db.query('SELECT meta FROM public.audit_logs')).rows);assert.equal(serialized.includes('sc03004'),false);
+ });
+
+ await t.test('branch rollout keeps004 old-client QR/counts and admits new PWA while005 annual requires22',async()=>{
+  config.scpdaPwaVersionCode=22;
+  config.scpdaDailyVersionPolicyJson=JSON.stringify({'004':{accepted:[17,22],qr:[17,22]},'005':{accepted:[17,22],qr:[22]}});
+  await db.query("INSERT INTO app_center.releases VALUES('scpda','published',22)");
+  await req('/session',{token:parentToken,expected:200});
+  assert.equal((await qr(17)).status,409);
+  for(const team of teams){
+   clock+=61000;
+   await req('/session',{token:team.primaryToken,expected:200});
+   await req('/counts/history',{token:team.counter,expected:200});
+   const c=(await req('/daily/qr/challenge',{token:team.primaryToken,body:{},expected:200})).data;
+   const body={target:'new',deviceCertificate:team.primaryCert,versionCode:17,challengeId:c.challengeId};
+   body.signature=team.primaryDevice.sign(['SCPDA-COMPANION-QR-V2',c.challengeId,c.nonce,team.primarySession,17,'new'].join('\n'));
+   const g=(await req('/daily/qr',{token:team.primaryToken,body,expected:201})).data;
+   const d=identity(),enroll={operatorCode:g.operatorCode,grantId:g.grantId,secret:g.secret,publicKey:d.publicKey,deviceId:d.deviceId,versionCode:22,selfie:image,pin:g.initialPassword};
+   const signed=version=>({...enroll,versionCode:version,signature:d.sign(['SCPDA-COMPANION-ENROLL-V1',g.grantId,g.secret,d.deviceId,imageHash,version].join('\n'))});
+   await req('/daily/companion/enroll',{body:signed(23),expected:409});
+   const admitted=(await req('/daily/companion/enroll',{body:signed(22),expected:201})).data;
+   assert.equal(admitted.user.countScope.id,team.scope);
+   await req('/session',{token:admitted.token,expected:200});
+   assert.equal(admitted.user.annualCountAvailable,undefined);
+  }
+  clock+=61000;
+  const bootstrap=await loginPrimary(),c=(await req('/daily/primary/challenge',{token:bootstrap,body:{},expected:200})).data;
+  const jti=JSON.parse(Buffer.from(bootstrap.split('.')[1],'base64url')).jti;
+  config.featureScpdaAnnual005=true;
+  const upgraded=(await req('/daily/primary/start',{token:bootstrap,body:{deviceCertificate:primary.certificate,selfie:image,versionCode:22,challengeId:c.challengeId,signature:primary.sign(['SCPDA-DAILY-PRIMARY-V1',c.challengeId,c.nonce,jti,imageHash,22].join('\n'))},expected:200})).data;
+  assert.equal(upgraded.user.annualCountAvailable,true);
+  parentToken=upgraded.token;
+  assert.equal((await qr(22)).status,201);
+  // An allowlisted build must still be published, not merely claimed by the client.
+  const {requirePublishedVersion}=require('../apps/admin-api/src/services/scpdaDailyVersions');
+  const candidate={...config,scpdaDailyVersionPolicyJson:JSON.stringify({'005':{accepted:[22,23],qr:[22]}})};
+  await assert.rejects(requirePublishedVersion(db,candidate,'005',23),{code:'APP_UPDATE_REQUIRED'});
  });
  await t.test('004 histories stay team/account scoped; repeated migration preserves evidence and005; midnight denies both teams',async()=>{
   for(const team of teams){const h=(await req('/counts/history',{token:team.counter,expected:200})).data;assert.equal(h.records.length,1);assert.ok(h.records.every(r=>r.event.operatorCode===team.childCode&&r.event.countScopeId===team.scope));}

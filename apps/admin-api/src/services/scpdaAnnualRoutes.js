@@ -9,10 +9,13 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
   const reply = (res, payload) => res.json(envelope(payload, '005'));
   async function actor(req, requiredRole) {
     if (!config.featureScpdaAnnual005) annual.reject(404, 'ANNUAL_DISABLED', 'ยังไม่เปิดอีเวนท์นับสต๊อก');
-    const { operator } = await authenticate(req);
+    const { operator, claims } = await authenticate(req);
     const code = operator.operatorCode;
     if (operator.branchCode !== '005' || !dailyRequired(config, code) || pairFor(code)?.primaryOperatorCode !== '01005') {
       annual.reject(403, 'ANNUAL_SCOPE_DENIED', 'บัญชีนี้ไม่ได้อยู่ในงานนับของสาขา 005');
+    }
+    if (!Number.isSafeInteger(claims?.app_version) || claims.app_version < 22) {
+      annual.reject(409, 'ANNUAL_UPDATE_REQUIRED', 'อัปเดต SCPDA เป็น R22 แล้วเข้าสู่ระบบอีกครั้งเพื่อใช้งานใบนับ');
     }
     const manager = code === '01005';
     if ((requiredRole === 'manager' && !manager) || (requiredRole === 'helper' && manager)) {
