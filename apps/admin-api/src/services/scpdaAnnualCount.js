@@ -62,6 +62,7 @@ function pageResult(page) {
     mutationId: page.mutation_id,
     receiptId: page.receipt_id,
     receivedAt: page.submitted_at,
+    savedAt: page.last_saved_at ?? null,
   };
 }
 
@@ -96,14 +97,11 @@ async function currentPage(client, eventId, category, pageNo) {
 
 async function availableToOperator(client, eventId, operator, page) {
   if (page.assignee) reject(409, 'ANNUAL_PAGE_TAKEN', 'หน้านี้มีคนรับแล้ว กรุณาเลือกหน้าอื่น');
-  const { rowCount } = await client.query(
-    'SELECT 1 FROM ordering.scpda_annual_pages WHERE event_id=$1 AND assignee=$2 AND submitted_at IS NULL',
-    [eventId, operator],
-  );
-  if (rowCount) reject(409, 'ANNUAL_OPERATOR_BUSY', 'เครื่องลูกยังมีหน้าที่ต้องส่ง');
+
 }
 
-async function overview(db, { branchCode, operator, manager }) {
+async function overview(db, { branchCode, operator, manager, selected, workOnly = false }) {
+  if (selected) validatePageKey(selected.category, selected.pageNo);
   const { rows: [event] } = await db.query(
     'SELECT id,label,warehouse_code FROM ordering.scpda_annual_events WHERE branch_code=$1 AND closed_at IS NULL',
     [branchCode],
@@ -113,15 +111,24 @@ async function overview(db, { branchCode, operator, manager }) {
     'SELECT * FROM ordering.scpda_annual_pages WHERE event_id=$1 ORDER BY category,page_no',
     [event.id],
   );
-  const result = { event: { id: event.id, label: event.label, warehouseCode: event.warehouse_code }, manager };
-  if (manager) {
+  const { rows: people } = await db.query('SELECT operator_code,display_name FROM ordering.scpda_annual_participants WHERE event_id=$1',[event.id]);
+  const names = new Map(people.map(person => [person.operator_code, person.display_name]));
+  const team = pages.filter(page => page.assignee).map(page => ({ ...pageSummary(page), operator: page.assignee, displayName: names.get(page.assignee) || null, primary: page.assignee === '01005' }));
+  const result = { event: { id: event.id, label: event.label, warehouseCode: event.warehouse_code }, manager: manager && !workOnly,
+    canManage: manager, team, myDisplayName: names.get(operator) || '', myWorkCount: pages.filter(page => page.assignee === operator && !page.submitted_at).length };
+  if (manager && !workOnly) {
     const { rows: requests } = await db.query(
       'SELECT category,page_no AS "pageNo",operator_code AS operator FROM ordering.scpda_annual_requests WHERE event_id=$1 ORDER BY requested_at',
       [event.id],
     );
     return { ...result, pages: pages.map(page => ({ ...pageSummary(page), assignee: page.assignee })), requests };
   }
-  const assigned = pages.find(page => page.assignee === operator && !page.submitted_at);
+  const owned = pages.filter(page => page.assignee === operator);
+  const queue = owned.filter(page => !page.submitted_at).sort((a, b) =>
+    (+new Date(a.assigned_at || 0) - +new Date(b.assigned_at || 0)) || a.category.localeCompare(b.category) || a.page_no-b.page_no);
+  const chosen = selected && owned.find(page => page.category === selected.category && page.page_no === selected.pageNo);
+  if (selected && !chosen) reject(404, 'ANNUAL_PAGE_MISSING', 'ไม่พบใบนับที่มอบหมายให้คุณ');
+  const assigned = chosen && !chosen.submitted_at ? chosen : queue[0];
   const { rows: [pending] } = await db.query(
     'SELECT category,page_no AS "pageNo" FROM ordering.scpda_annual_requests WHERE event_id=$1 AND operator_code=$2',
     [event.id, operator],
@@ -129,8 +136,9 @@ async function overview(db, { branchCode, operator, manager }) {
   return {
     ...result,
     assigned: assigned ? { ...pageResult(assigned), items: assigned.items, counts: assigned.counts } : null,
+    assignedPages: queue.map(pageResult),
     pending: pending ?? null,
-    free: assigned ? [] : pages.filter(page => !page.assignee).map(({ category, page_no: pageNo }) => ({ category, pageNo })),
+    free: pages.filter(page => !page.assignee).map(({ category, page_no: pageNo }) => ({ category, pageNo })),
     receipts: pages.filter(page => page.assignee === operator && page.submitted_at).map(pageResult),
   };
 }
@@ -200,14 +208,14 @@ async function savePage(db, { branchCode, eventId, category, pageNo, operator, r
     }
     const { rows: [updated] } = await client.query(
       `UPDATE ordering.scpda_annual_pages SET counts=$4::jsonb,revision=revision+1,mutation_id=$5,receipt_id=$6,
-          submitted_at=CASE WHEN $6::uuid IS NULL THEN NULL ELSE now() END
+          submitted_at=CASE WHEN $6::uuid IS NULL THEN NULL ELSE now() END,last_saved_at=clock_timestamp()
        WHERE event_id=$1 AND category=$2 AND page_no=$3 RETURNING *`,
       [eventId, category, pageNo, JSON.stringify(normalized), mutationId, submit ? randomUUID() : null],
     );
     if (changes.length) {
       await client.query(
-        `INSERT INTO ordering.scpda_annual_count_audit (event_id,category,page_no,revision,operator_code,changes)
-         VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+        `INSERT INTO ordering.scpda_annual_count_audit (event_id,category,page_no,revision,operator_code,changes,actor_name)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,(SELECT display_name FROM ordering.scpda_annual_participants WHERE event_id=$1 AND operator_code=$5))`,
         [eventId, category, pageNo, updated.revision, operator, JSON.stringify(changes)],
       );
     }
@@ -238,6 +246,15 @@ async function completedCategory(db, { branchCode, eventId, category }) {
   });
 }
 
+async function nameParticipant(db, { branchCode, eventId, operator, displayName }) {
+  if (typeof displayName !== 'string' || !displayName.trim() || displayName.trim().length > 80 || /[\u0000-\u001f]/.test(displayName)) reject(400, 'ANNUAL_NAME_INVALID', 'ระบุชื่อที่ใช้ในงานนับ ไม่เกิน 80 ตัวอักษร');
+  return inEvent(db, branchCode, eventId, async client => {
+    await client.query(`INSERT INTO ordering.scpda_annual_participants(event_id,operator_code,display_name)
+      VALUES($1,$2,$3) ON CONFLICT(event_id,operator_code) DO UPDATE SET display_name=EXCLUDED.display_name,updated_at=now()`, [eventId,operator,displayName.trim()]);
+    return { displayName: displayName.trim() };
+  });
+}
+
 function startAuditExpiry({ db, config, logger }) {
   const expire = () => db.query("DELETE FROM ordering.scpda_annual_count_audit WHERE recorded_at < now() - interval '60 days'")
     .catch(error => logger.error('SCPDA annual audit expiry failed', { code: error.code }));
@@ -245,4 +262,4 @@ function startAuditExpiry({ db, config, logger }) {
   return setInterval(expire, 24 * 60 * 60 * 1000).unref();
 }
 
-module.exports = { assignPage, completedCategory, normalizeCounts, overview, reject, requestPage, savePage, startAuditExpiry, uuid };
+module.exports = { nameParticipant, assignPage, completedCategory, normalizeCounts, overview, reject, requestPage, savePage, startAuditExpiry, uuid };

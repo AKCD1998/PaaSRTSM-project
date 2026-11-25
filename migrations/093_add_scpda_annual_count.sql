@@ -27,9 +27,16 @@ CREATE TABLE IF NOT EXISTS ordering.scpda_annual_pages (
   CHECK ((receipt_id IS NULL) = (submitted_at IS NULL)),
   CHECK (submitted_at IS NULL OR assignee IS NOT NULL)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS scpda_annual_active_page_per_operator
-  ON ordering.scpda_annual_pages (event_id, assignee)
-  WHERE assignee IS NOT NULL AND submitted_at IS NULL;
+-- Once094 introduces page queues, replaying093 must not restore its old
+-- one-page limit or fail on legitimate queued work.
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='ordering'
+      AND table_name='scpda_annual_pages' AND column_name='assigned_at') THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS scpda_annual_active_page_per_operator
+      ON ordering.scpda_annual_pages (event_id, assignee)
+      WHERE assignee IS NOT NULL AND submitted_at IS NULL;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS ordering.scpda_annual_requests (
   event_id uuid NOT NULL,
