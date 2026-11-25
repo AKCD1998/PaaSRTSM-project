@@ -9,6 +9,7 @@ const {scpdaClientIp}=require('../services/scpdaClientIp');
 const {checkDaily,dailyRequired,isCompanion}=require('../services/scpdaDailyPolicy');
 const {resolveOperator}=require('../services/scpdaCompanions');
 const {mountDailyRoutes}=require('../services/scpdaDailyRoutes');
+const {mountAnnualRoutes}=require('../services/scpdaAnnualRoutes');
 const {operatorScope,canRecordInternalPick}=require('../services/scpda004Scopes');
 const {validScpdaCredential}=require('../services/scpdaCredential');
 const {queryProducts,queryProductDetail,buildFiltersFromQuery}=require('./products');
@@ -36,7 +37,7 @@ function parseConfig(config){
  const revoked=JSON.parse(config.scpdaRevokedDeviceRefsJson||'[]');if(!Array.isArray(revoked)||revoked.some(r=>!/^[a-f0-9]{64}$/.test(r)))throw Error('Invalid revocations');
  return {sessionKey,deviceKey,operators,invitations,revoked:new Set(revoked)};
 }
-function publicUser(operator,now,config){return {id:operator.operatorCode,operatorCode:operator.operatorCode,role:'reader',branchCode:operator.branchCode,rotationDueAt:operator.rotationDueAt,rotationDue:Date.parse(operator.rotationDueAt)<=now,...(operatorScope(config,operator.operatorCode)?{countScope:operatorScope(config,operator.operatorCode),canRecordInternalPick:canRecordInternalPick(config,operator.operatorCode)}:{})};}
+function publicUser(operator,now,config){return {id:operator.operatorCode,operatorCode:operator.operatorCode,role:'reader',branchCode:operator.branchCode,rotationDueAt:operator.rotationDueAt,rotationDue:Date.parse(operator.rotationDueAt)<=now,...(operator.branchCode==='005'&&config.featureScpdaAnnual005?{annualCountAvailable:true}:{}),...(operatorScope(config,operator.operatorCode)?{countScope:operatorScope(config,operator.operatorCode),canRecordInternalPick:canRecordInternalPick(config,operator.operatorCode)}:{})};}
 function publicProduct(p){return {sku_id:p.sku_id,company_code:p.company_code,display_name:p.display_name,
  barcodes:(p.barcodes||[]).map(b=>({barcode:b.barcode,is_primary:b.is_primary})),
  unit_prices:(p.unit_prices||[]).map(u=>({unit:u.unit,retail_price:u.retail_price,currency:u.currency,updated_at:u.updated_at,source_updated_at:u.source_updated_at})),
@@ -87,6 +88,7 @@ function createScpdaReadRouter({config,db,now=Date.now}){
   res.json(envelope({records:rows.map(r=>({productCode:r.product_code,productNameThai:r.product_name_thai||'',productNameEng:r.product_name_eng||'',barcode:r.barcode||'',unit:r.unit||'',branchCode:who.operator.branchCode,...(who.operator.branchCode==='001'?{qtyBranch001:r.quantity==null?null:Number(r.quantity)}:{quantity:r.quantity==null?null:Number(r.quantity)}),syncedAt:r.synced_at,stockNullsPreserved:true})),pagination:{limit:200,offset:0,total},stockSource:'full-sync',stockObservedAt:null},who.operator.branchCode));
  }));
  mountDailyRoutes({router,config,db,settings,now,run,authenticate,deviceFrom,publicUser,envelope,burst,audit});
+ mountAnnualRoutes({router,config,db,settings,run,authenticate,envelope});
  router.use((_req,res)=>res.status(405).json({error:'SCPDA supports product and stock reads only',code:'READ_ONLY'}));
  return router;
 }

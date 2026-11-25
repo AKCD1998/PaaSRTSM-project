@@ -5,6 +5,7 @@ const bcrypt=require('bcryptjs');
 const {resolveOperator,listCompanions,newCompanion}=require('./scpdaCompanions');
 const {createDriveArchive}=require('./scpdaSelfieArchive');
 const {pairFor,isCompanion,dailyEnabled,businessDay,midnight,networkHash,selfie,hash,checkDaily,reject}=require('./scpdaDailyPolicy');
+const {acceptsVersion,requirePublishedVersion,versionPolicy}=require('./scpdaDailyVersions');
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const CERT_SECONDS=180*86400;
 function keyFor(encoded){
@@ -16,7 +17,6 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
  const challenges=new Map();
  function enabled(pair){if(!pair||!dailyEnabled(config,pair.branchCode))reject(404,'DAILY_DISABLED','ยังไม่เปิดเครื่องย่อย');if(!config.scpdaDriveClientId||!config.scpdaDriveClientSecret||!config.scpdaDriveRefreshToken)reject(503,'DRIVE_NOT_CONNECTED','ยังไม่เชื่อมการเก็บรูปใน Drive');if(!settings.operators.has(pair.primaryOperatorCode))reject(503,'DAILY_UNCONFIGURED','บัญชีเครื่องย่อยยังไม่พร้อม');}
  async function primary(req,bootstrap=false){const who=await authenticate(req,{bootstrap}),pair=pairFor(who.operator.operatorCode);if(!pair||isCompanion(who.operator.operatorCode))reject(403,'PRIMARY_REQUIRED','ใช้บัญชีเครื่องหลักของทีมนี้');enabled(pair);burst(req,who.operator.operatorCode);return {...who,pair};}
- async function latest(){const r=(await db.query("SELECT version_code FROM app_center.releases WHERE app_id='scpda' AND status='published' ORDER BY version_code DESC LIMIT 1")).rows[0];if(!r||r.version_code!==config.scpdaPwaVersionCode)reject(409,'APP_UPDATE_REQUIRED','ต้องอัปเดต SCPDA ให้เป็นรุ่นเดียวกันก่อน');return r.version_code;}
  function freshChallenge(purpose,identity){for(const [k,v]of challenges)if(v.until<=now())challenges.delete(k);if(challenges.size>=1000)reject(429,'RETRY_LATER','กรุณารอสักครู่');const id=crypto.randomUUID(),nonce=crypto.randomBytes(32).toString('base64url');challenges.set(id,{purpose,identity,nonce,until:now()+60000});return {challengeId:id,nonce};}
  function consume(body,purpose,identity){const c=challenges.get(body.challengeId);challenges.delete(body.challengeId);if(!c||c.until<=now()||c.purpose!==purpose||c.identity!==identity)reject(401,'CHALLENGE_EXPIRED','กรุณาลองใหม่');return c;}
  function sessionReply(row,op){const iat=Math.floor(now()/1000),exp=Math.floor(+new Date(row.expires_at)/1000);return envelope({token:jwt.sign({sub:op.operatorCode,role:'reader',kind:'scpda-reader',branch_code:op.branchCode,device_ref:row.device_ref,app_version:row.app_version,cv:op.fingerprint,iat,exp,iss:'sc-stockday',aud:'scpda-read-'+op.branchCode,jti:row.session_id},settings.sessionKey,{algorithm:'HS256'}),dailySessionId:row.session_id,expiresAt:new Date(exp*1000).toISOString(),user:publicUser(op,now(),config)},op.branchCode);}
@@ -42,14 +42,14 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
  async function transaction(fn){const client=await db.connect();try{await client.query('BEGIN');const result=await fn(client);await client.query('COMMIT');return result;}catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}}
  router.get('/daily/policy',run(async(req,res)=>{
   const pair=pairFor(req.query.operatorCode||(req.query.branchCode==='004'?'01004':'01005'));if(!pair||req.query.branchCode&&req.query.branchCode!==pair.branchCode)reject(400,'DAILY_POLICY_INVALID','เลือกสาขาและทีมให้ถูกต้อง');
-  res.json(envelope({enabled:dailyEnabled(config,pair.branchCode),operatorCode:pair.operatorCode,primaryOperatorCode:pair.primaryOperatorCode,versionCode:config.scpdaPwaVersionCode,networkPolicy:'same-public-ip-with-primary-qr',timezone:'Asia/Bangkok',resetAt:'00:00',selfieRetentionDays:90},pair.branchCode));
+  res.json(envelope({enabled:dailyEnabled(config,pair.branchCode),operatorCode:pair.operatorCode,primaryOperatorCode:pair.primaryOperatorCode,versionCode:config.scpdaPwaVersionCode,...(versionPolicy(config,pair.branchCode)?{compatibleVersions:versionPolicy(config,pair.branchCode).accepted,qrVersions:versionPolicy(config,pair.branchCode).qr}:{}),networkPolicy:'same-public-ip-with-primary-qr',timezone:'Asia/Bangkok',resetAt:'00:00',selfieRetentionDays:90},pair.branchCode));
  }));
  router.post('/daily/primary/challenge',run(async(req,res)=>{const who=await primary(req,true);res.json(envelope(freshChallenge('primary',who.claims.jti),who.operator.branchCode));}));
  router.post('/daily/primary/start',run(async(req,res)=>{
   const who=await primary(req,true),body=req.body;
   const d=deviceFrom(body.deviceCertificate);if(d.device_ref!==who.claims.device_ref||d.branch_code!==who.operator.branchCode)reject(401,'DEVICE_PROOF_INVALID','เครื่องไม่ตรงกัน');
   const image=selfie(body.selfie),c=consume(body,'primary',who.claims.jti);
-  if(body.versionCode!==await latest())reject(409,'APP_UPDATE_REQUIRED','อัปเดตเครื่องหลักก่อน');
+  await requirePublishedVersion(db,config,who.operator.branchCode,body.versionCode);
   verify(keyFor(d.public_key),['SCPDA-DAILY-PRIMARY-V1',body.challengeId,c.nonce,who.claims.jti,image.sha256,body.versionCode].join('\n'),body.signature);
   req.scpdaBranchCode=who.operator.branchCode;const row=await transaction(client=>insertDaily(client,req,{op:who.operator,device:d,version:body.versionCode,image}));res.json(sessionReply(row,who.operator));
  }));
@@ -58,7 +58,7 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
  router.post('/daily/qr',run(async(req,res)=>{
   const who=await primary(req),body=req.body,d=deviceFrom(body.deviceCertificate);
   if(d.device_ref!==who.claims.device_ref)reject(401,'DEVICE_PROOF_INVALID','เครื่องไม่ตรงกัน');
-  const c=consume(body,'qr',who.claims.jti),version=await latest();if(body.versionCode!==version)reject(409,'APP_UPDATE_REQUIRED','อัปเดตเครื่องหลักก่อนสร้าง QR');
+  const c=consume(body,'qr',who.claims.jti),version=await requirePublishedVersion(db,config,who.operator.branchCode,body.versionCode,true);if(version!==who.claims.app_version)reject(409,'APP_UPDATE_REQUIRED','อัปเดตเครื่องหลักก่อนสร้าง QR');
   const target=body.target===undefined?who.pair.operatorCode:body.target;
   if(typeof target!=='string'||target!=='new'&&(!isCompanion(target)||pairFor(target)?.primaryOperatorCode!==who.operator.operatorCode))reject(403,'QR_OPERATOR_MISMATCH','สร้าง QR ได้เฉพาะเครื่องย่อยของทีมนี้');
   const message=body.target===undefined?['SCPDA-COMPANION-QR-V1',body.challengeId,c.nonce,who.claims.jti,version]:['SCPDA-COMPANION-QR-V2',body.challengeId,c.nonce,who.claims.jti,version,target];
@@ -80,7 +80,7 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
  router.post('/daily/companion/enroll',run(async(req,res)=>{
   burst(req);if(!config.featureScpdaDaily004&&!config.featureScpdaDaily005)reject(404,'DAILY_DISABLED','ยังไม่เปิดเครื่องย่อย');const body=req.body;let op;keyFor(body.publicKey);if(!UUID.test(body.deviceId||'')||!UUID.test(body.grantId||'')||typeof body.secret!=='string'||body.secret.length>100||typeof body.pin!=='string'||body.pin.length>64)reject(400,'ENROLLMENT_INVALID','ข้อมูลลงทะเบียนไม่ถูกต้อง');
   const ref=hash(Buffer.from(body.publicKey,'base64')),image=selfie(body.selfie);if(settings.revoked.has(ref))reject(403,'DEVICE_REVOKED','เครื่องนี้ถูกยกเลิกแล้ว');
-  const version=await latest();if(body.versionCode!==version)reject(409,'APP_UPDATE_REQUIRED','เปิดเว็บแอปรุ่นล่าสุดก่อน');
+  const version=body.versionCode;if(!Number.isSafeInteger(version))reject(409,'APP_UPDATE_REQUIRED','เปิดเว็บแอปรุ่นล่าสุดก่อน');
   // The QR secret is a challenge to the installation key, not a bearer login.
   verify(keyFor(body.publicKey),['SCPDA-COMPANION-ENROLL-V1',body.grantId,body.secret,body.deviceId,image.sha256,version].join('\n'),body.signature);
   const row=await transaction(async client=>{
@@ -91,14 +91,15 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['scpda-login:'+op.operatorCode]);
    const attempts=(await client.query("SELECT count(*)::integer n FROM public.audit_logs WHERE actor_id=$1 AND action='scpda.login_failed' AND event_time>clock_timestamp()-interval '15 minutes'",['scpda:'+op.operatorCode])).rows[0];if(attempts.n>=5)reject(429,'PIN_LOCKED','กรอกรหัสผิดหลายครั้ง กรุณารอ 15 นาที');
    if(+new Date(grant.expires_at)<=now())reject(410,'QR_EXPIRED','QR หมดอายุ สร้างใหม่จากเครื่องหลัก');
-   if(grant.app_version!==version)reject(409,'APP_UPDATE_REQUIRED','สร้าง QR ด้วยแอปรุ่นล่าสุด');
+   await requirePublishedVersion(client,config,pair.branchCode,version);
+   if(!acceptsVersion(config,pair.branchCode,grant.app_version,true)||(!versionPolicy(config,pair.branchCode)&&grant.app_version!==version))reject(409,'APP_UPDATE_REQUIRED','สร้าง QR ด้วยแอปรุ่นที่รองรับ');
    if(!await bcrypt.compare(body.pin,op.hash)){
     // Commit failure evidence without consuming QR or claiming the binding.
     await audit(client,req,{actor:op.operatorCode,action:'scpda.login_failed',targetType:'scpda_grant',targetId:body.grantId,success:false});return null;
    }
    const primary=(await client.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1 FOR SHARE',[grant.primary_session_id])).rows[0];
    if(!primary||primary.operator_code!==pair.primaryOperatorCode||primary.branch_code!==pair.branchCode||primary.revoked_at||+new Date(primary.expires_at)<=now()||primary.network_hash!==networkHash(req,config.authJwtSecret))reject(403,'STORE_NETWORK_REQUIRED','ระบบยืนยันเครือข่ายไม่ตรงกับเครื่องหลัก ให้สร้าง QR ใหม่แล้วลองอีกครั้ง');
-   if(grant.consumed_session_id){if(grant.consumed_device_ref!==ref)reject(409,'QR_USED','QR นี้ใช้ไปแล้ว');const old=(await client.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1',[grant.consumed_session_id])).rows[0];if(!old||old.revoked_at||old.credential_version!==op.fingerprint||old.device_id!==body.deviceId)reject(409,'QR_USED','QR นี้ใช้ไปแล้ว');return old;}
+   if(grant.consumed_session_id){if(grant.consumed_device_ref!==ref)reject(409,'QR_USED','QR นี้ใช้ไปแล้ว');const old=(await client.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1',[grant.consumed_session_id])).rows[0];if(!old||old.revoked_at||old.credential_version!==op.fingerprint||old.device_id!==body.deviceId||old.app_version!==version)reject(409,'QR_USED','QR นี้ใช้ไปแล้ว');return old;}
    const binding=(await client.query("SELECT * FROM ordering.scpda_operator_devices WHERE operator_code=$1 FOR UPDATE",[op.operatorCode])).rows[0];
    if(binding&&(binding.revoked_at||binding.device_ref!==ref||binding.device_id!==body.deviceId))reject(409,'OPERATOR_ALREADY_BOUND',op.operatorCode+' ผูกกับเครื่องอื่นแล้ว ติดต่อผู้ดูแล');
    if(!binding)await client.query("INSERT INTO ordering.scpda_operator_devices(operator_code,branch_code,device_ref,device_id,public_key) VALUES($4,$5,$1,$2,$3)",[ref,body.deviceId,body.publicKey,op.operatorCode,op.branchCode]);
@@ -119,10 +120,19 @@ function mountDailyRoutes({router,config,db,settings,now,run,authenticate,device
   if(!UUID.test(body.sessionId||''))reject(401,'DAILY_LOGIN_REQUIRED','เข้าสู่ระบบสำหรับวันนี้');
   const row=(await db.query('SELECT * FROM ordering.scpda_daily_sessions WHERE session_id=$1',[body.sessionId])).rows[0];
   if(!row)reject(401,'DAILY_LOGIN_REQUIRED','เข้าสู่ระบบสำหรับวันนี้');enabled(pairFor(row.operator_code));req.scpdaBranchCode=row.branch_code;const op=await resolveOperator(config,settings,db,row.operator_code);if(!op||settings.revoked.has(row.device_ref))reject(401,'DEVICE_REVOKED','เครื่องนี้ถูกยกเลิกแล้ว');
-  verify(keyFor(row.public_key),['SCPDA-DAILY-RESUME-V1',body.challengeId,c.nonce,body.sessionId].join('\n'),body.signature);
+  const upgrades=body.versionCode!==undefined;
+  verify(keyFor(row.public_key),(upgrades?['SCPDA-DAILY-RESUME-V2',body.challengeId,c.nonce,body.sessionId,body.versionCode]:['SCPDA-DAILY-RESUME-V1',body.challengeId,c.nonce,body.sessionId]).join('\n'),body.signature);
   const claims={jti:row.session_id,sub:row.operator_code,device_ref:row.device_ref,app_version:row.app_version,cv:op.fingerprint};
   await checkDaily({config,db,req,claims,now:now()});
   if((await db.query("SELECT 1 FROM public.audit_logs WHERE action='scpda.logout' AND target_type='scpda_session' AND target_id=$1 AND success=TRUE LIMIT 1",[row.session_id])).rows.length)reject(401,'SESSION_ENDED','ออกจากระบบแล้ว');
+  if(upgrades){
+   await requirePublishedVersion(db,config,row.branch_code,body.versionCode);
+   if(body.versionCode!==row.app_version){
+    const updated=(await db.query('UPDATE ordering.scpda_daily_sessions SET app_version=$2 WHERE session_id=$1 AND app_version=$3 AND revoked_at IS NULL RETURNING session_id',[row.session_id,body.versionCode,row.app_version])).rows[0];
+    if(!updated)reject(409,'DAILY_SESSION_CHANGED','เซสชันเปลี่ยนแล้ว กรุณาลองใหม่');
+    row.app_version=body.versionCode;
+   }
+  }
   // Refreshes only this day's capability; never extends the midnight expiry.
   res.json({...sessionReply(row,op),...(isCompanion(row.operator_code)?{deviceCertificate:certReply(row)}:{})});
  }));

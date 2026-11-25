@@ -234,6 +234,8 @@ function loadConfig(env = process.env) {
     scpdaCountOperators001: env.SCPDA_COUNT_OPERATORS_001 || "",
     featureScpdaDaily004: parseBool(env.FEATURE_SCPDA_DAILY_004, false),
     featureScpdaDaily005: parseBool(env.FEATURE_SCPDA_DAILY_005, false),
+    featureScpdaAnnual005: parseBool(env.FEATURE_SCPDA_ANNUAL_005, false),
+    scpdaDailyVersionPolicyJson: env.SCPDA_DAILY_VERSION_POLICY_JSON || "",
     scpdaPwaVersionCode: parseIntWithFallback(env.SCPDA_PWA_VERSION_CODE, 18),
     scpdaPwaOrigin: "https://sc-stockday-ordering.onrender.com",
     scpdaDriveClientId: env.SCPDA_DRIVE_CLIENT_ID || "",
