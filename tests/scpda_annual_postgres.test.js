@@ -47,6 +47,7 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
     await db.query('CREATE SCHEMA IF NOT EXISTS ordering');
     await db.query(await fs.readFile(path.join(__dirname, '../migrations/093_add_scpda_annual_count.sql'), 'utf8'));
     await db.query(await fs.readFile(path.join(__dirname, '../migrations/094_queue_scpda_annual_pages.sql'), 'utf8'));
+    await db.query(await fs.readFile(path.join(__dirname, '../migrations/095_scpda_annual_submission_history.sql'), 'utf8'));
     const pageMap = JSON.parse((await fs.readFile(mapFile, 'utf8')).replace(/^\uFEFF/, ''));
     const event = await prepareEvent({ label: 'Fixture 005', branch: branchCode, warehouse: '001', pageMap, files });
     assert.equal(event.pages.length, 74);

@@ -14,7 +14,7 @@ function versionPolicy(config, branch) {
     for (const [key, value] of Object.entries(policy)) {
       if (!['004', '005'].includes(key) || !value ||
           !Array.isArray(value.accepted) || !Array.isArray(value.qr) ||
-          !value.accepted.length || value.accepted.length > 4 || !value.qr.length ||
+          !value.accepted.length || value.accepted.length > 8 || !value.qr.length ||
           value.accepted.some(v => !Number.isSafeInteger(v) || v < 1) ||
           value.qr.some(v => !value.accepted.includes(v))) throw Error();
     }

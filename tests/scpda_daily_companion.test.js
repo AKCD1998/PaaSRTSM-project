@@ -171,7 +171,7 @@ else test('real HTTP, signatures, transactions, midnight, network and archive re
  });
 
  await t.test('79-of80 annual draft survives midnight; same005 actor resumes next day without a submitted receipt',async()=>{
-  for(const file of ['093_add_scpda_annual_count.sql','094_queue_scpda_annual_pages.sql'])await db.query(fs.readFileSync('migrations/'+file,'utf8'));
+  for(const file of ['093_add_scpda_annual_count.sql','094_queue_scpda_annual_pages.sql','095_scpda_annual_submission_history.sql'])await db.query(fs.readFileSync('migrations/'+file,'utf8'));
   const eventId=crypto.randomUUID(),items=Array.from({length:80},(_,i)=>({row:i+3,ordinal:i+1,code:'QA-'+i,name:'ยาฝึก'+i,barcode:'QA-'+i,unit:'เม็ด'}));
   await db.query("INSERT INTO ordering.scpda_annual_events(id,branch_code,warehouse_code,label,source_files) VALUES($1,'005','001','Synthetic overnight draft','{}')",[eventId]);
   await db.query("INSERT INTO ordering.scpda_annual_pages(event_id,category,page_no,items,assignee) VALUES($1,'common',1,$2,'01005')",[eventId,JSON.stringify(items)]);
