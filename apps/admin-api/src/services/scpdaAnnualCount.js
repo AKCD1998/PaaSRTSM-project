@@ -184,7 +184,7 @@ async function assignPage(db, { branchCode, eventId, category, pageNo, operator,
   });
 }
 
-async function savePage(db, { branchCode, eventId, category, pageNo, operator, revision, mutationId, counts, submit }) {
+async function savePage(db, { branchCode, eventId, category, pageNo, operator, revision, mutationId, counts, submit, authorizeSubmit }) {
   validatePageKey(category, pageNo);
   if (!Number.isInteger(revision) || revision < 0 || !uuid.test(mutationId ?? '') || typeof submit !== 'boolean') {
     reject(400, 'ANNUAL_VERSION_INVALID', 'ข้อมูลรุ่นผลนับไม่ถูกต้อง');
@@ -200,6 +200,7 @@ async function savePage(db, { branchCode, eventId, category, pageNo, operator, r
     if (page.submitted_at || page.revision !== revision || page.mutation_id === mutationId) {
       reject(409, 'ANNUAL_PAGE_CHANGED', 'ใบนับเปลี่ยนแล้ว กรุณาตรวจผลก่อนส่งซ้ำ');
     }
+    if (submit && authorizeSubmit) await authorizeSubmit();
     const changes = [];
     for (const row of new Set([...Object.keys(page.counts), ...Object.keys(normalized)])) {
       const before = page.counts[row] ?? null;

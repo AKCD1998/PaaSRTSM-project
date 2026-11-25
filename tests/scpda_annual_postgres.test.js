@@ -10,6 +10,7 @@ const request = require('supertest');
 const { Pool } = require('pg');
 const XLSX = require('xlsx');
 const annual = require('../apps/admin-api/src/services/scpdaAnnualCount');
+const bcrypt = require('bcryptjs');
 const { mountAnnualRoutes } = require('../apps/admin-api/src/services/scpdaAnnualRoutes');
 const { generateWorkbook } = require('../apps/admin-api/src/services/scpdaAnnualWorkbook');
 const { insertEvent, prepareEvent } = require('../scripts/import_scpda_annual_event');
@@ -53,8 +54,10 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
     eventId = await insertEvent(db, event);
     const app = express();
     app.use(express.json());
-    const config = { featureScpdaAnnual005: false, featureScpdaDaily005: true, featureScpdaBranch005: true };
+    const confirmationPassword = 'fixtureConfirmationPass';
+    const config = { featureScpdaAnnual005: false, featureScpdaDaily005: true, featureScpdaBranch005: true, scpdaAnnualSubmitConfirmationHash: await bcrypt.hash(confirmationPassword, 12) };
     mountAnnualRoutes({
+      burst: () => {},
       router: app, config, db, settings: { operators: new Map() },
       authenticate: async req => ({ operator: { operatorCode: req.get('fixture-operator'), branchCode: req.get('fixture-branch') }, claims: { app_version: Number(req.get('fixture-version') || 22) } }),
       envelope: (data, branchCode) => ({ contract: 'scpda-read-005-v1', branchCode, ...data }),
@@ -124,7 +127,7 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
     const mine = await testActor('get','/annual?view=mine','01005').expect(200);
     assert.equal(mine.body.manager, false); assert.equal(mine.body.canManage, true);
     assert.equal(mine.body.assigned.pageNo, 1);
-    const ownReceipt = await testActor('post','/annual/save','01005').send({ ...primaryPage, revision: 0, mutationId: randomUUID(), counts: filled(mine.body.assigned), submit: true }).expect(200);
+    const ownReceipt = await testActor('post','/annual/save','01005').send({ ...primaryPage, revision: 0, mutationId: randomUUID(), counts: filled(mine.body.assigned), submit: true, confirmationPassword }).expect(200);
     assert.equal(ownReceipt.body.state, 'submitted');
     const team = await testActor('get','/annual',operator).expect(200);
     assert.equal(team.body.team.find(page => page.operator === '01005').displayName, 'เครื่องแม่ทดสอบ');
@@ -132,7 +135,14 @@ test('annual request, exclusive approval, draft, receipt retry and the three ori
     await testActor('get','/annual?category=common&pageNo=1',operator).expect(404);
     assert.ok((await db.query("SELECT actor_name FROM ordering.scpda_annual_count_audit WHERE event_id=$1 AND operator_code='01005'",[eventId])).rows.every(row => row.actor_name === 'เครื่องแม่ทดสอบ'));
     const submit = { ...draft, revision: 1, mutationId: randomUUID(), submit: true, counts: filled(assigned) };
-    const receipt = await annual.savePage(db, submit);
+    await testActor('post','/annual/save',operator).send(submit).expect(403, { code: 'ANNUAL_CONFIRM_REQUIRED' });
+    await testActor('post','/annual/save',operator).send({ ...submit, confirmationPassword: 'wrong' }).expect(403, { code: 'ANNUAL_CONFIRM_PASSWORD_INVALID' });
+    assert.equal((await annual.overview(db, { branchCode, operator, manager: false })).assigned.revision, 1);
+    const postedReceipt = await testActor('post','/annual/save',operator).send({ ...submit, confirmationPassword }).expect(200);
+    const receipt = postedReceipt.body;
+    assert.equal((await testActor('post','/annual/save',operator).send(submit).expect(200)).body.receiptId, receipt.receiptId);
+    const logs = JSON.stringify((await db.query('SELECT * FROM ordering.scpda_annual_count_audit WHERE event_id=$1',[eventId])).rows);
+    assert.equal(logs.includes(confirmationPassword), false);
     assert.equal(receipt.state, 'submitted');
     assert.equal((await annual.overview(db, { branchCode, operator, manager: false })).assigned.pageNo, 1);
     assert.equal((await annual.savePage(db, submit)).receiptId, receipt.receiptId);

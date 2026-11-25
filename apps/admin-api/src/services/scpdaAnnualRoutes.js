@@ -1,11 +1,12 @@
 'use strict';
 
 const annual = require('./scpdaAnnualCount');
+const bcrypt = require('bcryptjs');
 const { generateWorkbook } = require('./scpdaAnnualWorkbook');
 const { dailyRequired, pairFor } = require('./scpdaDailyPolicy');
 const { listCompanions } = require('./scpdaCompanions');
 
-function mountAnnualRoutes({ router, config, db, settings, run, authenticate, envelope }) {
+function mountAnnualRoutes({ router, config, db, settings, run, authenticate, envelope, burst }) {
   const reply = (res, payload) => res.json(envelope(payload, '005'));
   async function actor(req, requiredRole) {
     if (!config.featureScpdaAnnual005) annual.reject(404, 'ANNUAL_DISABLED', 'ยังไม่เปิดอีเวนท์นับสต๊อก');
@@ -37,7 +38,7 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
       const operators = await listCompanions(config, settings, db, who.operator);
       result.helpers = operators.filter(device => device.paired).map(device => device.operatorCode);
     }
-    reply(res, result);
+    reply(res, { ...result, submitPasswordRequired: Boolean(config.scpdaAnnualSubmitConfirmationHash) });
   }));
   router.post('/annual/request', run(async (req, res) => {
     const who = await actor(req, 'helper');
@@ -54,8 +55,16 @@ function mountAnnualRoutes({ router, config, db, settings, run, authenticate, en
   }));
   router.post('/annual/save', run(async (req, res) => {
     const who = await actor(req);
-    const { category, pageNo, revision, mutationId, counts, submit } = req.body || {};
-    reply(res, await annual.savePage(db, { ...who, eventId: eventId(req), category, pageNo, revision, mutationId, counts, submit }));
+    const { category, pageNo, revision, mutationId, counts, submit, confirmationPassword } = req.body || {};
+    if (submit && config.scpdaAnnualSubmitConfirmationHash) burst(req, who.operator);
+    const authorizeSubmit = async () => {
+      const hash = config.scpdaAnnualSubmitConfirmationHash;
+      if (!hash) return;
+      if (!/^\$2[aby]\$(12|13|14)\$[./A-Za-z0-9]{53}$/.test(hash)) annual.reject(503, 'ANNUAL_CONFIRM_UNAVAILABLE', 'ระบบยืนยันการส่งยังไม่พร้อม');
+      if (typeof confirmationPassword !== 'string' || !confirmationPassword) annual.reject(403, 'ANNUAL_CONFIRM_REQUIRED', 'ใส่รหัสยืนยันก่อนส่งจบหน้า · ใช้แอป R24 ขึ้นไป');
+      if (confirmationPassword.length > 72 || !await bcrypt.compare(confirmationPassword, hash)) annual.reject(403, 'ANNUAL_CONFIRM_PASSWORD_INVALID', 'รหัสยืนยันการส่งไม่ถูกต้อง');
+    };
+    reply(res, await annual.savePage(db, { ...who, eventId: eventId(req), category, pageNo, revision, mutationId, counts, submit, authorizeSubmit }));
   }));
   router.post('/annual/participant', run(async (req,res) => {
     const who = await actor(req);
